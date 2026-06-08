@@ -1,0 +1,19 @@
+{
+  "files": [],
+  "references": [
+    { "path": "apps/desktop" },
+    { "path": "packages/core-domain" },
+    { "path": "packages/ipc-contracts" },
+    { "path": "packages/project-service" },
+    { "path": "packages/latex-service" },
+    { "path": "packages/pdf-service" },
+    { "path": "packages/reference-service" },
+    { "path": "packages/project-lifecycle-service" },
+    { "path": "packages/history-service" },
+    { "path": "packages/provider-anthropic-claude" },
+    { "path": "packages/provider-openai-codex" },
+    { "path": "packages/agent-host" },
+    { "path": "packages/security" },
+    { "path": "packages/ui" }
+  ]
+}

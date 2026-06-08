@@ -1,0 +1,37 @@
+\documentclass{article}
+\usepackage{graphicx}
+\title{Figure Heavy Sample}
+\author{AI LaTeX Editor QA}
+
+\begin{document}
+\maketitle
+
+\section{Figures}
+This sample uses several figure environments without requiring external image
+assets, which keeps it portable across TeX installations.
+
+\begin{figure}[ht]
+\centering
+\fbox{\rule{0pt}{1in}\rule{0.8\linewidth}{0pt}}
+\caption{Placeholder figure one.}
+\label{fig:one}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\fbox{\rule{0pt}{1.2in}\rule{0.7\linewidth}{0pt}}
+\caption{Placeholder figure two.}
+\label{fig:two}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\fbox{\rule{0pt}{0.9in}\rule{0.6\linewidth}{0pt}}
+\caption{Placeholder figure three.}
+\label{fig:three}
+\end{figure}
+
+Figures~\ref{fig:one}, \ref{fig:two}, and \ref{fig:three} exercise outline,
+compile, and PDF rendering workflows.
+
+\end{document}

@@ -1,0 +1,25 @@
+{
+  "name": "@latex-agent/agent-host",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./host-process": "./dist/host-process.js"
+  },
+  "dependencies": {
+    "@latex-agent/ipc-contracts": "0.0.0",
+    "@latex-agent/provider-anthropic-claude": "0.0.0",
+    "@latex-agent/provider-openai-codex": "0.0.0"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty",
+    "test": "vitest run"
+  }
+}

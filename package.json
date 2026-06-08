@@ -1,0 +1,55 @@
+{
+  "name": "ai-latex-editor",
+  "version": "0.0.0-alpha.1",
+  "private": true,
+  "description": "Local-first desktop LaTeX editor with an integrated AI project agent.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "overrides": {
+    "monaco-editor": "0.53.0"
+  },
+  "scripts": {
+    "dev": "npm run dev --workspace @latex-agent/desktop",
+    "build": "tsc -b && npm run build:renderer --workspace @latex-agent/desktop",
+    "compare:providers": "node scripts/agent-provider-comparison.mjs",
+    "e2e": "npm run build && electron scripts/e2e-smoke.cjs",
+    "package:mac": "npm run build && node scripts/package-macos.mjs",
+    "package:mac:zip": "npm run package:mac && node scripts/package-macos-zip.mjs",
+    "alpha:readiness": "node scripts/private-alpha-readiness.mjs",
+    "alpha:pilot": "npm run build && node scripts/private-alpha-pilot.mjs",
+    "typecheck": "tsc -b --pretty",
+    "lint": "eslint eslint.config.js scripts/agent-provider-comparison.mjs scripts/e2e-smoke.cjs scripts/package-macos.mjs scripts/package-macos-zip.mjs scripts/private-alpha-pilot.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20.19.0",
+    "npm": ">=10.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^25.0.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "electron": "^42.3.3",
+    "eslint": "^9.39.1",
+    "prettier": "^3.7.4",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.1",
+    "vite": "^8.0.16",
+    "vitest": "^4.0.15"
+  },
+  "dependencies": {
+    "lucide-react": "^1.17.0",
+    "monaco-editor": "0.53.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  }
+}

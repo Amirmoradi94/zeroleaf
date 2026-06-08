@@ -1,0 +1,9 @@
+node_modules
+dist
+coverage
+.git
+.claude
+package-lock.json
+/release
+/tmp
+AGENTS.md

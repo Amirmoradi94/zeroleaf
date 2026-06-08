@@ -1,0 +1,16 @@
+{
+  "name": "@latex-agent/provider-openai-codex",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "dependencies": {
+    "@latex-agent/ipc-contracts": "0.0.0"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty",
+    "test": "vitest run"
+  }
+}

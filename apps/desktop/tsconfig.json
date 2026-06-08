@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/tsconfig.tsbuildinfo",
+    "jsx": "react-jsx",
+    "types": ["node", "vite/client"]
+  },
+  "include": ["src/**/*.cts", "src/**/*.d.ts", "src/**/*.ts", "src/**/*.tsx"],
+  "references": [
+    { "path": "../../packages/ipc-contracts" },
+    { "path": "../../packages/agent-host" },
+    { "path": "../../packages/history-service" },
+    { "path": "../../packages/latex-service" },
+    { "path": "../../packages/pdf-service" },
+    { "path": "../../packages/project-lifecycle-service" },
+    { "path": "../../packages/project-service" },
+    { "path": "../../packages/reference-service" },
+    { "path": "../../packages/ui" }
+  ]
+}
