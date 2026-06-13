@@ -70,7 +70,10 @@ const api: DesktopApi = {
     listChangeSets: (request) => invoke("history.listChangeSets", request),
     snapshotFile: (request) => invoke("history.snapshotFile", request),
     createChangeSet: (request) => invoke("history.createChangeSet", request),
+    createAppliedChangeSet: (request) =>
+      invoke("history.createAppliedChangeSet", request),
     applyChangeSet: (changesetId) => invoke("history.applyChangeSet", { changesetId }),
+    applyChangeSetHunks: (request) => invoke("history.applyChangeSetHunks", request),
     rejectChangeSet: (changesetId) =>
       invoke("history.rejectChangeSet", { changesetId }),
     rollbackChangeSet: (changesetId) =>
@@ -79,7 +82,8 @@ const api: DesktopApi = {
   },
   references: {
     analyze: (request) => invoke("references.analyze", request),
-    search: (request) => invoke("references.search", request)
+    search: (request) => invoke("references.search", request),
+    removeUnused: (request) => invoke("references.removeUnused", request)
   },
   lifecycle: {
     listTemplates: () => invoke("lifecycle.listTemplates", undefined),
@@ -99,7 +103,16 @@ const api: DesktopApi = {
     getAuthStatus: (providerId) => invoke("agent.getAuthStatus", { providerId }),
     start: (request) => invoke("agent.start", request),
     respondApproval: (request) => invoke("agent.respondApproval", request),
-    cancel: (sessionId) => invoke("agent.cancel", { sessionId })
+    cancel: (sessionId) => invoke("agent.cancel", { sessionId }),
+    onEvent: (callback) => {
+      const listener = (_event: Electron.IpcRendererEvent, event: unknown) => {
+        callback(event as Parameters<typeof callback>[0]);
+      };
+      ipcRenderer.on("agent.event", listener);
+      return () => {
+        ipcRenderer.removeListener("agent.event", listener);
+      };
+    }
   }
 };
 

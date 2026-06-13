@@ -1,4 +1,4 @@
-# Desktop AI LaTeX Editor System Architecture
+# ZeroLeaf System Architecture
 
 Date: 2026-06-07
 

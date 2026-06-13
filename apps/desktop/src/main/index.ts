@@ -9,6 +9,7 @@ import {
   dialog,
   ipcMain,
   nativeTheme,
+  shell,
   type IpcMainInvokeEvent,
   type OpenDialogOptions
 } from "electron";
@@ -43,6 +44,7 @@ import {
 } from "@latex-agent/project-service";
 import {
   analyzeProjectReferences,
+  removeUnusedReferenceEntry,
   searchProjectReferences
 } from "@latex-agent/reference-service";
 import {
@@ -68,18 +70,27 @@ import {
   type ProjectFileTreeNode,
   type WorkbenchLayout
 } from "@latex-agent/ipc-contracts";
+import { ProjectChangeDebouncer } from "./projectWatcher.js";
 
 const rendererDevServerUrl = process.env["VITE_DEV_SERVER_URL"];
 const mainDir = fileURLToPath(new URL(".", import.meta.url));
 const preloadPath = join(mainDir, "../preload/index.cjs");
 const rendererIndexPath = join(mainDir, "../renderer/index.html");
+const appIconPath = fileURLToPath(
+  new URL("../../assets/zeroleaf-icon.png", import.meta.url)
+);
 const agentHostProcessPath = fileURLToPath(
   import.meta.resolve("@latex-agent/agent-host/host-process")
 );
-const appName = "AI LaTeX Editor";
+const appName = "ZeroLeaf";
 const agentHostClient = new AgentHostClient({
   hostProcessPath: agentHostProcessPath,
   handleToolRequest: handleAgentHostToolRequest,
+  onEvent: (event) => {
+    BrowserWindow.getAllWindows().forEach((window) => {
+      window.webContents.send(ipcChannels.agentEvent, event);
+    });
+  },
   onCrash: (message) => {
     if (activeProjectRoot !== undefined) {
       void recordAgentAudit(activeProjectRoot, "agent.host.crashed", message);
@@ -88,8 +99,7 @@ const agentHostClient = new AgentHostClient({
 });
 let activeProjectWatcher: FSWatcher | undefined;
 let activeProjectRoot: string | undefined;
-let projectWatcherTimer: NodeJS.Timeout | undefined;
-const pendingProjectWatcherPaths = new Set<string>();
+let projectChangeDebouncer: ProjectChangeDebouncer | undefined;
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number) {
   return typeof value === "number" && Number.isFinite(value)
@@ -113,8 +123,8 @@ function normalizeWorkbenchLayout(value: unknown): WorkbenchLayout {
     pdfWidth: clampNumber(layout.pdfWidth, 320, 720, defaultWorkbenchLayout.pdfWidth),
     agentWidth: clampNumber(
       layout.agentWidth,
-      280,
-      520,
+      340,
+      560,
       defaultWorkbenchLayout.agentWidth
     ),
     bottomPanelHeight: clampNumber(
@@ -350,42 +360,27 @@ function clearLocalHistory(): PrivacySummary {
 
 function startProjectWatcher(projectRoot: string) {
   activeProjectWatcher?.close();
+  projectChangeDebouncer?.dispose();
   activeProjectRoot = projectRoot;
-  pendingProjectWatcherPaths.clear();
+  const debouncer = new ProjectChangeDebouncer(projectRoot, (event) => {
+    BrowserWindow.getAllWindows().forEach((window) => {
+      window.webContents.send(ipcChannels.projectChanged, event);
+    });
+  });
+  projectChangeDebouncer = debouncer;
 
   try {
     activeProjectWatcher = watch(
       projectRoot,
       { recursive: true },
       (_eventType, filename) => {
-        const changedPath = filename ?? undefined;
-
-        if (changedPath !== undefined && changedPath.length > 0) {
-          pendingProjectWatcherPaths.add(changedPath);
-        }
-
-        if (projectWatcherTimer !== undefined) {
-          clearTimeout(projectWatcherTimer);
-        }
-
-        projectWatcherTimer = setTimeout(() => {
-          if (activeProjectRoot === undefined) {
-            return;
-          }
-
-          const paths = Array.from(pendingProjectWatcherPaths);
-          pendingProjectWatcherPaths.clear();
-          BrowserWindow.getAllWindows().forEach((window) => {
-            window.webContents.send(ipcChannels.projectChanged, {
-              projectRoot: activeProjectRoot,
-              paths
-            });
-          });
-        }, 250);
+        debouncer.notify(filename);
       }
     );
   } catch {
     activeProjectWatcher = undefined;
+    debouncer.dispose();
+    projectChangeDebouncer = undefined;
   }
 }
 
@@ -570,8 +565,9 @@ function registerIpcHandlers() {
   });
 
   handleIpc(ipcChannels.projectDeleteEntry, async (_event, request) => {
-    await deleteProjectEntry(request.projectRoot, request.path);
-    return refreshProject(request.projectRoot, getProjectMetadataStore());
+    const deletedEntry = await deleteProjectEntry(request.projectRoot, request.path);
+    const result = await refreshProject(request.projectRoot, getProjectMetadataStore());
+    return { ...result, deletedEntry };
   });
 
   handleIpc(ipcChannels.projectSetMainFile, (_event, request) =>
@@ -633,10 +629,28 @@ function registerIpcHandlers() {
     }
   });
 
+  handleIpc(ipcChannels.historyCreateAppliedChangeSet, async (_event, request) => {
+    const history = getHistoryStore();
+    try {
+      return await history.createAppliedChangeSet(request);
+    } finally {
+      history.close();
+    }
+  });
+
   handleIpc(ipcChannels.historyApplyChangeSet, async (_event, request) => {
     const history = getHistoryStore();
     try {
       return await history.applyChangeSet(request.changesetId);
+    } finally {
+      history.close();
+    }
+  });
+
+  handleIpc(ipcChannels.historyApplyChangeSetHunks, async (_event, request) => {
+    const history = getHistoryStore();
+    try {
+      return await history.applyChangeSetHunks(request);
     } finally {
       history.close();
     }
@@ -675,6 +689,13 @@ function registerIpcHandlers() {
 
   handleIpc(ipcChannels.referencesSearch, async (_event, request) => {
     return await searchProjectReferences(request.projectRoot, request.query);
+  });
+
+  handleIpc(ipcChannels.referencesRemoveUnused, async (_event, request) => {
+    return await removeUnusedReferenceEntry(request.projectRoot, {
+      filePath: request.filePath,
+      key: request.key
+    });
   });
 
   handleIpc(ipcChannels.lifecycleListTemplates, () => projectTemplates);
@@ -725,10 +746,19 @@ function registerIpcHandlers() {
       return undefined;
     }
 
-    return await exportLifecyclePdf({
+    const exportResult = await exportLifecyclePdf({
       pdfPath: request.pdfPath,
       destinationPath: result.filePath
     });
+    const viewerOpenError = await shell.openPath(exportResult.destinationPath);
+
+    return viewerOpenError.length === 0
+      ? { ...exportResult, openedInViewer: true }
+      : {
+          ...exportResult,
+          openedInViewer: false,
+          viewerOpenError
+        };
   });
 
   handleIpc(ipcChannels.lifecycleImportSourceZip, async (event) => {
@@ -884,6 +914,27 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
         const payload = message.payload as AgentToolRequestPayloadMap["search-project"];
         return await searchProjectFiles(projectRoot, payload.query);
       }
+      case "move-entry": {
+        const payload = message.payload as AgentToolRequestPayloadMap["move-entry"];
+        await moveProjectEntry(projectRoot, payload.fromPath, payload.toPath);
+        return {
+          fromPath: payload.fromPath,
+          toPath: payload.toPath
+        };
+      }
+      case "set-main-file": {
+        const payload = message.payload as AgentToolRequestPayloadMap["set-main-file"];
+        const result = await setProjectMainFile(
+          projectRoot,
+          getProjectMetadataStore(),
+          payload.path
+        );
+        return { path: result.project.mainFilePath ?? payload.path };
+      }
+      case "network-fetch":
+        throw new Error(
+          "External network fetch is blocked in the local-first desktop app unless an explicit network-enabled tool is implemented and approved."
+        );
       case "codex-exec":
         throw new Error("Codex execution is provider-local, not an app tool.");
       case "claude-code":
@@ -899,6 +950,15 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
             afterContents: payload.afterContents,
             summary: payload.summary
           });
+        } finally {
+          history.close();
+        }
+      }
+      case "reject-patch": {
+        const payload = message.payload as AgentToolRequestPayloadMap["reject-patch"];
+        const history = getHistoryStore();
+        try {
+          return history.rejectChangeSet(payload.changesetId);
         } finally {
           history.close();
         }
@@ -1007,11 +1067,13 @@ function summarizeAgentEvent(event: AgentEvent): string {
     case "tool-call":
       return `${event.toolName} ${event.status}: ${event.summary}`;
     case "patch":
-      return `${event.status}: ${event.summary}`;
+      return `${event.status}: ${event.filePath} · ${event.summary}`;
     case "approval":
       return `${event.toolName} ${event.status}: ${event.prompt}`;
     case "verification":
-      return `${event.status}: ${event.summary}`;
+      return `${event.status}: ${event.summary}${
+        event.buildJobId === undefined ? "" : ` · build ${event.buildJobId}`
+      }`;
     case "error":
       return event.message;
   }
@@ -1030,11 +1092,12 @@ async function createMainWindow() {
   nativeTheme.themeSource = "light";
 
   const mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 940,
-    minWidth: 1100,
-    minHeight: 720,
+    width: 1800,
+    height: 1024,
+    minWidth: 1280,
+    minHeight: 840,
     title: appName,
+    icon: appIconPath,
     backgroundColor: "#f6f7f8",
     show: false,
     webPreferences: {
@@ -1073,6 +1136,7 @@ void app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   activeProjectWatcher?.close();
+  projectChangeDebouncer?.dispose();
   agentHostClient.stop();
 
   if (process.platform !== "darwin") {

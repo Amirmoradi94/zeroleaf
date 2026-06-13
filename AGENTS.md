@@ -1,67 +1,69 @@
 <claude-mem-context>
 # Memory Context
 
-# [overleaf-clone] recent context, 2026-06-08 1:31pm EDT
+# [overleaf-clone] recent context, 2026-06-13 12:13am EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 50 obs (18,947t read) | 635,564t work | 97% savings
+Stats: 50 obs (18,424t read) | 850,963t work | 98% savings
 
-### Jun 7, 2026
-6951 2:48p ✅ Project Directory Created and Senior-Architect Skill Installation Initiated
-6952 " 🟣 senior-architect Skill Installed into Overleaf Clone Project
-6953 " 🔵 senior-architect Skill Installed at .claude/skills/senior-architect/ Not development/ Subdirectory
-6954 " 🟣 brainstorming Skill Installed into Overleaf Clone Project
-6955 2:49p 🟣 senior-frontend Skill Installed with React/Next.js Tooling
-6956 " 🔵 brainstorming Skill Enforces Design-First Workflow Before Any Implementation
-6957 2:51p 🔵 AGENTS.md Exists at Project Root — Codex Configuration File
-6958 2:52p 🔵 senior-architect Reference Docs Are Generic Placeholder Content
-6959 " 🔵 Codex SDK Confirmed as Programmatic Integration Path for AI Agent in Overleaf Clone
-6960 " 🔵 Codex Custom Model Provider Auth via env_key Enables Anthropic Integration
-6961 " ✅ docs/architecture/ Directory Created — Project Moving from Research to Documentation Phase
-6962 " ⚖️ Full System Architecture Document Written for AI-Powered Desktop LaTeX Editor
-6963 2:56p ✅ docs/design/ Directory Created — UI/UX Design Documentation Layer Added
-7024 7:12p 🔵 Overleaf Clone Project — Phase 1 Complete, Phase 2 Starting
-7025 " 🟣 Phase 2 IPC Contracts Expanded with Full Project and File Management Types
-7026 " 🟣 Phase 2 IPC Contracts Expanded for Project and File Management
-7027 " 🟣 ProjectService Implementation: Root-Scoped File Operations and Recent Projects
-7028 7:16p 🟣 ProjectService Integration Test Suite Added
-7029 " ✅ Desktop App Wired to Project Service Package
-7030 " 🟣 Electron Main Process Wired with Phase 2 IPC Handlers and FSWatcher
-7031 " 🟣 Preload Bridge Extended with Project and File Namespaces
-7032 7:17p 🔴 Preload onChanged Type Fixed and desktopApi Fallback Extended
-7033 " 🟣 Phase 2: Project Management API Wired into Desktop Renderer
-7034 " 🔄 ProjectSidebar, FileRow, and EditorPane Replaced with Live Data-Driven Components
-7035 7:18p 🔵 overleaf-clone Tech Stack Confirmed from package-lock.json
-7036 7:20p 🔴 Project Callbacks Converted to void-Returning to Match Component Prop Types
-7037 " 🟣 Utility Helpers and Open Project Command Enabled
-7038 " 🟣 Phase 2 CSS Added for File Tree, Recent Projects, and Editor Empty States
-7039 " 🟣 Cmd+O Keyboard Shortcut Wired to Open Project
-7040 " 🔴 TypeScript Errors Found and Fixed in Electron Main Process
-7041 " 🔵 Phase 2 Plan Status: Steps 1-2 Complete, Step 3 In Progress, Step 4 Pending
-7042 7:21p 🔴 Remaining TypeScript Errors Fixed: IpcResponseMap Import and OpenDialogOptions Typing
-7043 " 🔵 ESLint Error: Unsafe any Assignment in project-service Test at Line 86
-7044 " 🟣 Phase 2 Build, Tests, and Lint All Pass — Full CI Green
-7045 7:22p 🔵 No Git History: Entire Repo Is Untracked
-7046 " 🟣 projectMoveEntry IPC Channel Added to ipc-contracts
-7047 " 🔵 apply_patch Failed on project-service/index.ts Due to Prettier Reformatting
-7048 " 🔴 moveProjectEntry Patch Split to Work Around apply_patch Context Mismatch
-7049 7:23p 🟣 moveProjectEntry Implementation and Tests Completed in project-service
-7050 " 🟣 moveEntry Wired Through All Three Electron Layers
-7051 " 🔵 App.tsx Patch Failure: Prettier Collapsed useCallback Arrow Forms
-7052 7:24p 🟣 moveActiveFile Callback and onMoveActiveFile Prop Wired in Renderer
-7053 " 🟣 Move File Button Added to Sidebar Toolbar — moveEntry UI Fully Wired
-7054 " ✅ Phase 2 Marked Complete in Development Plan — All Checks Green
-7055 " 🟣 projectSetMainFile IPC Channel Added to ipc-contracts
-7056 7:25p 🔵 project-service setProjectMainFile Patch Failed — recordProjectOpened Context Mismatch
-7057 " 🟣 ProjectMetadataStore Extended with Per-Project Settings and setProjectMainFile
-7058 7:26p 🟣 setProjectMainFile Fully Implemented: Service, Helper Guards, and Main IPC Handler
-7059 " 🟣 setMainFile Wired Through Preload, Fallback, and Renderer — EditorPane Receives mainFilePath and onSetMainFile
-7060 " 🟣 EditorPane "Set Main" Button and Persistence Test Added for setProjectMainFile
+### Jun 10, 2026
+7373 12:38a 🔵 Full Repo Build Succeeds After Agent-Host and Test Changes
+7452 3:28p 🔵 Project Identity: ai-latex-editor (overleaf-clone)
+7453 3:31p 🟣 Font Comparison Preview Page Created for Overleaf Clone
+7454 3:42p 🔵 Font Configuration Locations Mapped in Overleaf Clone
+7455 " ✅ App Fonts Changed to Nunito Sans + JetBrains Mono
+7457 " 🔵 Dev Server Started on Port 5175 After Port Conflicts
+7456 3:43p 🔴 Remaining Monaco Font Stack in .log-output Fixed
+7458 3:44p 🔵 Ports 5173–5174 Occupied by Separate Postdoc Dashboard Vite Instances
+7459 " 🔵 Duplicate Dev Server Processes Killed; Overleaf Clone Now on Port 5174
+7460 " 🔵 Electron Main Window Configuration Documented
+### Jun 11, 2026
+7517 12:59p 🟣 LaTeX Agent Real-World Test Plan Defined
+7518 " 🔵 Codex Provider Architecture and Agent Host IPC Contracts Mapped
+7519 " 🔵 createFileBackedAgentBroker and HistoryStore Integration Pattern Confirmed
+7521 " 🔵 project-service Public API Surface Mapped for Test Runner
+7523 " 🟣 Real Codex Agent Test Runner Script Created
+7524 1:02p 🔴 Case 01 Initial Compile Expectation Corrected to "succeeded"
+7525 " 🔵 First Real Codex Test Run: Two Initial Compile Expectation Mismatches Found
+7526 " 🔴 Both Compile Expectation Mismatches Fixed After Real Test Run Evidence
+7527 " 🔴 Compile Expectation Patch Matched Wrong Cases — Case 02 Accidentally Swapped
+7529 " 🔵 Third Run: Cases 01, 02, 03 All PASS — Compile Expectations Now Correct
+7528 1:03p 🔴 Compile Expectations for Cases 02 and 04 Correctly Fixed Using ID Anchors
+7530 1:04p 🟣 All 5 Real Codex Agent Test Cases Pass — Full Suite Green
+7531 " 🔵 Codex Agent Patch Content Verified — All Four Edit Cases Produced Minimal Correct Diffs
+7532 1:05p ✅ Real Codex Agent QA Session Completed — All Artifacts Untracked, AGENTS.md Updated
+7542 2:46p 🔵 Workbench Layout System Mapped — Default Widths May Clip Agent Panel
+7543 " 🔵 content-row Grid Structure Requires ~1472px Total to Show All Panes at Defaults
+7544 " 🔵 Layout Load Effect Does Not Call constrainLayoutToContentWidth — Root Cause Confirmed
+7545 2:47p 🔴 Default Agent Panel Width Increased and Minimum Raised to Fix Agent Panel Clipping
+7546 " 🔴 useLayoutEffect Added to Constrain Layout After Load and on Window Resize
+7547 2:48p ✅ Dev Server Restarted on Port 5174 to Apply Layout Fix
+7578 7:15p 🟣 AgentLiveStatus widget replaces flat provider-status text
+7579 " 🔄 Agent event stream split into conversation and activity sections
+7580 " 🔄 AgentEventCard redesigned with structured header layout and helper formatters
+7581 " 🟣 Agent pane CSS fully redesigned with chat-bubble and activity-feed visual language
+### Jun 12, 2026
+7630 2:26p 🔵 Agent Panel Architecture Discovered in Overleaf Clone
+7631 " 🟣 Agent Panel Header Redesigned with Provider Badge and Connection Pill
+7632 " 🟣 AgentEventCard Restructured with Icon + Body Layout and Tone Classes
+7633 " 🟣 Live Status Banner Redesigned as Floating Card with Pulse Animation
+7634 2:31p 🟣 Full Agent Panel CSS Overhaul: Chat Bubbles, Timeline, Animations, and Accessibility
+7636 " ✅ Agent Panel Redesign Tests Pass — App.render.test.tsx Green
+7637 " ✅ Agent Panel Redesign Passes TypeCheck and Production Build
+7638 " ✅ Electron Dev Server Started for Visual Verification of Agent Panel Redesign
+7639 " 🔵 Visual Verification Blocked: iab Browser Unavailable, Playwright/Puppeteer Not Installed
+7640 2:33p 🔵 Electron Dev App Confirmed Running but Visual Verification Abandoned
+7641 " 🔵 App.tsx Excluded from Project ESLint Config — Lint Passes on Scripts Only
+7642 " 🔴 Prettier Formatting Applied to App.tsx After Agent Panel Redesign Patches
+7643 " ✅ Agent Panel Redesign Complete — All Quality Gates Pass
+7644 " 🔵 Full Diff Reveals Agent Panel Redesign Scope vs Pre-Existing Changes
+7655 " ⚖️ Two Agent Panel UX Requirements Identified: Activity Cleanup and Markdown Rendering
+7645 2:34p 🔵 Working-Tree Diff Scale: 5145 Insertions, 720 Deletions Across Agent Panel Files
 
-Access 636k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 851k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>
 
 # Project Guidance
@@ -86,6 +88,17 @@ patterns, dark IDE frames, dark panels, and dark-mode-first visual language.
 - Agent edits must be patch-first, reviewable, snapshot-backed, and reversible.
 - Network access, shell escape, outside-root writes, and destructive operations
   require explicit approval or are blocked.
+
+## Testing Rules
+
+- Do not use smoke tests as acceptance evidence for agent-panel behavior.
+- Do not use mock agent providers, mock data, or simulated provider responses as
+  proof that the agent workflow works.
+- Agent-panel verification must use real project files, real LaTeX toolchain
+  execution, and the connected Codex provider path.
+- Codex must be connected before Codex-provider agent tests are considered valid.
+  Verify with the app/provider auth path, not only by checking that the `codex`
+  binary exists.
 
 ## Repository Layout
 

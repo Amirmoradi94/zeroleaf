@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { mkdir, open, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -21,6 +21,11 @@ export type LatexDiagnostic = {
   readonly filePath?: string;
   readonly line?: number;
   readonly message: string;
+};
+
+type LatexDiagnosticParseOptions = {
+  readonly mainFilePath?: string;
+  readonly mainSource?: string;
 };
 
 export type PdfArtifact = {
@@ -71,16 +76,33 @@ export type BuildRunRequest = {
   readonly maxOutputBytes?: number;
 };
 
+export type ShellEscapePolicy = {
+  readonly enabled: false;
+  readonly commandFlag: "-no-shell-escape";
+  readonly approvalRequiredToEnable: true;
+  readonly agentMayEnable: false;
+  readonly message: string;
+};
+
+export type BuildSecurityPolicy = {
+  readonly shellEscape: ShellEscapePolicy;
+};
+
 export type BuildResult = {
   readonly jobId: string;
   readonly status: BuildStatus;
+  readonly compiler: LatexCompiler;
   readonly command: readonly string[];
+  readonly securityPolicy: BuildSecurityPolicy;
   readonly startedAt: string;
   readonly finishedAt: string;
   readonly durationMs: number;
   readonly exitCode?: number;
   readonly diagnostics: readonly LatexDiagnostic[];
   readonly rawLog: string;
+  readonly rawLogTruncated?: boolean;
+  readonly rawLogBytes?: number;
+  readonly rawLogOriginalBytes?: number;
   readonly stdout: string;
   readonly stderr: string;
   readonly artifact?: PdfArtifact;
@@ -88,12 +110,26 @@ export type BuildResult = {
 
 type ActiveBuildJob = {
   readonly process: ChildProcessWithoutNullStreams;
+  readonly processGroupId?: number;
   cancelled: boolean;
+  forceKillTimer?: ReturnType<typeof setTimeout>;
 };
 
 const defaultTimeoutMs = 120_000;
 const defaultMaxOutputBytes = 2_000_000;
+const forceKillDelayMs = 1_500;
+const processTreeExitTimeoutMs = 5_000;
 const activeBuildJobs = new Map<string, ActiveBuildJob>();
+const defaultBuildSecurityPolicy: BuildSecurityPolicy = {
+  shellEscape: {
+    enabled: false,
+    commandFlag: "-no-shell-escape",
+    approvalRequiredToEnable: true,
+    agentMayEnable: false,
+    message:
+      "Shell escape is disabled for LaTeX builds. Enabling it requires an explicit user approval path and cannot be changed by the agent."
+  }
+};
 
 export async function detectLatexToolchain(): Promise<LatexToolchainStatus> {
   const [latexmkResult, synctexResult, ...compilerResults] = await Promise.all([
@@ -132,6 +168,20 @@ export async function runLatexBuild(request: BuildRunRequest): Promise<BuildResu
     outputDirectory,
     request.compiler
   );
+  const toolchain = await detectLatexToolchain();
+  const setupMessage = getToolchainSetupMessage(toolchain, request.compiler);
+
+  if (setupMessage !== undefined) {
+    return createPreflightBuildFailure({
+      jobId,
+      compiler: request.compiler,
+      command,
+      startedAt,
+      startedAtMs,
+      message: setupMessage
+    });
+  }
+
   const child = spawn(command[0] ?? "latexmk", command.slice(1), {
     cwd: root,
     detached: process.platform !== "win32",
@@ -142,6 +192,7 @@ export async function runLatexBuild(request: BuildRunRequest): Promise<BuildResu
   });
   const activeJob: ActiveBuildJob = {
     process: child,
+    ...(child.pid === undefined ? {} : { processGroupId: child.pid }),
     cancelled: false
   };
   const outputLimit = request.maxOutputBytes ?? defaultMaxOutputBytes;
@@ -152,7 +203,7 @@ export async function runLatexBuild(request: BuildRunRequest): Promise<BuildResu
 
   const timeout = setTimeout(() => {
     activeJob.cancelled = true;
-    killBuildProcess(child);
+    terminateBuildProcess(activeJob);
   }, request.timeoutMs ?? defaultTimeoutMs);
 
   try {
@@ -168,9 +219,13 @@ export async function runLatexBuild(request: BuildRunRequest): Promise<BuildResu
       child.on("error", rejectExit);
       child.on("close", resolveExit);
     });
+    if (activeJob.cancelled) {
+      await waitForBuildProcessTreeExit(activeJob);
+    }
     const finishedAtMs = Date.now();
     const logPath = getExpectedLogPath(outputDirectory, mainFilePath);
-    const rawLog = await readOptionalFile(logPath);
+    const rawLogResult = await readOptionalCappedFile(logPath, outputLimit);
+    const rawLog = rawLogResult.contents;
     const artifact = await getPdfArtifact(outputDirectory, mainFilePath);
     const status: BuildStatus = activeJob.cancelled
       ? "cancelled"
@@ -181,23 +236,35 @@ export async function runLatexBuild(request: BuildRunRequest): Promise<BuildResu
       status === "succeeded" && rawLog.trim().length > 0
         ? rawLog
         : `${stdout}\n${stderr}\n${rawLog}`;
+    const mainSource = await readOptionalFile(mainFilePath);
 
     return withOptionalBuildFields({
       jobId,
       status,
+      compiler: request.compiler,
       command,
+      securityPolicy: defaultBuildSecurityPolicy,
       startedAt,
       finishedAt: new Date(finishedAtMs).toISOString(),
       durationMs: finishedAtMs - startedAtMs,
       exitCode: exitCode ?? undefined,
-      diagnostics: parseLatexDiagnostics(diagnosticSource),
+      diagnostics: parseLatexDiagnostics(diagnosticSource, {
+        mainFilePath: relative(root, mainFilePath),
+        mainSource
+      }),
       rawLog,
+      rawLogTruncated: rawLogResult.truncated,
+      rawLogBytes: Buffer.byteLength(rawLog, "utf8"),
+      rawLogOriginalBytes: rawLogResult.originalBytes,
       stdout,
       stderr,
       artifact
     });
   } finally {
     clearTimeout(timeout);
+    if (!activeJob.cancelled && activeJob.forceKillTimer !== undefined) {
+      clearTimeout(activeJob.forceKillTimer);
+    }
     activeBuildJobs.delete(jobId);
   }
 }
@@ -210,7 +277,7 @@ export function stopLatexBuild(jobId: string): boolean {
   }
 
   job.cancelled = true;
-  return killBuildProcess(job.process);
+  return terminateBuildProcess(job);
 }
 
 export async function runSyncTexForward(
@@ -244,11 +311,16 @@ export async function runSyncTexReverse(
   return normalizeReverseResult(root, parseSyncTexReverseOutput(output));
 }
 
-export function parseLatexDiagnostics(log: string): readonly LatexDiagnostic[] {
+export function parseLatexDiagnostics(
+  log: string,
+  options: LatexDiagnosticParseOptions = {}
+): readonly LatexDiagnostic[] {
   const diagnostics: LatexDiagnostic[] = [];
   const lines = log.split(/\r?\n/);
   const fileLinePattern = /^(.+\.tex):(\d+):\s*(.+)$/;
   const warningPattern = /^(LaTeX|Package|Class)\s+(.+?)\s+Warning:\s+(.+)$/;
+  const missingLegalEnd =
+    /job aborted,\s*no legal \\end found|no legal \\end found/iu.test(log);
 
   for (const [index, line] of lines.entries()) {
     const fileLineMatch = fileLinePattern.exec(line);
@@ -266,6 +338,12 @@ export function parseLatexDiagnostics(log: string): readonly LatexDiagnostic[] {
     }
 
     if (line.startsWith("! ")) {
+      if (
+        missingLegalEnd &&
+        (line.includes("Emergency stop") || line.includes("Fatal error occurred"))
+      ) {
+        continue;
+      }
       diagnostics.push({
         severity: "error",
         message: line.slice(2).trim() || "LaTeX error"
@@ -297,7 +375,66 @@ export function parseLatexDiagnostics(log: string): readonly LatexDiagnostic[] {
     }
   }
 
+  if (missingLegalEnd) {
+    diagnostics.unshift(createMissingDocumentEndDiagnostic(options));
+  }
+
+  if (logMentionsBlockedShellEscape(log)) {
+    diagnostics.unshift({
+      severity: "warning",
+      message:
+        "Shell escape was requested by this project but stayed disabled with -no-shell-escape. Review the package or project source before approving any future shell-escape build."
+    });
+  }
+
   return dedupeDiagnostics(diagnostics).slice(0, 200);
+}
+
+function logMentionsBlockedShellEscape(log: string): boolean {
+  return (
+    /runsystem\(.+?\)\s*\.\.\.\s*disabled/isu.test(log) ||
+    /Package\s+.+?\s+Error:.*(?:-shell-escape|shell\s+escape)/iu.test(log) ||
+    /(?:requires?|needs?|must invoke|enable).*shell\s*-?\s*escape/iu.test(log)
+  );
+}
+
+function createMissingDocumentEndDiagnostic(
+  options: LatexDiagnosticParseOptions
+): LatexDiagnostic {
+  const line = findBeginDocumentLine(options.mainSource);
+
+  return withOptionalDiagnosticFields({
+    severity: "error",
+    filePath: options.mainFilePath,
+    line,
+    message:
+      "Missing \\end{document}; TeX reached the end of the main file without a legal \\end."
+  });
+}
+
+function findBeginDocumentLine(source: string | undefined): number | undefined {
+  if (source === undefined) {
+    return undefined;
+  }
+
+  const lines = source.split(/\r?\n/);
+  const beginDocumentIndex = lines.findIndex((line) =>
+    /\\begin\s*\{\s*document\s*\}/u.test(line)
+  );
+
+  if (beginDocumentIndex >= 0) {
+    return beginDocumentIndex + 1;
+  }
+
+  let lastContentIndex = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index]?.trim().length !== 0) {
+      lastContentIndex = index;
+      break;
+    }
+  }
+
+  return lastContentIndex >= 0 ? lastContentIndex + 1 : undefined;
 }
 
 function createLatexmkCommand(
@@ -327,6 +464,67 @@ function createLatexmkCommand(
     `-outdir=${outputDirectory}`,
     relativeMainFile
   ];
+}
+
+function getToolchainSetupMessage(
+  toolchain: LatexToolchainStatus,
+  compiler: LatexCompiler
+): string | undefined {
+  if (!toolchain.latexmkAvailable) {
+    return "latexmk is not available on PATH. Install MacTeX or BasicTeX, then restart the app or make sure /Library/TeX/texbin is on PATH.";
+  }
+
+  if (!toolchain.availableCompilers.includes(compiler)) {
+    const availableCompilers =
+      toolchain.availableCompilers.length === 0
+        ? "none detected"
+        : toolchain.availableCompilers.join(", ");
+
+    return `${compiler} is not available on PATH. Install MacTeX or BasicTeX, choose an available compiler, or make sure /Library/TeX/texbin is on PATH. Available compilers: ${availableCompilers}.`;
+  }
+
+  return undefined;
+}
+
+function createPreflightBuildFailure({
+  jobId,
+  compiler,
+  command,
+  startedAt,
+  startedAtMs,
+  message
+}: {
+  readonly jobId: string;
+  readonly compiler: LatexCompiler;
+  readonly command: readonly string[];
+  readonly startedAt: string;
+  readonly startedAtMs: number;
+  readonly message: string;
+}): BuildResult {
+  const finishedAtMs = Date.now();
+
+  return {
+    jobId,
+    status: "failed",
+    compiler,
+    command,
+    securityPolicy: defaultBuildSecurityPolicy,
+    startedAt,
+    finishedAt: new Date(finishedAtMs).toISOString(),
+    durationMs: finishedAtMs - startedAtMs,
+    diagnostics: [
+      {
+        severity: "error",
+        message
+      }
+    ],
+    rawLog: message,
+    rawLogTruncated: false,
+    rawLogBytes: Buffer.byteLength(message, "utf8"),
+    rawLogOriginalBytes: Buffer.byteLength(message, "utf8"),
+    stdout: "",
+    stderr: message
+  };
 }
 
 async function validateProjectRoot(rootPath: string): Promise<string> {
@@ -420,6 +618,76 @@ async function readOptionalFile(path: string): Promise<string> {
   } catch {
     return "";
   }
+}
+
+async function readOptionalCappedFile(
+  path: string,
+  maxBytes: number
+): Promise<{
+  readonly contents: string;
+  readonly truncated: boolean;
+  readonly originalBytes: number;
+}> {
+  try {
+    const fileStats = await stat(path);
+
+    if (!fileStats.isFile()) {
+      return { contents: "", truncated: false, originalBytes: 0 };
+    }
+
+    const byteBudget = Math.max(1, maxBytes);
+
+    if (fileStats.size <= byteBudget) {
+      return {
+        contents: await readFile(path, "utf8"),
+        truncated: false,
+        originalBytes: fileStats.size
+      };
+    }
+
+    const marker = createTruncatedLogMarker(fileStats.size, byteBudget);
+    const markerBytes = Buffer.byteLength(marker, "utf8");
+    if (markerBytes >= byteBudget) {
+      return {
+        contents: marker.slice(0, byteBudget),
+        truncated: true,
+        originalBytes: fileStats.size
+      };
+    }
+
+    const retainedBytes = byteBudget - markerBytes;
+    const headBytes = Math.floor(retainedBytes / 2);
+    const tailBytes = retainedBytes - headBytes;
+    const head = Buffer.alloc(headBytes);
+    const tail = Buffer.alloc(tailBytes);
+    const handle = await open(path, "r");
+
+    try {
+      await handle.read(head, 0, headBytes, 0);
+      await handle.read(tail, 0, tailBytes, Math.max(0, fileStats.size - tailBytes));
+    } finally {
+      await handle.close();
+    }
+
+    return {
+      contents: `${head.toString("utf8")}${marker}${tail.toString("utf8")}`,
+      truncated: true,
+      originalBytes: fileStats.size
+    };
+  } catch {
+    return { contents: "", truncated: false, originalBytes: 0 };
+  }
+}
+
+function createTruncatedLogMarker(originalBytes: number, maxBytes: number): string {
+  return [
+    "",
+    "----- LaTeX log truncated -----",
+    `Original log was ${originalBytes} bytes; capped to ${maxBytes} bytes from the beginning and end.`,
+    "Search results may not include omitted middle content.",
+    "----- End truncation notice -----",
+    ""
+  ].join("\n");
 }
 
 function appendCapped(current: string, next: string, maxBytes: number): string {
@@ -559,17 +827,94 @@ function toNumber(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function killBuildProcess(child: ChildProcessWithoutNullStreams): boolean {
-  if (process.platform !== "win32" && child.pid !== undefined) {
+function terminateBuildProcess(job: ActiveBuildJob): boolean {
+  const signalled = sendBuildTerminationSignal(job, "SIGTERM");
+
+  if (signalled) {
+    scheduleForcedBuildTermination(job);
+  }
+
+  return signalled;
+}
+
+function scheduleForcedBuildTermination(job: ActiveBuildJob): void {
+  if (job.forceKillTimer !== undefined || process.platform === "win32") {
+    return;
+  }
+
+  job.forceKillTimer = setTimeout(() => {
+    sendBuildTerminationSignal(job, "SIGKILL");
+  }, forceKillDelayMs);
+  job.forceKillTimer.unref();
+}
+
+function sendBuildTerminationSignal(
+  job: ActiveBuildJob,
+  signal: NodeJS.Signals
+): boolean {
+  if (process.platform === "win32") {
+    return terminateWindowsBuildTree(job.process);
+  }
+
+  if (job.processGroupId !== undefined) {
     try {
-      process.kill(-child.pid, "SIGTERM");
+      process.kill(-job.processGroupId, signal);
       return true;
     } catch {
-      return child.kill("SIGTERM");
+      return job.process.kill(signal);
     }
   }
 
-  return child.kill("SIGTERM");
+  return job.process.kill(signal);
+}
+
+function terminateWindowsBuildTree(child: ChildProcessWithoutNullStreams): boolean {
+  if (child.pid === undefined) {
+    return child.kill("SIGTERM");
+  }
+
+  const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+    stdio: "ignore"
+  });
+  killer.unref();
+  return true;
+}
+
+async function waitForBuildProcessTreeExit(job: ActiveBuildJob): Promise<void> {
+  if (process.platform === "win32" || job.processGroupId === undefined) {
+    return;
+  }
+
+  const deadline = Date.now() + processTreeExitTimeoutMs;
+
+  while (processGroupExists(job.processGroupId)) {
+    if (Date.now() >= deadline) {
+      sendBuildTerminationSignal(job, "SIGKILL");
+      return;
+    }
+
+    await delay(50);
+  }
+}
+
+function processGroupExists(processGroupId: number): boolean {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "EPERM"
+    );
+  }
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, ms);
+  });
 }
 
 async function runVersionCommand(
@@ -639,13 +984,18 @@ function isInsideRoot(rootPath: string, absolutePath: string): boolean {
 function withOptionalBuildFields(result: {
   readonly jobId: string;
   readonly status: BuildStatus;
+  readonly compiler: LatexCompiler;
   readonly command: readonly string[];
+  readonly securityPolicy: BuildSecurityPolicy;
   readonly startedAt: string;
   readonly finishedAt: string;
   readonly durationMs: number;
   readonly exitCode: number | undefined;
   readonly diagnostics: readonly LatexDiagnostic[];
   readonly rawLog: string;
+  readonly rawLogTruncated: boolean;
+  readonly rawLogBytes: number;
+  readonly rawLogOriginalBytes: number;
   readonly stdout: string;
   readonly stderr: string;
   readonly artifact: PdfArtifact | undefined;
@@ -653,13 +1003,18 @@ function withOptionalBuildFields(result: {
   return {
     jobId: result.jobId,
     status: result.status,
+    compiler: result.compiler,
     command: result.command,
+    securityPolicy: result.securityPolicy,
     startedAt: result.startedAt,
     finishedAt: result.finishedAt,
     durationMs: result.durationMs,
     ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
     diagnostics: result.diagnostics,
     rawLog: result.rawLog,
+    rawLogTruncated: result.rawLogTruncated,
+    rawLogBytes: result.rawLogBytes,
+    rawLogOriginalBytes: result.rawLogOriginalBytes,
     stdout: result.stdout,
     stderr: result.stderr,
     ...(result.artifact === undefined ? {} : { artifact: result.artifact })

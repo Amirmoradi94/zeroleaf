@@ -601,7 +601,7 @@ Goal: prove the packaged alpha build on real local workflows before handing it t
 
 | ID    | Task                                | Dependencies | Acceptance Criteria                                                                 | Status |
 | ----- | ----------------------------------- | ------------ | ----------------------------------------------------------------------------------- | ------ |
-| P15.1 | Smoke-launch packaged macOS app     | P14.8        | `release/mac/AI LaTeX Editor.app` starts without immediate process failure.         | Done   |
+| P15.1 | Smoke-launch packaged macOS app     | P14.8        | `release/mac/ZeroLeaf.app` starts without immediate process failure.                | Done   |
 | P15.2 | Run real sample-project pilot       | P14          | Five realistic local project scenarios pass with real `latexmk` output.             | Done   |
 | P15.3 | Run real Codex and Claude CLI flows | P9, P10      | Both installed CLIs repair a broken LaTeX project through the app agent host.       | Done   |
 | P15.4 | Capture pilot report                | P15.2        | Machine-readable report records projects, artifacts, provider IDs, and PDF outputs. | Done   |
@@ -633,7 +633,7 @@ Goal: prepare the private-alpha build for tester distribution and structured bug
 | ID    | Task                       | Dependencies | Acceptance Criteria                                                       | Status |
 | ----- | -------------------------- | ------------ | ------------------------------------------------------------------------- | ------ |
 | P16.1 | Set alpha release version  | P15          | Root package version is `0.0.0-alpha.1`.                                  | Done   |
-| P16.2 | Create versioned macOS ZIP | P15          | `release/mac/AI-LaTeX-Editor-0.0.0-alpha.1-mac.zip` exists.               | Done   |
+| P16.2 | Create versioned macOS ZIP | P15          | `release/mac/ZeroLeaf-0.0.0-alpha.1-mac.zip` exists.                      | Done   |
 | P16.3 | Write tester handoff doc   | P15          | Install, requirements, workflows, and known limitations are documented.   | Done   |
 | P16.4 | Write feedback template    | P16.3        | Testers have a structured bug/feedback report format.                     | Done   |
 | P16.5 | Run final release gate     | P16.1        | Format, lint, typecheck, tests, readiness, and pilot commands pass.       | Done   |
@@ -761,5 +761,5 @@ Assuming 1-2 engineers, use two-week sprints. If a larger team exists, run front
 | Security review completed         | Codex | `docs/security/mvp-security-review.md`, `npm run test -- packages/security` | Done   |
 | Accessibility review completed    | Codex | `apps/desktop/src/renderer/accessibility.test.ts`, `npm run e2e`            | Done   |
 | Sample projects pass              | Codex | `npm run alpha:readiness`                                                   | Done   |
-| Packaging smoke test completed    | Codex | `npm run package:mac`, `release/mac/AI LaTeX Editor.app`                    | Done   |
+| Packaging smoke test completed    | Codex | `npm run package:mac`, `release/mac/ZeroLeaf.app`                           | Done   |
 ```

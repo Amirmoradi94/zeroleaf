@@ -23,6 +23,7 @@ export default defineConfig({
   },
   build: {
     outDir: "dist/renderer",
-    emptyOutDir: false
+    emptyOutDir: false,
+    minify: "esbuild"
   }
 });

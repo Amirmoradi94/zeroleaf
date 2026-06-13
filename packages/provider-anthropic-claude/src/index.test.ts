@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   ClaudeProvider,
-  parseClaudePatchResponseFromCli,
-  parseClaudePatchResponse,
+  parseClaudeAgentResponseFromCli,
+  parseClaudeAgentResponse,
   type ClaudeCodeToolBroker
 } from "./index.js";
 
@@ -19,40 +19,193 @@ describe("ClaudeProvider", () => {
     });
   });
 
-  it("turns Claude output into a reviewable changeset", async () => {
+  it("runs read-only tasks through Claude Code and returns the model answer", async () => {
+    const calls: string[] = [];
     const provider = new ClaudeProvider({
       getCliAuthStatus: () => Promise.resolve({ loggedIn: true }),
       runClaudeCode: () =>
-        Promise.resolve({
+        Promise.resolve(
+          createClaudeAnswer("The active file is a short article with one warning.")
+        )
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "anthropic-claude",
+        mode: "read-only",
+        projectRoot: "/tmp/project",
+        prompt: "Summarize the active file",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex",
+        diagnostic: {
+          severity: "warning",
+          filePath: "main.tex",
+          line: 7,
+          message: "LaTeX Warning: Reference `fig:missing` undefined"
+        }
+      },
+      createBroker(calls)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(result.changeset).toBeUndefined();
+    expect(calls).toEqual(["read-file:main.tex"]);
+    expect(
+      result.events.some(
+        (event) => event.type === "tool-call" && event.toolName === "read-file"
+      )
+    ).toBe(true);
+    expect(
+      result.events.some(
+        (event) => event.type === "tool-call" && event.toolName === "claude-code"
+      )
+    ).toBe(true);
+    expect(result.events.some((event) => event.type === "patch")).toBe(false);
+    expect(result.events.some((event) => event.type === "approval")).toBe(false);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "message" &&
+          event.content.includes("The active file is a short article")
+      )
+    ).toBe(true);
+  });
+
+  it("delegates TODO and placeholder reviews in read-only mode to Claude Code", async () => {
+    const calls: string[] = [];
+    const provider = new ClaudeProvider({
+      getCliAuthStatus: () => Promise.resolve({ loggedIn: true }),
+      runClaudeCode: () =>
+        Promise.resolve(
+          createClaudeAnswer("chapters/introduction.tex:2 [TODO] verify dataset count")
+        )
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "anthropic-claude",
+        mode: "read-only",
+        projectRoot: "/tmp/project",
+        prompt: "Find TODOs, citation needed notes, and placeholders in this draft.",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls, {
+        searchResults: {
+          TODO: [
+            {
+              path: "chapters/introduction.tex",
+              contents: "Intro text\n% TODO: verify dataset count\n"
+            }
+          ],
+          "citation needed": [
+            {
+              path: "chapters/related.tex",
+              contents: "This claim still has citation needed\n"
+            }
+          ],
+          placeholder: [
+            {
+              path: "chapters/results.tex",
+              contents: "Placeholder figure caption\n"
+            }
+          ]
+        }
+      })
+    );
+
+    expect(result.status).toBe("completed");
+    expect(calls).toEqual(["read-file:main.tex"]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "message" &&
+          event.content.includes("chapters/introduction.tex:2 [TODO]")
+      )
+    ).toBe(true);
+    expect(
+      result.events.some(
+        (event) => event.type === "tool-call" && event.toolName === "claude-code"
+      )
+    ).toBe(true);
+  });
+
+  it("delegates final formatting review prompts to Claude Code", async () => {
+    const calls: string[] = [];
+    const provider = new ClaudeProvider({
+      getCliAuthStatus: () => Promise.resolve({ loggedIn: true }),
+      runClaudeCode: () =>
+        Promise.resolve(
+          createClaudeAnswer("Priority 1 blockers: Missing local figure asset.")
+        )
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "anthropic-claude",
+        mode: "read-only",
+        projectRoot: "/tmp/project",
+        prompt: [
+          "Final PDF formatting review before submission.",
+          "- warning: Generated build artifact is present in the source tree. (.latex-agent/build/main.log)"
+        ].join("\n"),
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls, {
+        readFiles: {
+          "main.tex": [
+            "\\documentclass{article}",
+            "\\usepackage{graphicx}",
+            "\\begin{document}",
+            "\\begin{figure}[ht]",
+            "\\includegraphics{figures/missing.png}",
+            "\\caption{System overview}",
+            "\\end{figure}",
+            "\\end{document}",
+            ""
+          ].join("\n")
+        }
+      })
+    );
+
+    expect(result.status).toBe("completed");
+    expect(calls).toEqual(["read-file:main.tex"]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "message" &&
+          event.content.includes("Priority 1 blockers:") &&
+          event.content.includes("Missing local figure asset")
+      )
+    ).toBe(true);
+    expect(
+      result.events.some(
+        (event) => event.type === "tool-call" && event.toolName === "claude-code"
+      )
+    ).toBe(true);
+  });
+
+  it("turns Claude output into a reviewable changeset", async () => {
+    let providerPrompt = "";
+    const provider = new ClaudeProvider({
+      getCliAuthStatus: () => Promise.resolve({ loggedIn: true }),
+      runClaudeCode: (request) => {
+        providerPrompt = request.prompt;
+        return Promise.resolve({
+          action: "patch",
           targetFilePath: "main.tex",
           summary: "Add document end",
           afterContents:
             "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+          message: "I prepared a minimal patch.",
           notes: "Generated by fake Claude runner"
-        })
+        });
+      }
     });
-    const broker: ClaudeCodeToolBroker = {
-      readFile: () =>
-        Promise.resolve({
-          path: "main.tex",
-          contents: "\\documentclass{article}\n\\begin{document}\nHello\n",
-          mtimeMs: 1
-        }),
-      searchProject: () => Promise.resolve([]),
-      proposePatch: (_filePath, _beforeContents, afterContents, summary) =>
-        Promise.resolve({
-          id: "changeset-1",
-          projectRoot: "/tmp/project",
-          filePath: "main.tex",
-          summary,
-          patch: afterContents,
-          status: "proposed",
-          baseSnapshotId: "snapshot-1",
-          createdAt: "2026-06-08T00:00:00.000Z",
-          updatedAt: "2026-06-08T00:00:00.000Z"
-        })
-    };
-
     const result = await provider.startSession(
       {
         providerId: "anthropic-claude",
@@ -61,9 +214,11 @@ describe("ClaudeProvider", () => {
         prompt: "Fix the compile error",
         activeFilePath: "main.tex",
         mainFilePath: "main.tex",
-        compiler: "pdflatex"
+        compiler: "pdflatex",
+        selectedText:
+          "This is a bit rough, but we show that results follow \\citep{smith2024}."
       },
-      broker
+      createBroker()
     );
 
     expect(result.status).toBe("awaiting-approval");
@@ -74,38 +229,131 @@ describe("ClaudeProvider", () => {
         (event) => event.type === "tool-call" && event.toolName === "claude-code"
       )
     ).toBe(true);
+    expect(providerPrompt).toContain("Change only that exact selected span");
+    expect(providerPrompt).toContain("preserve all unrelated paragraphs");
+    expect(providerPrompt).toContain("labels, references, and citations");
+    expect(providerPrompt).toContain("do not add new claims or citations");
+    expect(providerPrompt).toContain("preserve TODO lines that require user input");
+    expect(providerPrompt).toContain("preserve required contribution statements");
+    expect(providerPrompt).toContain("make the smallest syntax-only edit");
+    expect(providerPrompt).toContain("balance the caption braces without rewriting");
+    expect(providerPrompt).toContain(
+      "produce valid LaTeX using the project's existing table conventions"
+    );
+    expect(providerPrompt).toContain("mention width/layout advice in notes");
+    expect(providerPrompt).toContain("preserve citation keys, labels, file paths");
+    expect(providerPrompt).toContain('Set action to "patch" only when');
+    expect(providerPrompt).toContain("\\citep{smith2024}");
   });
 
   it("parses Claude Code structured output", () => {
     expect(
-      parseClaudePatchResponseFromCli(
+      parseClaudeAgentResponseFromCli(
         JSON.stringify({
           structured_output: {
+            action: "patch",
             targetFilePath: "main.tex",
             summary: "Fix",
             afterContents: "ok",
+            message: "patched",
             notes: "done"
           }
         })
       )
     ).toEqual({
+      action: "patch",
       targetFilePath: "main.tex",
       summary: "Fix",
       afterContents: "ok",
+      message: "patched",
       notes: "done"
     });
   });
 
   it("parses fenced JSON responses", () => {
     expect(
-      parseClaudePatchResponse(`\`\`\`json
-{"targetFilePath":"main.tex","summary":"Fix","afterContents":"ok","notes":"done"}
+      parseClaudeAgentResponse(`\`\`\`json
+{"action":"answer","targetFilePath":"main.tex","summary":"Answer","afterContents":"ok","message":"done","notes":"done"}
 \`\`\``)
     ).toEqual({
+      action: "answer",
       targetFilePath: "main.tex",
-      summary: "Fix",
+      summary: "Answer",
       afterContents: "ok",
+      message: "done",
       notes: "done"
     });
   });
+
+  it("reports empty Claude Code print results clearly", () => {
+    expect(() =>
+      parseClaudeAgentResponseFromCli(
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          num_turns: 0,
+          result: ""
+        })
+      )
+    ).toThrow("Claude Code returned an empty result");
+  });
 });
+
+function createClaudeAnswer(message: string) {
+  return {
+    action: "answer" as const,
+    targetFilePath: "main.tex",
+    summary: "Answer user question",
+    afterContents: "\\documentclass{article}\n\\begin{document}\nHello\n",
+    message,
+    notes: "Answered by fake Claude runner"
+  };
+}
+
+function createBroker(
+  calls: string[] = [],
+  options: {
+    readonly readFiles?: Readonly<Record<string, string>>;
+    readonly searchResults?: Readonly<
+      Record<string, readonly { readonly path: string; readonly contents: string }[]>
+    >;
+  } = {}
+): ClaudeCodeToolBroker {
+  return {
+    readFile: (path) => {
+      calls.push(`read-file:${path}`);
+      return Promise.resolve({
+        path,
+        contents:
+          options.readFiles?.[path] ??
+          "\\documentclass{article}\n\\begin{document}\nHello\n",
+        mtimeMs: 1
+      });
+    },
+    searchProject: (query) => {
+      calls.push(`search-project:${query}`);
+      return Promise.resolve(
+        (options.searchResults?.[query] ?? []).map((result) => ({
+          path: result.path,
+          contents: result.contents,
+          mtimeMs: 1
+        }))
+      );
+    },
+    proposePatch: (_filePath, _beforeContents, afterContents, summary) => {
+      calls.push("propose-patch");
+      return Promise.resolve({
+        id: "changeset-1",
+        projectRoot: "/tmp/project",
+        filePath: "main.tex",
+        summary,
+        patch: afterContents,
+        status: "proposed",
+        baseSnapshotId: "snapshot-1",
+        createdAt: "2026-06-08T00:00:00.000Z",
+        updatedAt: "2026-06-08T00:00:00.000Z"
+      });
+    }
+  };
+}

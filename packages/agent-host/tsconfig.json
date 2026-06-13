@@ -8,6 +8,7 @@
   "include": ["src/**/*.ts"],
   "references": [
     { "path": "../ipc-contracts" },
+    { "path": "../latex-service" },
     { "path": "../provider-anthropic-claude" },
     { "path": "../provider-openai-codex" }
   ]

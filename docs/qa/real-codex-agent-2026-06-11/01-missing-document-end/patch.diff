@@ -1,0 +1,7 @@
+--- a/main.tex
++++ b/main.tex
+@@ -3,2 +3,4 @@
+ \section{Introduction}
+ This article studies local-first review workflows for scholarly writing.
++
++\end{document}

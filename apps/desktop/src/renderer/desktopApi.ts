@@ -93,7 +93,7 @@ const fallbackApi: DesktopApi = {
   app: {
     getInfo: () =>
       Promise.resolve({
-        appName: "AI LaTeX Editor",
+        appName: "ZeroLeaf",
         appVersion: "dev",
         platform: getBrowserPlatform(),
         isPackaged: false
@@ -168,7 +168,11 @@ const fallbackApi: DesktopApi = {
     snapshotFile: () => Promise.reject(new Error("Electron history API unavailable.")),
     createChangeSet: () =>
       Promise.reject(new Error("Electron history API unavailable.")),
+    createAppliedChangeSet: () =>
+      Promise.reject(new Error("Electron history API unavailable.")),
     applyChangeSet: () =>
+      Promise.reject(new Error("Electron history API unavailable.")),
+    applyChangeSetHunks: () =>
       Promise.reject(new Error("Electron history API unavailable.")),
     rejectChangeSet: () =>
       Promise.reject(new Error("Electron history API unavailable.")),
@@ -184,7 +188,8 @@ const fallbackApi: DesktopApi = {
         missingCitations: [],
         unusedEntries: []
       }),
-    search: () => Promise.resolve([])
+    search: () => Promise.resolve([]),
+    removeUnused: () => Promise.reject(new Error("Electron reference API unavailable."))
   },
   lifecycle: {
     listTemplates: () =>
@@ -275,7 +280,8 @@ const fallbackApi: DesktopApi = {
       }),
     start: () => Promise.reject(new Error("Electron agent API unavailable.")),
     respondApproval: () => Promise.reject(new Error("Electron agent API unavailable.")),
-    cancel: () => Promise.resolve({ cancelled: false })
+    cancel: () => Promise.resolve({ cancelled: false }),
+    onEvent: () => () => undefined
   }
 };
 

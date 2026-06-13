@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Font Preview</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap");
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+      @import url("https://fonts.googleapis.com/css2?family=Merriweather:wght@400;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+      @import url("https://fonts.googleapis.com/css2?family=Nunito+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+      @import url("https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=Source+Code+Pro:wght@400;500;700&display=swap");
+      @import url("https://fonts.googleapis.com/css2?family=Source+Code+Pro:wght@400;500;700&display=swap");
+      @import url("https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;700&display=swap");
+
+      :root {
+        --bg: #f5f7fb;
+        --panel: #ffffff;
+        --line: #d9e2ef;
+        --text: #1f2937;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        padding: 32px;
+        font-family: Inter, system-ui, sans-serif;
+        background: linear-gradient(135deg, #eef3ff, #f9f4ff);
+        color: var(--text);
+      }
+
+      h1 {
+        margin-top: 0;
+        font-size: 28px;
+      }
+
+      .grid {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: 0 6px 16px rgba(31, 41, 55, 0.06);
+      }
+
+      .label {
+        margin: 0 0 10px;
+        font-size: 18px;
+        color: #0f172a;
+      }
+
+      .meta {
+        color: #64748b;
+        font-size: 12px;
+        margin-bottom: 12px;
+      }
+
+      .sample {
+        margin-top: 12px;
+        padding: 12px;
+        border-left: 3px solid #2563eb;
+        border-radius: 8px;
+        background: #f8faff;
+      }
+
+      .body-text {
+        font-size: 16px;
+        line-height: 1.5;
+        margin-bottom: 10px;
+      }
+      .ui-mini {
+        font-size: 14px;
+        color: #334155;
+      }
+      .code {
+        margin-top: 10px;
+        padding: 10px;
+        background: #0f172a;
+        color: #e2e8f0;
+        border-radius: 8px;
+        font-size: 14px;
+        white-space: pre-wrap;
+      }
+
+      .preview-source-sans-3 {
+        --ui-font: "Source Sans 3", Arial, sans-serif;
+        --mono-font: "Source Code Pro", "Courier New", monospace;
+      }
+      .preview-ibm-plex {
+        --ui-font: "IBM Plex Sans", "Arial", sans-serif;
+        --mono-font: "IBM Plex Mono", "Courier New", monospace;
+      }
+      .preview-nunito {
+        --ui-font: "Nunito Sans", "Arial", sans-serif;
+        --mono-font: "JetBrains Mono", "Consolas", monospace;
+      }
+      .preview-inter-fira {
+        --ui-font: "Inter", "Arial", sans-serif;
+        --mono-font: "Fira Code", "Consolas", monospace;
+      }
+      .preview-merriweather {
+        --ui-font: "Merriweather", Georgia, serif;
+        --mono-font: "JetBrains Mono", "Consolas", monospace;
+      }
+
+      .preview {
+        font-family: var(--ui-font);
+      }
+
+      .preview .code {
+        font-family: var(--mono-font);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Font Comparison</h1>
+    <p>Each card uses one UI font + one monospaced font for code/math-style text.</p>
+
+    <section class="grid">
+      <article class="card preview preview-source-sans-3">
+        <h2 class="label">Source Sans 3 + Source Code Pro</h2>
+        <div class="meta">UI + body: Source Sans 3 · Code: Source Code Pro</div>
+        <div class="sample">
+          <p class="body-text">
+            The quick brown fox jumps over the lazy dog. In LaTeX, \(E=mc^2\) and
+            \(\sum_{i=1}^{n} i\) should read cleanly.
+          </p>
+          <p class="ui-mini">
+            Toolbar, menus, and editor controls look clean and modern.
+          </p>
+          <div class="code">
+            \begin{equation}\n \frac{\partial u}{\partial t} = \alpha \nabla^2
+            u\n\end{equation}
+          </div>
+        </div>
+      </article>
+
+      <article class="card preview preview-ibm-plex">
+        <h2 class="label">IBM Plex Sans + IBM Plex Mono</h2>
+        <div class="meta">UI + body: IBM Plex Sans · Code: IBM Plex Mono</div>
+        <div class="sample">
+          <p class="body-text">
+            The interface feels neutral, technical, and highly readable with subtle
+            character width.
+          </p>
+          <p class="ui-mini">
+            Great for research notes, references, and frequent command entry.
+          </p>
+          <div class="code">
+            \section{Methods}\n\label{sec:methods}\n\newcommand{\vect}[1]{\boldsymbol{#1}}
+          </div>
+        </div>
+      </article>
+
+      <article class="card preview preview-nunito">
+        <h2 class="label">Nunito Sans + JetBrains Mono</h2>
+        <div class="meta">UI + body: Nunito Sans · Code: JetBrains Mono</div>
+        <div class="sample">
+          <p class="body-text">
+            A friendlier, less rigid UI while keeping math and code lines crisp.
+          </p>
+          <p class="ui-mini">
+            This pairing often feels warm without losing professionalism.
+          </p>
+          <div class="code">
+            \documentclass{article}\n\usepackage{amsmath}\n\title{Experiment Notes}
+          </div>
+        </div>
+      </article>
+
+      <article class="card preview preview-inter-fira">
+        <h2 class="label">Inter + Fira Code</h2>
+        <div class="meta">UI + body: Inter · Code: Fira Code</div>
+        <div class="sample">
+          <p class="body-text">
+            Inter gives excellent UI density and Fira Code adds readable code with
+            optional ligatures.
+          </p>
+          <p class="ui-mini">
+            If you use keyboard-heavy workflows, this is a practical default.
+          </p>
+          <div class="code">for i in {1..3}; do\n echo \"Run $i\"\ndone</div>
+        </div>
+      </article>
+
+      <article class="card preview preview-merriweather">
+        <h2 class="label">Merriweather + JetBrains Mono</h2>
+        <div class="meta">UI + body: Merriweather · Code: JetBrains Mono</div>
+        <div class="sample">
+          <p class="body-text">
+            Merriweather brings a more editorial style suitable for long-form notes and
+            writing blocks.
+          </p>
+          <p class="ui-mini">
+            This can look sharp for prose-heavy areas and still keep code distinct.
+          </p>
+          <div class="code">
+            \begin{tikzpicture}\n\draw[->] (0,0) -- (2,2);\n\end{tikzpicture}
+          </div>
+        </div>
+      </article>
+    </section>
+  </body>
+</html>

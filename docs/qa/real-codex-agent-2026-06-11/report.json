@@ -1,0 +1,65 @@
+{
+  "createdAt": "2026-06-12T06:31:48.323Z",
+  "authStatus": {
+    "providerId": "openai-codex",
+    "state": "connected",
+    "message": "Codex CLI is logged in using ChatGPT."
+  },
+  "reportRoot": "/Users/amirmoradi94/Desktop/Projects/overleaf-clone/docs/qa/real-codex-agent-2026-06-11",
+  "passed": true,
+  "results": [
+    {
+      "id": "01-missing-document-end",
+      "title": "Fix missing document terminator",
+      "passed": true,
+      "durationMs": 11272,
+      "initialCompileStatus": "failed",
+      "agentStatus": "awaiting-approval",
+      "changeSetId": "9364dfa6-b0b5-47e9-b680-bf0878c1a14c",
+      "verificationStatus": "succeeded",
+      "artifactDir": "/Users/amirmoradi94/Desktop/Projects/overleaf-clone/docs/qa/real-codex-agent-2026-06-11/01-missing-document-end"
+    },
+    {
+      "id": "02-unbalanced-caption-brace",
+      "title": "Fix unbalanced caption brace",
+      "passed": true,
+      "durationMs": 12719,
+      "initialCompileStatus": "failed",
+      "agentStatus": "awaiting-approval",
+      "changeSetId": "88ccb2b9-5f0b-4d32-ae5a-5888cea4ba3a",
+      "verificationStatus": "succeeded",
+      "artifactDir": "/Users/amirmoradi94/Desktop/Projects/overleaf-clone/docs/qa/real-codex-agent-2026-06-11/02-unbalanced-caption-brace"
+    },
+    {
+      "id": "03-selected-prose-only",
+      "title": "Improve selected prose only",
+      "passed": true,
+      "durationMs": 13544,
+      "initialCompileStatus": "succeeded",
+      "agentStatus": "awaiting-approval",
+      "changeSetId": "dd6f54af-23a8-4fac-bca8-53a05b6344ab",
+      "verificationStatus": "succeeded",
+      "artifactDir": "/Users/amirmoradi94/Desktop/Projects/overleaf-clone/docs/qa/real-codex-agent-2026-06-11/03-selected-prose-only"
+    },
+    {
+      "id": "04-insert-results-table",
+      "title": "Insert a compact results table",
+      "passed": true,
+      "durationMs": 16427,
+      "initialCompileStatus": "succeeded",
+      "agentStatus": "awaiting-approval",
+      "changeSetId": "0cced3a5-009a-4142-88c7-2a3f119b4c88",
+      "verificationStatus": "succeeded",
+      "artifactDir": "/Users/amirmoradi94/Desktop/Projects/overleaf-clone/docs/qa/real-codex-agent-2026-06-11/04-insert-results-table"
+    },
+    {
+      "id": "05-missing-package-explanation",
+      "title": "Explain missing package without fabricating a source fix",
+      "passed": true,
+      "durationMs": 12608,
+      "initialCompileStatus": "failed",
+      "agentStatus": "completed",
+      "artifactDir": "/Users/amirmoradi94/Desktop/Projects/overleaf-clone/docs/qa/real-codex-agent-2026-06-11/05-missing-package-explanation"
+    }
+  ]
+}

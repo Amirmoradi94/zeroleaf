@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { ClaudeProvider } from "@latex-agent/provider-anthropic-claude";
 import { CodexCliProvider } from "@latex-agent/provider-openai-codex";
 import type {
+  AgentMoveEntryOperation,
   AgentApprovalResponseRequest,
   AgentEvent,
   AgentProviderId,
@@ -22,6 +23,7 @@ import {
   type AgentToolRequestPayloadMap,
   type AgentToolResultMap
 } from "./index.js";
+import { completeDeniedApproval, completeDeniedNetworkApproval } from "./approval.js";
 
 type HostProviderRequest = AgentStartRequest & {
   readonly sessionId: string;
@@ -31,7 +33,10 @@ type HostSession = {
   readonly request: AgentStartRequest;
   readonly providerId: AgentProviderId;
   readonly changeset?: HistoryChangeSet;
+  readonly changesets?: readonly HistoryChangeSet[];
+  readonly moveEntries?: readonly AgentMoveEntryOperation[];
   readonly approvalId?: string;
+  readonly approvalToolName?: AgentToolName;
   readonly events: readonly AgentEvent[];
 };
 
@@ -100,7 +105,17 @@ async function startSession(
   request: AgentStartRequest
 ): Promise<void> {
   const provider = getProvider(request.providerId);
-  const sessionId = randomUUID();
+  const requestedSession =
+    request.sessionId === undefined ? undefined : sessions.get(request.sessionId);
+  const canContinueSession =
+    requestedSession !== undefined &&
+    requestedSession.providerId === request.providerId &&
+    requestedSession.request.projectRoot === request.projectRoot &&
+    requestedSession.request.mode === request.mode;
+  const sessionId =
+    canContinueSession && request.sessionId !== undefined
+      ? request.sessionId
+      : randomUUID();
   const providerRequest: HostProviderRequest = {
     ...request,
     sessionId
@@ -113,14 +128,39 @@ async function startSession(
     (event) => event.type === "approval" && event.status === "requested"
   );
 
+  const previousEvents = canContinueSession ? requestedSession.events : [];
   sessions.set(result.sessionId, {
-    request,
+    request: providerRequest,
     providerId: result.providerId,
-    events: result.events,
-    ...(result.changeset === undefined ? {} : { changeset: result.changeset }),
+    events: [...previousEvents, ...result.events],
+    ...(result.changeset !== undefined
+      ? { changeset: result.changeset }
+      : requestedSession?.changeset === undefined
+        ? {}
+        : { changeset: requestedSession.changeset }),
+    ...(result.changesets !== undefined
+      ? { changesets: result.changesets }
+      : requestedSession?.changesets === undefined
+        ? {}
+        : { changesets: requestedSession.changesets }),
+    ...(result.moveEntries !== undefined
+      ? { moveEntries: result.moveEntries }
+      : requestedSession?.moveEntries === undefined
+        ? {}
+        : { moveEntries: requestedSession.moveEntries }),
     ...(approvalEvent?.type === "approval"
-      ? { approvalId: approvalEvent.approvalId }
-      : {})
+      ? {
+          approvalId: approvalEvent.approvalId,
+          approvalToolName: approvalEvent.toolName
+        }
+      : requestedSession?.approvalId === undefined
+        ? {}
+        : {
+            approvalId: requestedSession.approvalId,
+            ...(requestedSession.approvalToolName === undefined
+              ? {}
+              : { approvalToolName: requestedSession.approvalToolName })
+          })
   });
 
   sendHostMessage({
@@ -148,26 +188,56 @@ async function respondApproval(
     createApprovalEvent(
       request.sessionId,
       request.approvalId,
-      "apply-patch",
+      session.approvalToolName ?? "apply-patch",
       "high",
       request.decision
     )
   ];
 
   if (request.decision === "denied") {
+    const result =
+      session.approvalToolName === "network-fetch"
+        ? completeDeniedNetworkApproval({
+            providerId: session.providerId,
+            request,
+            baseEvents
+          })
+        : await completeDeniedApproval({
+            session,
+            request,
+            baseEvents,
+            broker: createBrokerProxy(request.sessionId, session.request)
+          });
+    sessions.set(request.sessionId, {
+      ...session,
+      events: [...session.events, ...result.events]
+    });
+    sendHostMessage({ type: "session.result", requestId, result });
+    return;
+  }
+
+  if (session.approvalToolName === "network-fetch") {
     const result: AgentSessionResult = {
       sessionId: request.sessionId,
       providerId: session.providerId,
       status: "completed",
       events: [
         ...baseEvents,
+        {
+          id: randomUUID(),
+          sessionId: request.sessionId,
+          createdAt: new Date().toISOString(),
+          type: "message",
+          role: "assistant",
+          content:
+            "Network-enabled fetch is not implemented in this local-first build. Paste the DOI metadata, BibTeX, or web text if you want a local-only follow-up."
+        },
         createVerificationEvent(
           request.sessionId,
           "failed",
-          "Patch approval was denied; no files were changed."
+          "Network approval was allowed, but external fetch is not implemented in this local-first build."
         )
-      ],
-      ...(session.changeset === undefined ? {} : { changeset: session.changeset })
+      ]
     };
     sessions.set(request.sessionId, {
       ...session,
@@ -177,40 +247,77 @@ async function respondApproval(
     return;
   }
 
-  if (session.changeset === undefined) {
+  if (session.changeset === undefined && (session.changesets?.length ?? 0) === 0) {
     throw new Error("Approved session has no changeset to apply.");
   }
 
   const broker = createBrokerProxy(request.sessionId, session.request);
   const events: AgentEvent[] = [...baseEvents];
+  for (const moveEntry of session.moveEntries ?? []) {
+    events.push(
+      createToolEvent(
+        request.sessionId,
+        "move-entry",
+        "running",
+        `Moving ${moveEntry.fromPath} to ${moveEntry.toPath}`,
+        "high"
+      )
+    );
+    await broker.moveEntry?.(moveEntry.fromPath, moveEntry.toPath);
+    events.push(
+      createToolEvent(
+        request.sessionId,
+        "move-entry",
+        "succeeded",
+        `Moved ${moveEntry.fromPath} to ${moveEntry.toPath}`,
+        "high"
+      )
+    );
+  }
+
+  const pendingChangeSets =
+    session.changesets ?? (session.changeset === undefined ? [] : [session.changeset]);
+
+  let appliedChangeSet = session.changeset;
+  const appliedChangeSets: HistoryChangeSet[] = [];
+  for (const changeSet of pendingChangeSets) {
+    events.push(
+      createToolEvent(
+        request.sessionId,
+        "apply-patch",
+        "running",
+        `Applying ${changeSet.summary}`,
+        "high"
+      )
+    );
+    const applied = await broker.applyPatch(changeSet.id);
+    appliedChangeSets.push(applied);
+    appliedChangeSet =
+      appliedChangeSet?.id === changeSet.id || appliedChangeSet === undefined
+        ? applied
+        : appliedChangeSet;
+    events.push(
+      createToolEvent(
+        request.sessionId,
+        "apply-patch",
+        "succeeded",
+        `Applied ${applied.summary}`,
+        "high"
+      ),
+      {
+        id: randomUUID(),
+        sessionId: request.sessionId,
+        createdAt: new Date().toISOString(),
+        type: "patch",
+        changesetId: applied.id,
+        filePath: applied.filePath,
+        summary: applied.summary,
+        status: applied.status
+      }
+    );
+  }
+
   events.push(
-    createToolEvent(
-      request.sessionId,
-      "apply-patch",
-      "running",
-      `Applying ${session.changeset.summary}`,
-      "high"
-    )
-  );
-  const appliedChangeSet = await broker.applyPatch(session.changeset.id);
-  events.push(
-    createToolEvent(
-      request.sessionId,
-      "apply-patch",
-      "succeeded",
-      `Applied ${appliedChangeSet.summary}`,
-      "high"
-    ),
-    {
-      id: randomUUID(),
-      sessionId: request.sessionId,
-      createdAt: new Date().toISOString(),
-      type: "patch",
-      changesetId: appliedChangeSet.id,
-      filePath: appliedChangeSet.filePath,
-      summary: appliedChangeSet.summary,
-      status: appliedChangeSet.status
-    },
     createToolEvent(
       request.sessionId,
       "run-compile",
@@ -225,13 +332,17 @@ async function respondApproval(
       request.sessionId,
       "run-compile",
       buildResult.status === "succeeded" ? "succeeded" : "failed",
-      `Compile ${buildResult.status}`,
+      `Compile ${buildResult.status} with ${buildResult.diagnostics.length} diagnostic${
+        buildResult.diagnostics.length === 1 ? "" : "s"
+      }`,
       "medium"
     ),
     createVerificationEvent(
       request.sessionId,
       buildResult.status === "succeeded" ? "passed" : "failed",
-      `Compile verification ${buildResult.status}`,
+      `Compile verification ${buildResult.status} with ${buildResult.diagnostics.length} diagnostic${
+        buildResult.diagnostics.length === 1 ? "" : "s"
+      }`,
       buildResult.jobId
     )
   );
@@ -241,13 +352,15 @@ async function respondApproval(
     providerId: session.providerId,
     status: "completed",
     events,
-    changeset: appliedChangeSet,
+    ...(appliedChangeSet === undefined ? {} : { changeset: appliedChangeSet }),
+    ...(session.changesets === undefined ? {} : { changesets: appliedChangeSets }),
     buildResult
   };
   sessions.set(request.sessionId, {
     ...session,
     events: [...session.events, ...events],
-    changeset: appliedChangeSet
+    ...(appliedChangeSet === undefined ? {} : { changeset: appliedChangeSet }),
+    ...(session.changesets === undefined ? {} : { changesets: appliedChangeSets })
   });
   sendHostMessage({ type: "session.result", requestId, result });
 }
@@ -286,12 +399,28 @@ function createBrokerProxy(
     readFile: (path) => requestTool(sessionId, context, "read-file", { path }),
     searchProject: (query) =>
       requestTool(sessionId, context, "search-project", { query }),
+    moveEntry: (fromPath, toPath) =>
+      requestTool(sessionId, context, "move-entry", {
+        fromPath,
+        toPath,
+        approved: true
+      }),
+    setMainFile: (path) =>
+      requestTool(sessionId, context, "set-main-file", {
+        path,
+        approved: true
+      }),
     proposePatch: (filePath, beforeContents, afterContents, summary) =>
       requestTool(sessionId, context, "propose-patch", {
         filePath,
         beforeContents,
         afterContents,
         summary
+      }),
+    rejectPatch: (changesetId) =>
+      requestTool(sessionId, context, "reject-patch", {
+        changesetId,
+        approved: false
       }),
     applyPatch: (changesetId) =>
       requestTool(sessionId, context, "apply-patch", {

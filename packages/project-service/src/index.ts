@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
   access,
@@ -6,7 +7,6 @@ import {
   readFile,
   realpath,
   rename,
-  rm,
   stat,
   writeFile
 } from "node:fs/promises";
@@ -46,6 +46,12 @@ export type ProjectOpenResult = {
   readonly recentProjects: readonly RecentProject[];
 };
 
+export type ProjectDeleteBackup = {
+  readonly deletedPath: string;
+  readonly backupPath: string;
+  readonly deletedAt: string;
+};
+
 export type ProjectEntryKind = "directory" | "file";
 
 export type ProjectFileSnapshot = {
@@ -80,6 +86,7 @@ const ignoredDirectories = new Set([
 const maxTreeDepth = 8;
 const maxTreeEntries = 2500;
 const mainFileReadLimit = 80_000;
+const internalMetadataPath = ".latex-agent";
 
 export class ProjectServiceError extends Error {
   constructor(
@@ -91,6 +98,7 @@ export class ProjectServiceError extends Error {
       | "not-directory"
       | "not-file"
       | "not-readable"
+      | "unsupported-project"
   ) {
     super(message);
     this.name = "ProjectServiceError";
@@ -169,10 +177,19 @@ export async function openProject(
 ): Promise<ProjectOpenResult> {
   const root = await validateProjectRoot(rootPath);
   const tree = await listProjectTree(root);
+  const texPaths = getTexFilePaths(tree);
+
+  if (texPaths.length === 0) {
+    throw new ProjectServiceError(
+      "Choose a folder that contains at least one .tex file.",
+      "unsupported-project"
+    );
+  }
+
   const storedSettings = await metadataStore.readProjectSettings(root);
   const mainFilePath =
     getAvailableMainFilePath(tree, storedSettings.mainFilePath) ??
-    (await detectMainTexFile(root, tree));
+    (await detectMainTexFile(root, tree, texPaths));
   const project = withOptionalMainFile(
     {
       rootPath: root,
@@ -219,7 +236,17 @@ export async function validateProjectRoot(rootPath: string): Promise<string> {
     throw new ProjectServiceError("Project root is required.", "invalid-root");
   }
 
-  const resolvedRoot = await realpath(rootPath);
+  let resolvedRoot: string;
+
+  try {
+    resolvedRoot = await realpath(rootPath);
+  } catch {
+    throw new ProjectServiceError(
+      "Project folder is missing or inaccessible.",
+      "invalid-root"
+    );
+  }
+
   const rootStats = await stat(resolvedRoot);
 
   if (!rootStats.isDirectory()) {
@@ -394,26 +421,57 @@ export async function moveProjectEntry(
 export async function deleteProjectEntry(
   rootPath: string,
   path: string
-): Promise<void> {
+): Promise<ProjectDeleteBackup> {
   const root = await validateProjectRoot(rootPath);
   const targetPath = await resolveExistingProjectPath(root, path);
+  const deletedPath = toProjectPath(root, targetPath);
 
   if (targetPath === root) {
     throw new ProjectServiceError("Cannot delete the project root.", "outside-root");
   }
 
-  await rm(targetPath, { recursive: true, force: false });
+  if (
+    deletedPath === internalMetadataPath ||
+    deletedPath.startsWith(`${internalMetadataPath}/`)
+  ) {
+    throw new ProjectServiceError("Cannot delete app metadata.", "invalid-name");
+  }
+
+  const deletedAt = new Date().toISOString();
+  const backupRoot = join(
+    root,
+    internalMetadataPath,
+    "backups",
+    "deleted",
+    `${deletedAt.replaceAll(":", "-")}-${randomUUID()}`
+  );
+  const backupPath = join(backupRoot, deletedPath);
+
+  if (!isInsideRoot(root, backupPath)) {
+    throw new ProjectServiceError(
+      "Backup path resolves outside the project root.",
+      "outside-root"
+    );
+  }
+
+  await mkdir(dirname(backupPath), { recursive: true });
+  await rename(targetPath, backupPath);
+
+  return {
+    deletedPath,
+    backupPath: toProjectPath(root, backupPath),
+    deletedAt
+  };
 }
 
 export async function detectMainTexFile(
   rootPath: string,
-  tree?: readonly ProjectFileTreeNode[]
+  tree?: readonly ProjectFileTreeNode[],
+  texFilePaths?: readonly string[]
 ): Promise<string | undefined> {
   const root = await validateProjectRoot(rootPath);
   const nodes = tree ?? (await listProjectTree(root));
-  const texPaths = flattenTree(nodes)
-    .filter((node) => node.kind === "file" && node.path.endsWith(".tex"))
-    .map((node) => node.path);
+  const texPaths = texFilePaths ?? getTexFilePaths(nodes);
 
   if (texPaths.includes("main.tex")) {
     return "main.tex";
@@ -537,6 +595,12 @@ function flattenTree(
     node,
     ...(node.children === undefined ? [] : flattenTree(node.children))
   ]);
+}
+
+function getTexFilePaths(nodes: readonly ProjectFileTreeNode[]): readonly string[] {
+  return flattenTree(nodes)
+    .filter((node) => node.kind === "file" && node.path.endsWith(".tex"))
+    .map((node) => node.path);
 }
 
 function getAvailableMainFilePath(

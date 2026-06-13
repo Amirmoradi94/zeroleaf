@@ -11,8 +11,8 @@ const packageJson = JSON.parse(
 const version =
   typeof packageJson.version === "string" ? packageJson.version : "0.0.0-alpha";
 const releaseRoot = resolve(repoRoot, "release/mac");
-const appPath = resolve(releaseRoot, "AI LaTeX Editor.app");
-const zipPath = resolve(releaseRoot, `AI-LaTeX-Editor-${version}-mac.zip`);
+const appPath = resolve(releaseRoot, "ZeroLeaf.app");
+const zipPath = resolve(releaseRoot, `ZeroLeaf-${version}-mac.zip`);
 
 await mkdir(releaseRoot, { recursive: true });
 await stat(appPath);

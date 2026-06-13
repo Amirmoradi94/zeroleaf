@@ -1,0 +1,107 @@
+[
+  {
+    "id": "6087b2ee-1687-4567-a605-26015b05eb43",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:42.005Z",
+    "type": "message",
+    "role": "user",
+    "content": "Fix the compile error with the smallest syntax-only edit. Do not rewrite prose."
+  },
+  {
+    "id": "c33d3bd1-5fbe-48f1-ae5e-0e029ad925ed",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:42.005Z",
+    "type": "message",
+    "role": "assistant",
+    "content": "I will ask the installed Codex CLI to inspect the project and decide whether to answer or propose a reviewable patch."
+  },
+  {
+    "id": "dc5fd519-d317-4c24-bd69-9d7c1da38850",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:42.005Z",
+    "type": "tool-call",
+    "toolName": "read-file",
+    "status": "running",
+    "summary": "Reading main.tex",
+    "risk": "low"
+  },
+  {
+    "id": "213ec24f-6f8f-4d4a-be73-d41a7ce137c6",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:42.005Z",
+    "type": "tool-call",
+    "toolName": "read-file",
+    "status": "succeeded",
+    "summary": "Read main.tex",
+    "risk": "low"
+  },
+  {
+    "id": "1afbd0b6-59f0-4ed0-a581-71cf4d3d216b",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:42.005Z",
+    "type": "tool-call",
+    "toolName": "codex-exec",
+    "status": "running",
+    "summary": "Running installed Codex CLI in a read-only project sandbox",
+    "risk": "medium"
+  },
+  {
+    "id": "c4afffd6-1f03-46eb-b4de-8242aeba8c92",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:52.448Z",
+    "type": "tool-call",
+    "toolName": "codex-exec",
+    "status": "succeeded",
+    "summary": "No prose was rewritten.",
+    "risk": "medium"
+  },
+  {
+    "id": "41dfad6f-33f9-47f0-872e-602d293984d8",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:52.448Z",
+    "type": "tool-call",
+    "toolName": "propose-patch",
+    "status": "running",
+    "summary": "Creating review patch for main.tex",
+    "risk": "medium"
+  },
+  {
+    "id": "dc09db0f-ad77-471b-ae07-17c71cddef0a",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:52.452Z",
+    "type": "tool-call",
+    "toolName": "propose-patch",
+    "status": "succeeded",
+    "summary": "Created changeset 9364dfa6-b0b5-47e9-b680-bf0878c1a14c",
+    "risk": "medium"
+  },
+  {
+    "id": "5cd5a513-3e99-4312-8b65-10bb93e02fb7",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:52.452Z",
+    "type": "patch",
+    "changesetId": "9364dfa6-b0b5-47e9-b680-bf0878c1a14c",
+    "filePath": "main.tex",
+    "summary": "Added the missing document terminator.",
+    "status": "proposed"
+  },
+  {
+    "id": "bee4f3e8-60f2-4382-b138-5710d081f571",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:52.452Z",
+    "type": "approval",
+    "approvalId": "11b05107-6c22-4d6d-b277-6005355fb312",
+    "toolName": "apply-patch",
+    "risk": "high",
+    "prompt": "Review the Codex patch before applying it to the project.",
+    "status": "requested"
+  },
+  {
+    "id": "adb6a308-2434-46fc-8f8d-6d48586659de",
+    "sessionId": "564ba2b1-344f-483a-b7a4-758b6a17e3c2",
+    "createdAt": "2026-06-12T06:30:52.452Z",
+    "type": "verification",
+    "status": "pending",
+    "summary": "Apply the Codex patch to start compile verification."
+  }
+]

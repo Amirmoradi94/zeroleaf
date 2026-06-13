@@ -55,6 +55,13 @@ export type CreateChangeSetRequest = {
   readonly summary: string;
 };
 
+export type CreateAppliedChangeSetRequest = CreateChangeSetRequest;
+
+export type ApplyChangeSetHunksRequest = {
+  readonly changesetId: string;
+  readonly acceptedHunkIndexes: readonly number[];
+};
+
 export type RecordAuditEventRequest = {
   readonly projectRoot: string;
   readonly eventType: string;
@@ -82,6 +89,8 @@ export class HistoryServiceError extends Error {
       | "not-directory"
       | "not-file"
       | "invalid-state"
+      | "invalid-hunk"
+      | "rollback-conflict"
   ) {
     super(message);
     this.name = "HistoryServiceError";
@@ -180,6 +189,19 @@ export class HistoryStore {
   }
 
   async createChangeSet(request: CreateChangeSetRequest): Promise<HistoryChangeSet> {
+    return await this.createChangeSetRecord(request, "proposed");
+  }
+
+  async createAppliedChangeSet(
+    request: CreateAppliedChangeSetRequest
+  ): Promise<HistoryChangeSet> {
+    return await this.createChangeSetRecord(request, "applied");
+  }
+
+  private async createChangeSetRecord(
+    request: CreateChangeSetRequest,
+    status: "proposed" | "applied"
+  ): Promise<HistoryChangeSet> {
     const root = await validateProjectRoot(request.projectRoot);
     const filePath = normalizeProjectPath(root, request.filePath);
 
@@ -204,10 +226,11 @@ export class HistoryStore {
         request.beforeContents,
         request.afterContents
       ),
-      status: "proposed" as const,
+      status,
       baseSnapshotId: baseSnapshot.id,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      ...(status === "applied" ? { appliedAt: now } : {})
     };
 
     this.db
@@ -215,9 +238,10 @@ export class HistoryStore {
         `insert into changesets
           (
             id, project_id, project_root, file_path, summary, patch, status,
-            before_snapshot_id, before_contents, after_contents, created_at, updated_at
+            before_snapshot_id, before_contents, after_contents, created_at,
+            updated_at, applied_at
           )
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         changeset.id,
@@ -231,7 +255,8 @@ export class HistoryStore {
         request.beforeContents,
         request.afterContents,
         changeset.createdAt,
-        changeset.updatedAt
+        changeset.updatedAt,
+        changeset.appliedAt ?? null
       );
     this.recordAudit(
       projectId,
@@ -240,6 +265,15 @@ export class HistoryStore {
       "changeset.created",
       changeset.summary
     );
+    if (status === "applied") {
+      this.recordAudit(
+        projectId,
+        root,
+        changeset.id,
+        "changeset.applied",
+        `Saved ${filePath}`
+      );
+    }
 
     return changeset;
   }
@@ -291,6 +325,97 @@ export class HistoryStore {
     return this.getChangeSet(changeset.id);
   }
 
+  async applyChangeSetHunks(
+    request: ApplyChangeSetHunksRequest
+  ): Promise<HistoryChangeSet> {
+    const changeset = this.getChangeSetRowWithContents(request.changesetId);
+
+    if (changeset.status !== "proposed") {
+      throw new HistoryServiceError(
+        "Only proposed changesets can be applied.",
+        "invalid-state"
+      );
+    }
+
+    const hunks = getDiffHunkRanges(
+      splitDiffLines(changeset.before_contents),
+      splitDiffLines(changeset.after_contents)
+    );
+    const acceptedHunkIndexes = [...new Set(request.acceptedHunkIndexes)].sort(
+      (left, right) => left - right
+    );
+
+    if (acceptedHunkIndexes.length === 0) {
+      throw new HistoryServiceError(
+        "At least one hunk must be accepted before applying.",
+        "empty-change"
+      );
+    }
+
+    if (
+      acceptedHunkIndexes.some(
+        (hunkIndex) =>
+          !Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= hunks.length
+      )
+    ) {
+      throw new HistoryServiceError("Accepted hunk index is invalid.", "invalid-hunk");
+    }
+
+    const acceptedContents =
+      acceptedHunkIndexes.length === hunks.length
+        ? changeset.after_contents
+        : buildContentsFromAcceptedHunks(
+            changeset.before_contents,
+            changeset.after_contents,
+            acceptedHunkIndexes
+          );
+
+    if (acceptedContents === changeset.before_contents) {
+      throw new HistoryServiceError(
+        "Accepted hunks do not change the file.",
+        "empty-change"
+      );
+    }
+
+    await writeProjectFile(
+      changeset.project_root,
+      changeset.file_path,
+      acceptedContents
+    );
+
+    const appliedAt = new Date().toISOString();
+    const patch = generateUnifiedDiff(
+      changeset.file_path,
+      changeset.before_contents,
+      acceptedContents
+    );
+    this.db
+      .prepare(
+        `update changesets
+            set patch = ?,
+                after_contents = ?,
+                status = ?,
+                updated_at = ?,
+                applied_at = coalesce(?, applied_at)
+          where id = ?`
+      )
+      .run(
+        patch,
+        acceptedContents,
+        "applied",
+        new Date().toISOString(),
+        appliedAt,
+        changeset.id
+      );
+    this.recordAuditForChangeSet(
+      changeset,
+      "changeset.applied",
+      `Applied ${acceptedHunkIndexes.length} of ${hunks.length} hunks from ${changeset.summary}`
+    );
+
+    return this.getChangeSet(changeset.id);
+  }
+
   rejectChangeSet(changesetId: string): HistoryChangeSet {
     const changeset = this.getChangeSetRowWithContents(changesetId);
 
@@ -325,6 +450,14 @@ export class HistoryStore {
       await resolveExistingProjectPath(changeset.project_root, changeset.file_path),
       "utf8"
     );
+
+    if (currentContents !== changeset.after_contents) {
+      throw new HistoryServiceError(
+        "Cannot roll back changeset because the file changed after the patch was applied.",
+        "rollback-conflict"
+      );
+    }
+
     await this.snapshotFile({
       projectRoot: changeset.project_root,
       filePath: changeset.file_path,
@@ -633,55 +766,191 @@ export function generateUnifiedDiff(
 ): string {
   const beforeLines = splitDiffLines(beforeContents);
   const afterLines = splitDiffLines(afterContents);
-  const diffLines = diffLineEntries(beforeLines, afterLines);
-  const oldCount = Math.max(beforeLines.length, 1);
-  const newCount = Math.max(afterLines.length, 1);
+  const ops = diffLineOps(beforeLines, afterLines);
+  const hunks = getDiffHunks(beforeLines, afterLines);
+  const diffLines =
+    hunks.length === 0
+      ? [
+          `@@ -1,${Math.max(beforeLines.length, 1)} +1,${Math.max(afterLines.length, 1)} @@`,
+          " "
+        ]
+      : hunks.flatMap((hunk) => [
+          `@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`,
+          ...ops.slice(hunk.startIndex, hunk.endIndex + 1).map(formatDiffOp)
+        ]);
 
-  return [
-    `--- a/${filePath}`,
-    `+++ b/${filePath}`,
-    `@@ -1,${oldCount} +1,${newCount} @@`,
-    ...diffLines
-  ].join("\n");
+  return [`--- a/${filePath}`, `+++ b/${filePath}`, ...diffLines].join("\n");
 }
 
-function diffLineEntries(
+type DiffLineOp = {
+  readonly kind: "context" | "delete" | "insert";
+  readonly line: string;
+};
+
+type DiffHunk = {
+  readonly startIndex: number;
+  readonly endIndex: number;
+  readonly oldStart: number;
+  readonly oldCount: number;
+  readonly newStart: number;
+  readonly newCount: number;
+};
+
+function diffLineOps(
   beforeLines: readonly string[],
   afterLines: readonly string[]
-): readonly string[] {
+): readonly DiffLineOp[] {
   const table = buildLcsTable(beforeLines, afterLines);
-  const output: string[] = [];
+  const output: DiffLineOp[] = [];
   let beforeIndex = 0;
   let afterIndex = 0;
 
   while (beforeIndex < beforeLines.length && afterIndex < afterLines.length) {
     if (beforeLines[beforeIndex] === afterLines[afterIndex]) {
-      output.push(` ${beforeLines[beforeIndex] ?? ""}`);
+      output.push({ kind: "context", line: beforeLines[beforeIndex] ?? "" });
       beforeIndex += 1;
       afterIndex += 1;
     } else if (
       getTableScore(table, beforeIndex + 1, afterIndex) >=
       getTableScore(table, beforeIndex, afterIndex + 1)
     ) {
-      output.push(`-${beforeLines[beforeIndex] ?? ""}`);
+      output.push({ kind: "delete", line: beforeLines[beforeIndex] ?? "" });
       beforeIndex += 1;
     } else {
-      output.push(`+${afterLines[afterIndex] ?? ""}`);
+      output.push({ kind: "insert", line: afterLines[afterIndex] ?? "" });
       afterIndex += 1;
     }
   }
 
   while (beforeIndex < beforeLines.length) {
-    output.push(`-${beforeLines[beforeIndex] ?? ""}`);
+    output.push({ kind: "delete", line: beforeLines[beforeIndex] ?? "" });
     beforeIndex += 1;
   }
 
   while (afterIndex < afterLines.length) {
-    output.push(`+${afterLines[afterIndex] ?? ""}`);
+    output.push({ kind: "insert", line: afterLines[afterIndex] ?? "" });
     afterIndex += 1;
   }
 
-  return output.length === 0 ? [" "] : output;
+  return output.length === 0 ? [{ kind: "context", line: "" }] : output;
+}
+
+function getDiffHunks(
+  beforeLines: readonly string[],
+  afterLines: readonly string[]
+): readonly DiffHunk[] {
+  const ops = diffLineOps(beforeLines, afterLines);
+  return getDiffHunkRanges(beforeLines, afterLines, ops);
+}
+
+function getDiffHunkRanges(
+  beforeLines: readonly string[],
+  afterLines: readonly string[],
+  ops: readonly DiffLineOp[] = diffLineOps(beforeLines, afterLines)
+): readonly DiffHunk[] {
+  const contextRadius = 2;
+  const changeIndexes = ops
+    .map((op, index) => (op.kind === "context" ? -1 : index))
+    .filter((index) => index >= 0);
+
+  if (changeIndexes.length === 0) {
+    return [];
+  }
+
+  const ranges: { startIndex: number; endIndex: number }[] = [];
+  let startIndex = Math.max(0, (changeIndexes[0] ?? 0) - contextRadius);
+  let endIndex = Math.min(ops.length - 1, (changeIndexes[0] ?? 0) + contextRadius);
+
+  for (const changeIndex of changeIndexes.slice(1)) {
+    const nextStart = Math.max(0, changeIndex - contextRadius);
+    const nextEnd = Math.min(ops.length - 1, changeIndex + contextRadius);
+
+    if (nextStart <= endIndex + 1) {
+      endIndex = Math.max(endIndex, nextEnd);
+      continue;
+    }
+
+    ranges.push({ startIndex, endIndex });
+    startIndex = nextStart;
+    endIndex = nextEnd;
+  }
+
+  ranges.push({ startIndex, endIndex });
+
+  return ranges.map((range) => {
+    const beforeConsumedBeforeRange = countOps(
+      ops.slice(0, range.startIndex),
+      "before"
+    );
+    const afterConsumedBeforeRange = countOps(ops.slice(0, range.startIndex), "after");
+    const rangeOps = ops.slice(range.startIndex, range.endIndex + 1);
+
+    return {
+      ...range,
+      oldStart: beforeConsumedBeforeRange + 1,
+      oldCount: Math.max(countOps(rangeOps, "before"), 1),
+      newStart: afterConsumedBeforeRange + 1,
+      newCount: Math.max(countOps(rangeOps, "after"), 1)
+    };
+  });
+}
+
+function countOps(ops: readonly DiffLineOp[], side: "before" | "after"): number {
+  return ops.filter((op) =>
+    side === "before" ? op.kind !== "insert" : op.kind !== "delete"
+  ).length;
+}
+
+function formatDiffOp(op: DiffLineOp): string {
+  switch (op.kind) {
+    case "context":
+      return ` ${op.line}`;
+    case "delete":
+      return `-${op.line}`;
+    case "insert":
+      return `+${op.line}`;
+  }
+}
+
+function buildContentsFromAcceptedHunks(
+  beforeContents: string,
+  afterContents: string,
+  acceptedHunkIndexes: readonly number[]
+): string {
+  const beforeLines = splitDiffLines(beforeContents);
+  const afterLines = splitDiffLines(afterContents);
+  const ops = diffLineOps(beforeLines, afterLines);
+  const hunks = getDiffHunkRanges(beforeLines, afterLines, ops);
+  const acceptedIndexes = new Set(acceptedHunkIndexes);
+  const hunkIndexByOpIndex = new Map<number, number>();
+
+  hunks.forEach((hunk, hunkIndex) => {
+    for (let opIndex = hunk.startIndex; opIndex <= hunk.endIndex; opIndex += 1) {
+      hunkIndexByOpIndex.set(opIndex, hunkIndex);
+    }
+  });
+
+  const output: string[] = [];
+
+  ops.forEach((op, opIndex) => {
+    if (op.kind === "context") {
+      output.push(op.line);
+      return;
+    }
+
+    const hunkIndex = hunkIndexByOpIndex.get(opIndex);
+    const accepted = hunkIndex !== undefined && acceptedIndexes.has(hunkIndex);
+
+    if (accepted && op.kind === "insert") {
+      output.push(op.line);
+    }
+
+    if (!accepted && op.kind === "delete") {
+      output.push(op.line);
+    }
+  });
+
+  return `${output.join("\n")}${beforeContents.endsWith("\n") || afterContents.endsWith("\n") ? "\n" : ""}`;
 }
 
 function buildLcsTable(

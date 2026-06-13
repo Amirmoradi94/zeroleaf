@@ -33,16 +33,18 @@ export type ClaudeCodeRequest = {
   readonly timeoutMs: number;
 };
 
-export type ClaudePatchResponse = {
+export type ClaudeAgentResponse = {
+  readonly action: "answer" | "patch";
   readonly targetFilePath: string;
   readonly summary: string;
   readonly afterContents: string;
+  readonly message: string;
   readonly notes: string;
 };
 
 export type ClaudeCodeRunner = (
   request: ClaudeCodeRequest
-) => Promise<ClaudePatchResponse>;
+) => Promise<ClaudeAgentResponse>;
 
 export type ClaudeAuthStatusRunner = () => Promise<ClaudeCodeAuthStatus>;
 
@@ -121,7 +123,7 @@ export class ClaudeProvider {
       createMessageEvent(
         sessionId,
         "assistant",
-        "I will ask the installed Claude Code CLI for a minimal full-file replacement, then turn it into a reviewable patch."
+        "I will ask the installed Claude Code CLI to inspect the project and decide whether to answer or propose a reviewable patch."
       )
     ];
     const targetPath = request.activeFilePath ?? request.mainFilePath;
@@ -152,32 +154,16 @@ export class ClaudeProvider {
       )
     );
 
-    if (request.mode === "read-only") {
-      events.push(
-        createMessageEvent(
-          sessionId,
-          "assistant",
-          "Read-only mode is active, so I stopped before asking Claude for edits."
-        )
-      );
-      return {
-        sessionId,
-        providerId: this.id,
-        status: "completed",
-        events
-      };
-    }
-
     events.push(
       createToolEvent(
         sessionId,
         "claude-code",
         "running",
-        "Running installed Claude Code CLI with built-in tools disabled",
+        "Running installed Claude Code CLI",
         "medium"
       )
     );
-    const claudePatch = await this.runClaudeCode({
+    const claudeResponse = await this.runClaudeCode({
       projectRoot: request.projectRoot,
       timeoutMs: this.timeoutMs,
       prompt: createClaudePrompt(request, snapshot)
@@ -187,7 +173,7 @@ export class ClaudeProvider {
         sessionId,
         "claude-code",
         "succeeded",
-        claudePatch.notes,
+        claudeResponse.notes,
         "medium"
       )
     );
@@ -201,12 +187,44 @@ export class ClaudeProvider {
       };
     }
 
-    if (claudePatch.afterContents === snapshot.contents) {
+    if (
+      claudeResponse.action === "answer" ||
+      (request.mode === "read-only" && claudeResponse.action === "patch")
+    ) {
       events.push(
         createMessageEvent(
           sessionId,
           "assistant",
-          "Claude did not propose a file change for this request."
+          claudeResponse.action === "patch"
+            ? [
+                claudeResponse.message,
+                "Claude identified a possible source edit, but the current agent mode is read-only. Switch to review mode if you want a patch."
+              ]
+                .filter((line) => line.trim().length > 0)
+                .join("\n\n")
+            : claudeResponse.message
+        )
+      );
+      return {
+        sessionId,
+        providerId: this.id,
+        status: "completed",
+        events
+      };
+    }
+
+    const patchSnapshot =
+      claudeResponse.targetFilePath === snapshot.path
+        ? snapshot
+        : await broker.readFile(claudeResponse.targetFilePath);
+
+    if (claudeResponse.afterContents === patchSnapshot.contents) {
+      events.push(
+        createMessageEvent(
+          sessionId,
+          "assistant",
+          claudeResponse.message ||
+            "Claude did not propose a file change for this request."
         )
       );
       return {
@@ -222,15 +240,15 @@ export class ClaudeProvider {
         sessionId,
         "propose-patch",
         "running",
-        `Creating review patch for ${snapshot.path}`,
+        `Creating review patch for ${patchSnapshot.path}`,
         "medium"
       )
     );
     const changeset = await broker.proposePatch(
-      snapshot.path,
-      snapshot.contents,
-      claudePatch.afterContents,
-      normalizeSummary(claudePatch.summary)
+      patchSnapshot.path,
+      patchSnapshot.contents,
+      claudeResponse.afterContents,
+      normalizeSummary(claudeResponse.summary)
     );
     events.push(
       createToolEvent(
@@ -294,7 +312,7 @@ async function runClaudeCode(
   claudeBinary: string,
   model: string,
   request: ClaudeCodeRequest
-): Promise<ClaudePatchResponse> {
+): Promise<ClaudeAgentResponse> {
   const { stdout } = await runCommand(
     claudeBinary,
     [
@@ -305,6 +323,9 @@ async function runClaudeCode(
       JSON.stringify(claudeOutputSchema),
       "--permission-mode",
       "dontAsk",
+      "--setting-sources",
+      "local",
+      "--disable-slash-commands",
       "--tools",
       "",
       "--no-session-persistence",
@@ -317,7 +338,7 @@ async function runClaudeCode(
     request.projectRoot
   );
 
-  return parseClaudePatchResponseFromCli(stdout);
+  return parseClaudeAgentResponseFromCli(stdout);
 }
 
 async function runCommand(
@@ -358,53 +379,119 @@ async function runCommand(
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
-        reject(new Error(`${command} exited with ${code}: ${stderr || stdout}`));
+        reject(
+          new Error(
+            `${command} exited with ${code}: ${formatCommandFailure(stderr || stdout)}`
+          )
+        );
       }
     });
     child.stdin.end(stdin ?? "");
   });
 }
 
-export function parseClaudePatchResponseFromCli(stdout: string): ClaudePatchResponse {
+function formatCommandFailure(output: string): string {
+  const trimmed = output.trim();
+
+  if (trimmed.length === 0) {
+    return "no error output";
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (isClaudeErrorResult(parsed)) {
+      return getClaudeResultText(parsed);
+    }
+  } catch {
+    return trimmed;
+  }
+
+  return trimmed;
+}
+
+export function parseClaudeAgentResponseFromCli(stdout: string): ClaudeAgentResponse {
+  if (stdout.trim().length === 0) {
+    throw new Error("Claude Code returned no output.");
+  }
+
   const parsed = JSON.parse(stdout) as unknown;
 
+  if (isClaudeErrorResult(parsed)) {
+    throw new Error(
+      `Claude Code returned an error result: ${getClaudeResultText(parsed)}`
+    );
+  }
+
   if (typeof parsed === "object" && parsed !== null && "structured_output" in parsed) {
-    return parseClaudePatchResponse(
+    return parseClaudeAgentResponse(
       (parsed as { readonly structured_output?: unknown }).structured_output
     );
   }
 
   if (typeof parsed === "object" && parsed !== null && "result" in parsed) {
-    return parseClaudePatchResponse((parsed as { readonly result?: unknown }).result);
+    return parseClaudeAgentResponse((parsed as { readonly result?: unknown }).result);
   }
 
-  return parseClaudePatchResponse(parsed);
+  return parseClaudeAgentResponse(parsed);
 }
 
-export function parseClaudePatchResponse(value: unknown): ClaudePatchResponse {
+export function parseClaudeAgentResponse(value: unknown): ClaudeAgentResponse {
+  if (typeof value === "string" && value.trim().length === 0) {
+    throw new Error(
+      "Claude Code returned an empty result. Run `claude -p 'Say hello.'` to verify print mode."
+    );
+  }
+
   const parsed = typeof value === "string" ? parseJsonText(value) : value;
 
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error("Claude output was not a JSON object.");
   }
 
-  const candidate = parsed as Partial<ClaudePatchResponse>;
+  const candidate = parsed as Partial<ClaudeAgentResponse>;
 
   if (
+    (candidate.action !== "answer" && candidate.action !== "patch") ||
     typeof candidate.targetFilePath !== "string" ||
     typeof candidate.summary !== "string" ||
     typeof candidate.afterContents !== "string" ||
+    typeof candidate.message !== "string" ||
     typeof candidate.notes !== "string"
   ) {
-    throw new Error("Claude output did not match the expected patch schema.");
+    throw new Error("Claude output did not match the expected agent response schema.");
   }
 
   return {
+    action: candidate.action,
     targetFilePath: candidate.targetFilePath,
     summary: candidate.summary,
     afterContents: candidate.afterContents,
+    message: candidate.message,
     notes: candidate.notes
   };
+}
+
+function isClaudeErrorResult(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as {
+    readonly is_error?: unknown;
+    readonly subtype?: unknown;
+  };
+  return candidate.is_error === true || candidate.subtype === "error";
+}
+
+function getClaudeResultText(value: unknown): string {
+  if (typeof value !== "object" || value === null || !("result" in value)) {
+    return "unknown error";
+  }
+
+  const result = (value as { readonly result?: unknown }).result;
+  return typeof result === "string" && result.trim().length > 0
+    ? result.trim()
+    : "unknown error";
 }
 
 function createClaudePrompt(
@@ -413,11 +500,26 @@ function createClaudePrompt(
 ): string {
   return [
     "You are the Claude Code provider inside a local-first LaTeX editor.",
-    "Do not modify files. Your built-in tools are disabled for this request.",
+    "Use your own judgment to decide how to complete the user's task.",
+    "You may inspect the project from the current working directory, but do not modify files.",
     "Return only JSON matching the provided schema.",
-    "Produce a minimal full-file replacement for the target file.",
-    "Preserve all unrelated text and formatting.",
-    "If no edit is needed, return afterContents exactly equal to the original file.",
+    'Set action to "answer" when the task is best completed by explanation, summary, review, diagnosis, or guidance.',
+    'Set action to "patch" only when the task requires a source edit. For patches, produce a minimal full-file replacement for targetFilePath.',
+    request.mode === "read-only"
+      ? 'The current ZeroLeaf mode is read-only, so action must be "answer". You may describe suggested edits in message, but do not return a patch action.'
+      : "ZeroLeaf will convert patch actions into a reviewable local changeset before any file is changed.",
+    "Preserve all unrelated text and formatting when returning a patch.",
+    request.selectedText === undefined
+      ? ""
+      : "The user selected text. Change only that exact selected span; preserve all unrelated paragraphs, LaTeX commands, labels, references, and citations unless the user explicitly asks to change one.",
+    request.selectedText === undefined
+      ? ""
+      : "For writing edits, do not add new claims or citations. If expanding rough notes into prose, preserve TODO lines that require user input instead of resolving them. If shortening an abstract, keep the abstract environment valid and preserve required contribution statements.",
+    "For unbalanced-brace repairs, make the smallest syntax-only edit. If the error is inside a caption, balance the caption braces without rewriting the caption text.",
+    "For table generation from pasted data, produce valid LaTeX using the project's existing table conventions when visible. Include a caption and label. If the table is wide, mention width/layout advice in notes.",
+    "For terminology normalization, preserve citation keys, labels, file paths, BibTeX keys, and LaTeX command arguments. List domain-specific terms that need user confirmation in notes.",
+    "For title and keyword requests, return afterContents exactly equal to the original file unless the user explicitly asks to apply a title patch. Put suggestions and their manuscript basis in notes.",
+    'If no edit is needed, use action "answer" and put the user-facing answer in message.',
     "",
     `User task: ${request.prompt}`,
     `Project root: ${request.projectRoot}`,
@@ -441,12 +543,14 @@ const claudeOutputSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
+    action: { enum: ["answer", "patch"] },
     targetFilePath: { type: "string" },
     summary: { type: "string" },
     afterContents: { type: "string" },
+    message: { type: "string" },
     notes: { type: "string" }
   },
-  required: ["targetFilePath", "summary", "afterContents", "notes"]
+  required: ["action", "targetFilePath", "summary", "afterContents", "message", "notes"]
 } as const;
 
 function parseJsonText(value: string): unknown {

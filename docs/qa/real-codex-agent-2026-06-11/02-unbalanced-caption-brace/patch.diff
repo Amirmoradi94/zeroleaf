@@ -1,0 +1,9 @@
+--- a/main.tex
++++ b/main.tex
+@@ -6,5 +6,5 @@
+ \centering
+ \fbox{Result panel}
+-\caption{Accuracy improves across folds.\label{fig:accuracy}
++\caption{Accuracy improves across folds.\label{fig:accuracy}}
+ \end{figure}
+ Figure~\ref{fig:accuracy} summarizes the result.

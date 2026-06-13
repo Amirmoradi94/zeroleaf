@@ -228,8 +228,8 @@ async function checkLifecycle(projectRoot) {
 }
 
 async function checkPackage() {
-  const appRoot = resolve(repoRoot, "release/mac/AI LaTeX Editor.app");
-  const launcherPath = join(appRoot, "Contents", "MacOS", "AI LaTeX Editor");
+  const appRoot = resolve(repoRoot, "release/mac/ZeroLeaf.app");
+  const launcherPath = join(appRoot, "Contents", "MacOS", "ZeroLeaf");
   const plistPath = join(appRoot, "Contents", "Info.plist");
   const launcherStats = await stat(launcherPath);
   const plist = await readFile(plistPath, "utf8");
@@ -246,7 +246,7 @@ async function checkPackage() {
   return {
     appRoot,
     launcherExecutable: (launcherStats.mode & 0o111) !== 0,
-    plistBundleName: plist.includes("AI LaTeX Editor")
+    plistBundleName: plist.includes("ZeroLeaf")
   };
 }
 

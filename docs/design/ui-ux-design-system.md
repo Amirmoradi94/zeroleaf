@@ -1,4 +1,4 @@
-# UI/UX Design System for the Desktop AI LaTeX Editor
+# UI/UX Design System for ZeroLeaf
 
 Date: 2026-06-07
 

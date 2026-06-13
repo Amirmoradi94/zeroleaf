@@ -39,6 +39,7 @@ export type ExportSourceZipResult = {
   readonly archivePath: string;
   readonly fileCount: number;
   readonly byteLength: number;
+  readonly includedBuildArtifacts: boolean;
 };
 
 export type ExportPdfRequest = {
@@ -50,6 +51,8 @@ export type ExportPdfResult = {
   readonly pdfPath: string;
   readonly destinationPath: string;
   readonly byteLength: number;
+  readonly openedInViewer?: boolean;
+  readonly viewerOpenError?: string;
 };
 
 export type ImportProjectZipRequest = {
@@ -92,6 +95,7 @@ export class ProjectLifecycleServiceError extends Error {
   constructor(
     message: string,
     readonly code:
+      | "conflict"
       | "invalid-name"
       | "invalid-path"
       | "missing-file"
@@ -189,7 +193,8 @@ export async function exportSourceZip(
   return {
     archivePath: destinationPath,
     fileCount: zipEntries.length,
-    byteLength: archive.byteLength
+    byteLength: archive.byteLength,
+    includedBuildArtifacts: request.includeBuildArtifacts === true
   };
 }
 
@@ -225,7 +230,7 @@ export async function importProjectZip(
   const entries = readZipArchive(await readFile(zipPath));
 
   assertInsideRoot(destinationParentPath, projectRoot);
-  await mkdir(projectRoot, { recursive: false });
+  await createNewProjectRoot(projectRoot);
 
   let fileCount = 0;
   for (const entry of entries) {
@@ -258,7 +263,7 @@ export async function createProjectFromTemplate(
   const projectRoot = resolve(destinationParentPath, projectName);
 
   assertInsideRoot(destinationParentPath, projectRoot);
-  await mkdir(projectRoot, { recursive: false });
+  await createNewProjectRoot(projectRoot);
 
   for (const file of template.files) {
     const targetPath = resolve(projectRoot, file.path);
@@ -703,6 +708,21 @@ function validateProjectName(name: string): string {
   return trimmedName;
 }
 
+async function createNewProjectRoot(projectRoot: string): Promise<void> {
+  try {
+    await mkdir(projectRoot, { recursive: false });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "EEXIST") {
+      throw new ProjectLifecycleServiceError(
+        "A project folder with that name already exists in the chosen destination.",
+        "conflict"
+      );
+    }
+
+    throw error;
+  }
+}
+
 function sanitizeProjectName(name: string): string {
   const sanitized = name
     .trim()
@@ -755,6 +775,10 @@ function isBuildArtifact(filePath: string): boolean {
 
 function isNonEmptyString(value: string): boolean {
   return value.trim().length > 0;
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && "code" in error;
 }
 
 const crcTable = new Uint32Array(256).map((_value, index) => {

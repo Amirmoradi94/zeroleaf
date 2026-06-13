@@ -1,4 +1,4 @@
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { extname, join, relative, resolve, sep } from "node:path";
 
 export type BibliographyEntry = {
@@ -36,10 +36,26 @@ export type ReferenceSearchResult = BibliographyEntry & {
   readonly score: number;
 };
 
+export type RemoveUnusedReferenceRequest = {
+  readonly filePath: string;
+  readonly key: string;
+};
+
+export type RemoveUnusedReferenceResult = {
+  readonly removedEntry: BibliographyEntry;
+  readonly analysis: ReferenceAnalysis;
+};
+
 export class ReferenceServiceError extends Error {
   constructor(
     message: string,
-    readonly code: "invalid-root" | "not-directory" | "outside-root"
+    readonly code:
+      | "invalid-root"
+      | "not-directory"
+      | "outside-root"
+      | "invalid-file"
+      | "entry-not-found"
+      | "entry-still-cited"
   ) {
     super(message);
     this.name = "ReferenceServiceError";
@@ -84,7 +100,8 @@ export function parseBibFile(
     const endIndex = findBalancedEntryEnd(contents, bodyStart, closeChar);
 
     if (endIndex === -1) {
-      break;
+      cursor = atIndex + 1;
+      continue;
     }
 
     const body = contents.slice(bodyStart, endIndex);
@@ -213,6 +230,61 @@ export async function searchProjectReferences(
     .slice(0, 100);
 }
 
+export async function removeUnusedReferenceEntry(
+  projectRoot: string,
+  request: RemoveUnusedReferenceRequest
+): Promise<RemoveUnusedReferenceResult> {
+  const root = await validateProjectRoot(projectRoot);
+  const filePath = normalizeProjectFilePath(root, request.filePath, ".bib");
+  const absolutePath = join(root, filePath);
+  const realProjectPath = toProjectPath(root, await realpath(absolutePath));
+  const key = request.key.trim();
+
+  if (realProjectPath !== filePath) {
+    throw new ReferenceServiceError(
+      "Bibliography file must resolve inside the project root.",
+      "invalid-file"
+    );
+  }
+
+  if (key.length === 0) {
+    throw new ReferenceServiceError("Bibliography key is required.", "invalid-file");
+  }
+
+  const analysis = await analyzeProjectReferences(root);
+  const unusedEntry = analysis.unusedEntries.find(
+    (entry) => entry.filePath === filePath && entry.key === key
+  );
+
+  if (unusedEntry === undefined) {
+    const stillCited = analysis.citations.some((citation) => citation.key === key);
+
+    throw new ReferenceServiceError(
+      stillCited
+        ? `Bibliography entry ${key} is still cited.`
+        : `Unused bibliography entry ${key} was not found.`,
+      stillCited ? "entry-still-cited" : "entry-not-found"
+    );
+  }
+
+  const contents = await readCappedFile(absolutePath);
+  const removal = removeBibEntryByKey(contents, key);
+
+  if (removal === undefined) {
+    throw new ReferenceServiceError(
+      `Bibliography entry ${key} was not found in ${filePath}.`,
+      "entry-not-found"
+    );
+  }
+
+  await writeFile(absolutePath, removal.contents, "utf8");
+
+  return {
+    removedEntry: unusedEntry,
+    analysis: await analyzeProjectReferences(root)
+  };
+}
+
 async function validateProjectRoot(rootPath: string): Promise<string> {
   if (rootPath.trim().length === 0) {
     throw new ReferenceServiceError("Project root is required.", "invalid-root");
@@ -281,6 +353,102 @@ async function readCappedFile(filePath: string): Promise<string> {
   }
 
   return readFile(filePath, "utf8");
+}
+
+function normalizeProjectFilePath(
+  projectRoot: string,
+  filePath: string,
+  extension: ".bib"
+): string {
+  const normalizedPath = filePath.trim();
+
+  if (
+    normalizedPath.length === 0 ||
+    extname(normalizedPath).toLowerCase() !== extension
+  ) {
+    throw new ReferenceServiceError(
+      `Expected a ${extension} project file path.`,
+      "invalid-file"
+    );
+  }
+
+  return toProjectPath(projectRoot, resolve(projectRoot, normalizedPath));
+}
+
+function removeBibEntryByKey(
+  contents: string,
+  keyToRemove: string
+): { readonly contents: string; readonly removedEntry: BibliographyEntry } | undefined {
+  let cursor = 0;
+
+  while (cursor < contents.length) {
+    const atIndex = contents.indexOf("@", cursor);
+
+    if (atIndex === -1) {
+      break;
+    }
+
+    const headerMatch = /^@([A-Za-z]+)\s*[{(]\s*/u.exec(contents.slice(atIndex));
+
+    if (headerMatch === null || headerMatch[1] === undefined) {
+      cursor = atIndex + 1;
+      continue;
+    }
+
+    const bodyStart = atIndex + headerMatch[0].length;
+    const openChar = contents[atIndex + headerMatch[0].length - 1];
+    const closeChar = openChar === "(" ? ")" : "}";
+    const endIndex = findBalancedEntryEnd(contents, bodyStart, closeChar);
+
+    if (endIndex === -1) {
+      break;
+    }
+
+    const body = contents.slice(bodyStart, endIndex);
+    const keyEnd = findTopLevelComma(body);
+    const key = keyEnd === -1 ? "" : body.slice(0, keyEnd).trim();
+
+    if (key === keyToRemove) {
+      const raw = contents.slice(atIndex, endIndex + 1);
+      const [removedEntry] = parseBibFile(raw);
+
+      if (removedEntry === undefined) {
+        return undefined;
+      }
+
+      return {
+        contents: removeRangeAndAdjacentBlankLine(contents, atIndex, endIndex + 1),
+        removedEntry
+      };
+    }
+
+    cursor = endIndex + 1;
+  }
+
+  return undefined;
+}
+
+function removeRangeAndAdjacentBlankLine(
+  contents: string,
+  startIndex: number,
+  endIndex: number
+): string {
+  let removeStart = startIndex;
+  let removeEnd = endIndex;
+
+  while (removeStart > 0 && /[ \t]/u.test(contents[removeStart - 1] ?? "")) {
+    removeStart -= 1;
+  }
+
+  if (contents.slice(removeEnd, removeEnd + 2) === "\r\n") {
+    removeEnd += 2;
+  } else if (contents[removeEnd] === "\n" || contents[removeEnd] === "\r") {
+    removeEnd += 1;
+  }
+
+  const nextContents = `${contents.slice(0, removeStart)}${contents.slice(removeEnd)}`;
+
+  return nextContents.replace(/\n{3,}/gu, "\n\n");
 }
 
 function parseBibFields(input: string): ReadonlyMap<string, string> {

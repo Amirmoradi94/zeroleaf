@@ -8,7 +8,8 @@ export type CommandId =
   | "compile-project"
   | "open-settings"
   | "toggle-problems"
-  | "focus-agent";
+  | "focus-agent"
+  | "fix-top-diagnostic";
 
 export type CommandDefinition = {
   readonly id: CommandId;
@@ -68,12 +69,18 @@ export const commandDefinitions: readonly CommandDefinition[] = [
   },
   {
     id: "toggle-problems",
-    title: "Show Problems",
+    title: "Toggle Bottom Panel",
     group: "Workbench"
   },
   {
     id: "focus-agent",
     title: "Focus Agent",
+    group: "Agent",
+    shortcut: "Cmd I"
+  },
+  {
+    id: "fix-top-diagnostic",
+    title: "Fix Top Diagnostic with AI",
     group: "Agent"
   }
 ];
