@@ -15,10 +15,8 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("Open Folder");
     expect(appSource).toContain("Import ZIP");
     expect(appSource).toContain("Create Project");
-    expect(appSource).toContain("Checking toolchain");
     expect(appSource).toContain("latexmk is missing.");
     expect(appSource).toContain("is not available. Set one of:");
-    expect(appSource).toContain("Project health");
     expect(appSource).toContain("Delete selected entry");
     expect(appSource).toContain(
       "window.confirm(`Delete ${selectedProjectEntryPath}?`)"
@@ -73,7 +71,7 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("Agent");
     expect(appSource).toContain("local CLI login state");
     expect(appSource).toMatch(/does\s+not request or store provider API keys/u);
-    expect(appSource).toContain("read-only inspection");
+    expect(appSource).toContain("scoped edit, compile, or project inspection");
     expect(appSource).toContain("Explain selection");
     expect(appSource).toContain("Expand notes");
     expect(appSource).toContain("Improve academic tone");
@@ -82,7 +80,7 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("runInlineSelectionPrompt");
     expect(appSource).toContain("AI for selected text");
     expect(appSource).toContain(
-      'inlineSelectionPrompt.action === "explain" ? "read-only" : "apply-with-review"'
+      'inlineSelectionPrompt.action === "explain" ? "suggest" : "apply-with-review"'
     );
     expect(appSource).toContain("selectedText");
     expect(appSource).toContain("createDiagnosticAgentPrompt");
@@ -104,9 +102,26 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("setAgentSessionId(result.sessionId)");
     expect(appSource).toContain('setAgentPrompt("");');
     expect(appSource).toContain("AgentLiveStatus");
-    expect(appSource).toContain("Context loaded");
-    expect(appSource).toContain("Local inspection");
-    expect(appSource).toContain("Action planning");
+    expect(appSource).toContain("zeroleaf-agent-history");
+    expect(appSource).toContain("zeroleaf-agent-provider");
+    expect(appSource).toContain("Clear agent history");
+    expect(appSource).toContain("Stop agent run");
+    expect(appSource).toContain("parseNoProjectAgentCommand");
+    expect(appSource).toContain("runNoProjectAgentCommand");
+    expect(appSource).toContain("desktopApi.lifecycle.createFromTemplate");
+    expect(appSource).toContain("Creating project");
+    expect(appSource).toContain(
+      "Open or create a project before project-scoped agent work."
+    );
+    expect(appSource).toContain("create a new project and name it front-postdoc");
+    expect(appSource).toContain("formatElapsedTime");
+    expect(appSource).toContain("RevealedAgentRichText");
+    expect(appSource).toContain("setVisibleTokenCount");
+    expect(appSource).toContain("content.match(/\\S+\\s*|\\s+/gu)");
+    expect(appSource).not.toContain("scheduleBackgroundUpdate");
+    expect(appSource).not.toContain("Context loaded");
+    expect(appSource).not.toContain("Local inspection");
+    expect(appSource).not.toContain("Action planning");
     expect(appSource).toContain("Waiting for patch review");
     expect(appSource).toContain("`${requestSessionId}-failed-error`");
     expect(appSource).toContain("`${requestSessionId}-failed-message`");
@@ -115,6 +130,8 @@ describe("App renderer shell", () => {
     );
     expect(appSource).toContain("prepareAgentDisplayEvents(result.events)");
     expect(appSource).toContain("mergeAgentThreadEvents");
+    expect(appSource).toContain("buildAgentCompletionSummaryEvent(result)");
+    expect(appSource).toContain("I compiled the project.");
     expect(appSource).toContain("createTransientAgentMessage");
     expect(appSource).toContain("agent-progress-message");
     expect(appSource).not.toContain("agent-activity-feed");

@@ -11,13 +11,13 @@ describe("workbench layout", () => {
     expect(
       clampPaneSizes({
         sidebarWidth: 10,
-        pdfWidth: 900,
+        pdfWidth: 2_000,
         agentWidth: 100,
         bottomPanelHeight: 900
       })
     ).toEqual({
       sidebarWidth: 220,
-      pdfWidth: 720,
+      pdfWidth: 1_400,
       agentWidth: 340,
       bottomPanelHeight: 360
     });
@@ -46,7 +46,9 @@ describe("workbench layout", () => {
       pdfWidth: 560
     };
 
-    expect(resizeWorkbenchPane("pdf", layout, { x: -400, y: 0 }).pdfWidth).toBe(720);
+    expect(resizeWorkbenchPane("pdf", layout, { x: -1_000, y: 0 }).pdfWidth).toBe(
+      1_400
+    );
     expect(resizeWorkbenchPane("pdf", layout, { x: 400, y: 0 }).pdfWidth).toBe(320);
   });
 });

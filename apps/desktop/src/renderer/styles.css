@@ -222,7 +222,11 @@ select:disabled {
 .workspace {
   display: grid;
   grid-template-columns: 52px var(--sidebar-width) 6px minmax(0, 1fr);
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .activity-rail {
@@ -450,41 +454,6 @@ h2 {
   color: #263940;
 }
 
-.project-health {
-  display: grid;
-  gap: 7px;
-  padding: 9px 10px;
-  border-bottom: 1px solid #e1e6ea;
-  background: #fbfcfd;
-  color: #53666e;
-  font-size: 12px;
-}
-
-.project-health div {
-  display: grid;
-  grid-template-columns: 68px minmax(0, 1fr);
-  gap: 8px;
-  align-items: baseline;
-}
-
-.project-health strong {
-  color: #263940;
-  font-weight: 650;
-}
-
-.project-health span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.setup-guidance {
-  margin: 0;
-  color: #8a3e19;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
 .recent-projects {
   display: grid;
   gap: 16px;
@@ -672,15 +641,20 @@ h2 {
 .workbench {
   display: grid;
   grid-template-rows: minmax(0, 1fr) var(--bottom-split-size, 6px) var(--bottom-height);
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .content-row {
   display: grid;
   grid-template-columns:
-    minmax(320px, 1fr) 6px var(--pdf-width) 6px
+    minmax(0, 1fr) 6px var(--pdf-width) 6px
     var(--agent-width);
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -698,35 +672,64 @@ h2 {
 .tab-strip {
   display: flex;
   align-items: end;
-  gap: 4px;
+  gap: 3px;
   overflow: auto hidden;
-  padding: 0 10px;
-  border-bottom: 1px solid #d7dde2;
-  background: #f8fafb;
+  padding: 5px 10px 0;
+  border-bottom: 1px solid #b9c8cf;
+  background: linear-gradient(#f8fafb, #eef4f5);
+  scrollbar-color: #aab8be transparent;
+  scrollbar-width: thin;
 }
 
 .editor-tab {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  max-width: 180px;
-  height: 31px;
-  padding: 0 14px;
-  border: 1px solid #d7dde2;
-  border-bottom-color: #d7dde2;
-  border-radius: 6px 6px 0 0;
-  background: #f8fafb;
-  color: #263940;
+  gap: 7px;
+  max-width: 210px;
+  min-width: 118px;
+  height: 32px;
+  padding: 0 10px 0 12px;
+  border: 1px solid #c0ced5;
+  border-bottom-color: #b9c8cf;
+  border-radius: 7px 7px 0 0;
+  background: #eef4f5;
+  color: #334a52;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 70%);
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.editor-tab:hover {
+  background: #f7fbfb;
+  border-color: #98b2ba;
+  color: #20363d;
 }
 
 .editor-tab.active {
+  z-index: 1;
+  border-color: #8baeb5;
+  border-top-color: #2f777b;
   border-bottom-color: #ffffff;
   background: #ffffff;
+  color: #122b33;
+  box-shadow:
+    inset 0 3px 0 #2f777b,
+    0 -1px 0 rgb(47 119 123 / 18%),
+    0 1px 0 #ffffff;
 }
 
 .editor-tab.muted {
-  border-bottom-color: #d7dde2;
-  background: #f8fafb;
+  min-width: auto;
+  border-color: #c9d4d9;
+  border-bottom-color: #b9c8cf;
+  background: #eef4f5;
   color: #65747b;
 }
 
@@ -742,10 +745,22 @@ h2 {
   width: 18px;
   height: 18px;
   border-radius: 4px;
+  color: #5f727a;
+  flex: 0 0 auto;
 }
 
 .tab-close:hover {
-  background: #e1e6ea;
+  background: #dae8e9;
+  color: #1f3b43;
+}
+
+.tab-dirty {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #2f777b;
+  box-shadow: 0 0 0 2px rgb(47 119 123 / 14%);
+  flex: 0 0 auto;
 }
 
 .editor-toolbar {
@@ -864,14 +879,20 @@ h2 {
 }
 
 .pdf-canvas {
-  display: grid;
-  place-items: start center;
+  display: block;
   min-width: 0;
   min-height: 0;
   max-width: 100%;
   overflow: auto;
-  padding: 24px;
+  padding: 18px 24px 28px;
   background: #edf1f3;
+}
+
+.pdf-document {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  min-width: min-content;
 }
 
 .pdf-toolbar {
@@ -953,6 +974,7 @@ h2 {
 }
 
 .pdf-page-canvas {
+  display: block;
   max-width: none;
   border: 1px solid #d7dde2;
   background: #ffffff;
@@ -962,6 +984,7 @@ h2 {
 
 .pdf-page-wrap {
   position: relative;
+  scroll-margin-top: 12px;
 }
 
 .synctex-marker {
@@ -1009,7 +1032,7 @@ h2 {
 }
 
 .agent-pane-title {
-  min-height: 42px;
+  min-height: 48px;
   justify-content: flex-start;
   gap: 10px;
   background: #ffffff;
@@ -1048,6 +1071,34 @@ h2 {
 
 .agent-title-copy span {
   font-size: 15px;
+}
+
+.agent-title-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 0;
+}
+
+.agent-title-actions .icon-button {
+  width: 28px;
+  height: 28px;
+}
+
+.agent-run-timer {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid #d6e1e2;
+  border-radius: 999px;
+  background: #f7faf9;
+  color: #53666e;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 .agent-connection-pill {
@@ -1403,8 +1454,9 @@ input {
 
 .agent-message-row.user .agent-message-avatar {
   grid-column: 2;
-  background: #e7f4f3;
-  color: #24594f;
+  border-color: #1f3e44;
+  background: #263f46;
+  color: #ffffff;
 }
 
 .agent-message-row.user .agent-message-bubble {
@@ -1435,16 +1487,208 @@ input {
   border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 7px 18px rgba(42, 65, 72, 0.06);
+  transform-origin: bottom left;
 }
 
 .agent-message-bubble.user {
-  border-color: #b8d8d5;
-  background: #edf8f6;
+  border-color: #1f3e44;
+  background: #263f46;
+  color: #ffffff;
+  transform-origin: bottom right;
+}
+
+.agent-message-bubble.user header strong,
+.agent-message-bubble.user header span,
+.agent-message-bubble.user p,
+.agent-message-bubble.user .agent-rich-text,
+.agent-message-bubble.user .agent-rich-text strong,
+.agent-message-bubble.user .agent-rich-text li,
+.agent-message-bubble.user .agent-rich-text a {
+  color: #ffffff;
+}
+
+.agent-message-bubble.user .agent-rich-text code {
+  border-color: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
 }
 
 .agent-message-bubble.assistant,
 .agent-message-bubble.system {
   border-color: #d6e1e2;
+}
+
+.agent-run-card {
+  display: grid;
+  gap: 10px;
+  width: min(100%, 96%);
+  padding: 12px;
+  border: 1px solid #dbe5e7;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 7px 18px rgba(42, 65, 72, 0.06);
+  animation: agent-message-reveal 360ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.agent-run-card.running {
+  border-color: #b9d8dc;
+}
+
+.agent-run-card.success {
+  border-color: #b9dcd3;
+}
+
+.agent-run-card.warning {
+  border-color: #ead6a6;
+}
+
+.agent-run-card.danger {
+  border-color: #f0c4bd;
+}
+
+.agent-run-header,
+.agent-run-footer,
+.agent-run-step header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agent-run-header > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.agent-run-header strong {
+  color: #263940;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.agent-run-header span,
+.agent-run-footer,
+.agent-run-step header span {
+  color: #65747b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.agent-run-header > div span {
+  padding: 2px 7px;
+  border: 1px solid #d8e3e4;
+  border-radius: 999px;
+  background: #f5f8f8;
+  color: #3f5961;
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+}
+
+.agent-run-response {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.agent-run-message {
+  min-width: 0;
+}
+
+.agent-typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+  color: #53666e;
+}
+
+.agent-typing-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.35;
+  animation: agent-typing-dot 900ms ease-in-out infinite;
+}
+
+.agent-typing-dots span:nth-child(2) {
+  animation-delay: 120ms;
+}
+
+.agent-typing-dots span:nth-child(3) {
+  animation-delay: 240ms;
+}
+
+.agent-run-steps {
+  display: grid;
+  gap: 7px;
+  padding-top: 2px;
+}
+
+.agent-run-step {
+  display: grid;
+  grid-template-columns: 11px minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #e4ecee;
+  border-radius: 8px;
+  background: #f8fbfb;
+}
+
+.agent-run-step-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: #8ea0a6;
+}
+
+.agent-run-step.running .agent-run-step-dot {
+  background: #386c7d;
+}
+
+.agent-run-step.success .agent-run-step-dot {
+  background: #2f7d5f;
+}
+
+.agent-run-step.warning .agent-run-step-dot {
+  background: #8a5a1f;
+}
+
+.agent-run-step.danger .agent-run-step-dot {
+  background: #b42318;
+}
+
+.agent-run-step-body {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.agent-run-step header strong {
+  overflow: hidden;
+  color: #263940;
+  font-size: 13px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-run-step p {
+  color: #53666e;
+  font-size: 13px;
+  line-height: 1.38;
+  overflow-wrap: anywhere;
+}
+
+.agent-run-footer {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  padding-top: 2px;
 }
 
 .agent-event {
@@ -1537,6 +1781,48 @@ input {
   color: #4f3b08;
 }
 
+.agent-rich-text a {
+  color: #1f6672;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.agent-rich-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid #d8e3e4;
+  border-radius: 8px;
+}
+
+.agent-rich-table-wrap table {
+  width: 100%;
+  min-width: 420px;
+  border-collapse: collapse;
+  background: #ffffff;
+  font-size: 13px;
+}
+
+.agent-rich-table-wrap th,
+.agent-rich-table-wrap td {
+  padding: 7px 8px;
+  border-bottom: 1px solid #e4ecee;
+  color: #53666e;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.agent-rich-table-wrap th {
+  background: #f5f8f8;
+  color: #263940;
+  font-weight: 800;
+}
+
+.agent-rich-table-wrap tr:last-child td {
+  border-bottom: 0;
+}
+
 .agent-event header span,
 .agent-event small,
 .agent-message-bubble span {
@@ -1623,13 +1909,29 @@ input {
   }
 }
 
+@keyframes agent-typing-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+
+  40% {
+    opacity: 0.9;
+    transform: translateY(-2px);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .agent-thread {
     scroll-behavior: auto;
   }
 
   .agent-event,
-  .agent-message-row {
+  .agent-run-card,
+  .agent-message-row,
+  .agent-typing-dots span {
     animation: none;
   }
 

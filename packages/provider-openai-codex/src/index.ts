@@ -7,28 +7,40 @@ import { join } from "node:path";
 import type {
   AgentAuthStatus,
   AgentEvent,
+  AgentMoveEntryOperation,
   AgentProviderId,
   AgentSessionResult,
   AgentStartRequest,
   AgentToolCallEvent,
   AgentToolName,
   AgentToolRisk,
+  BuildResult,
   HistoryChangeSet,
   ProjectFileSnapshot
 } from "@latex-agent/ipc-contracts";
 
 export const openAiCodexProviderId = "openai-codex" as const;
+const defaultCodexExecTimeoutMs = 7_200_000;
+const maxCodexPlannerAttempts = 2;
+const maxCodexCompileRepairAttempts = 2;
 
 export type CodexCliToolBroker = {
+  readonly emitEvent?: (event: AgentEvent) => void;
   readonly readFile: (path: string) => Promise<ProjectFileSnapshot>;
   readonly searchProject: (query: string) => Promise<readonly ProjectFileSnapshot[]>;
+  readonly moveEntry?: (
+    fromPath: string,
+    toPath: string
+  ) => Promise<AgentMoveEntryOperation>;
   readonly setMainFile?: (path: string) => Promise<{ readonly path: string }>;
+  readonly runCompile?: () => Promise<BuildResult>;
   readonly proposePatch: (
     filePath: string,
     beforeContents: string,
     afterContents: string,
     summary: string
   ) => Promise<HistoryChangeSet>;
+  readonly applyPatch?: (changesetId: string) => Promise<HistoryChangeSet>;
 };
 
 export type CodexExecRequest = {
@@ -38,7 +50,7 @@ export type CodexExecRequest = {
 };
 
 export type CodexAgentResponse = {
-  readonly action: "answer" | "patch" | "set-main-file";
+  readonly action: "answer" | "patch" | "move-entry" | "set-main-file" | "run-compile";
   readonly targetFilePath: string;
   readonly summary: string;
   readonly afterContents: string;
@@ -75,7 +87,7 @@ export class CodexCliProvider {
   constructor(options: CodexCliProviderOptions = {}) {
     this.codexBinary =
       options.codexBinary ?? process.env["LATEX_AGENT_CODEX_BIN"] ?? "codex";
-    this.timeoutMs = options.timeoutMs ?? 180_000;
+    this.timeoutMs = options.timeoutMs ?? defaultCodexExecTimeoutMs;
     this.runCodexExec =
       options.runCodexExec ?? ((request) => runCodexExec(this.codexBinary, request));
     this.getCliAuthStatus =
@@ -135,11 +147,15 @@ export class CodexCliProvider {
       };
     }
 
-    events.push(
+    pushAgentEvents(
+      events,
+      broker,
       createToolEvent(sessionId, "read-file", "running", `Reading ${targetPath}`, "low")
     );
     const snapshot = await broker.readFile(targetPath);
-    events.push(
+    pushAgentEvents(
+      events,
+      broker,
       createToolEvent(
         sessionId,
         "read-file",
@@ -149,21 +165,28 @@ export class CodexCliProvider {
       )
     );
 
-    events.push(
+    pushAgentEvents(
+      events,
+      broker,
       createToolEvent(
         sessionId,
         "codex-exec",
         "running",
-        "Running installed Codex CLI in a read-only project sandbox",
+        "Running installed Codex CLI in project planning mode",
         "medium"
       )
     );
-    let codexResponse = await this.runCodexExec({
-      projectRoot: request.projectRoot,
-      timeoutMs: this.timeoutMs,
-      prompt: createCodexPrompt(request, snapshot)
-    });
-    events.push(
+    let codexResponse = await this.runPlannerWithRetry(
+      request,
+      snapshot,
+      createCodexPrompt(request, snapshot),
+      events,
+      sessionId,
+      broker
+    );
+    pushAgentEvents(
+      events,
+      broker,
       createToolEvent(
         sessionId,
         "codex-exec",
@@ -174,7 +197,9 @@ export class CodexCliProvider {
     );
 
     if (shouldRetryForConcreteAction(request, codexResponse)) {
-      events.push(
+      pushAgentEvents(
+        events,
+        broker,
         createToolEvent(
           sessionId,
           "codex-exec",
@@ -183,12 +208,17 @@ export class CodexCliProvider {
           "medium"
         )
       );
-      codexResponse = await this.runCodexExec({
-        projectRoot: request.projectRoot,
-        timeoutMs: this.timeoutMs,
-        prompt: createCodexPatchRetryPrompt(request, snapshot, codexResponse)
-      });
-      events.push(
+      codexResponse = await this.runPlannerWithRetry(
+        request,
+        snapshot,
+        createCodexPatchRetryPrompt(request, snapshot, codexResponse),
+        events,
+        sessionId,
+        broker
+      );
+      pushAgentEvents(
+        events,
+        broker,
         createToolEvent(
           sessionId,
           "codex-exec",
@@ -258,7 +288,9 @@ export class CodexCliProvider {
         };
       }
 
-      events.push(
+      pushAgentEvents(
+        events,
+        broker,
         createToolEvent(
           sessionId,
           "set-main-file",
@@ -268,7 +300,9 @@ export class CodexCliProvider {
         )
       );
       const result = await broker.setMainFile(codexResponse.targetFilePath);
-      events.push(
+      pushAgentEvents(
+        events,
+        broker,
         createToolEvent(
           sessionId,
           "set-main-file",
@@ -291,10 +325,235 @@ export class CodexCliProvider {
       };
     }
 
-    const patchSnapshot =
+    if (codexResponse.action === "move-entry") {
+      const destinationPath = codexResponse.afterContents.trim();
+
+      if (
+        request.mode === "read-only" ||
+        broker.moveEntry === undefined ||
+        destinationPath.length === 0
+      ) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            [
+              codexResponse.message,
+              request.mode === "read-only"
+                ? "Codex identified a project file move, but the current agent mode is read-only."
+                : broker.moveEntry === undefined
+                  ? "Codex identified a project file move, but this provider bridge cannot run that app tool."
+                  : "Codex identified a project file move, but did not provide a destination path."
+            ]
+              .filter((line) => line.trim().length > 0)
+              .join("\n\n")
+          )
+        );
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
+
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "move-entry",
+          "running",
+          `Moving ${codexResponse.targetFilePath} to ${destinationPath}`,
+          "high"
+        )
+      );
+      const moveResult = await broker.moveEntry(
+        codexResponse.targetFilePath,
+        destinationPath
+      );
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "move-entry",
+          "succeeded",
+          `Moved ${moveResult.fromPath} to ${moveResult.toPath}`,
+          "high"
+        ),
+        createMessageEvent(
+          sessionId,
+          "assistant",
+          codexResponse.message ||
+            `Moved ${moveResult.fromPath} to ${moveResult.toPath}.`
+        )
+      );
+
+      return {
+        sessionId,
+        providerId: this.id,
+        status: "completed",
+        events,
+        moveEntries: [moveResult]
+      };
+    }
+
+    if (codexResponse.action === "run-compile") {
+      if (request.mode === "read-only" || broker.runCompile === undefined) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            request.mode === "read-only"
+              ? "Codex identified a compile request, but the current agent mode is read-only."
+              : "Codex identified a compile request, but this provider bridge cannot run the app compile tool."
+          )
+        );
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
+
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "run-compile",
+          "running",
+          "Running LaTeX compile through ZeroLeaf",
+          "medium"
+        )
+      );
+      const buildResult = await broker.runCompile();
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "run-compile",
+          buildResult.status === "succeeded" ? "succeeded" : "failed",
+          `Compile ${buildResult.status} with ${buildResult.diagnostics.length} diagnostic${buildResult.diagnostics.length === 1 ? "" : "s"}`,
+          "medium"
+        ),
+        createVerificationEvent(
+          sessionId,
+          buildResult.status === "succeeded" ? "passed" : "failed",
+          `Compile ${buildResult.status}.`,
+          buildResult.jobId
+        )
+      );
+
+      if (
+        buildResult.status === "failed" &&
+        request.mode === "autonomous-local" &&
+        broker.applyPatch !== undefined
+      ) {
+        return await this.repairFailedCompile({
+          broker,
+          buildResult,
+          events,
+          request,
+          sessionId,
+          snapshot
+        });
+      }
+
+      events.push(
+        createMessageEvent(sessionId, "assistant", formatCompileMessage(buildResult))
+      );
+
+      return {
+        sessionId,
+        providerId: this.id,
+        status: "completed",
+        events,
+        buildResult
+      };
+    }
+
+    let patchSnapshot =
       codexResponse.targetFilePath === snapshot.path
         ? snapshot
         : await broker.readFile(codexResponse.targetFilePath);
+
+    if (isLikelyOverbroadPatch(patchSnapshot.contents, codexResponse.afterContents)) {
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "running",
+          "Codex returned a patch that removed most of a large file; requesting a complete minimal patch",
+          "medium"
+        )
+      );
+      codexResponse = await this.runPlannerWithRetry(
+        request,
+        patchSnapshot,
+        createCodexOverbroadPatchRetryPrompt(request, patchSnapshot, codexResponse),
+        events,
+        sessionId,
+        broker
+      );
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "succeeded",
+          codexResponse.notes,
+          "medium"
+        )
+      );
+
+      if (codexResponse.action !== "patch") {
+        events.push(createMessageEvent(sessionId, "assistant", codexResponse.message));
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
+
+      patchSnapshot =
+        codexResponse.targetFilePath === snapshot.path
+          ? snapshot
+          : await broker.readFile(codexResponse.targetFilePath);
+
+      if (isLikelyOverbroadPatch(patchSnapshot.contents, codexResponse.afterContents)) {
+        pushAgentEvents(
+          events,
+          broker,
+          createToolEvent(
+            sessionId,
+            "propose-patch",
+            "blocked",
+            "Codex returned a patch that removed most of a large file, so ZeroLeaf did not apply it.",
+            "high"
+          ),
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            "Codex returned a patch that removed too much of the file, so I did not apply it. Please ask for a narrower edit or select the exact lines to change."
+          )
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
+    }
 
     if (codexResponse.afterContents === patchSnapshot.contents) {
       events.push(
@@ -313,7 +572,9 @@ export class CodexCliProvider {
       };
     }
 
-    events.push(
+    pushAgentEvents(
+      events,
+      broker,
       createToolEvent(
         sessionId,
         "propose-patch",
@@ -328,14 +589,118 @@ export class CodexCliProvider {
       codexResponse.afterContents,
       normalizeSummary(codexResponse.summary)
     );
-    events.push(
+    pushAgentEvents(
+      events,
+      broker,
       createToolEvent(
         sessionId,
         "propose-patch",
         "succeeded",
         `Created changeset ${changeset.id}`,
         "medium"
-      ),
+      )
+    );
+
+    if (request.mode === "autonomous-local" && broker.applyPatch !== undefined) {
+      pushAgentEvents(
+        events,
+        broker,
+        createPatchEvent(sessionId, changeset),
+        createToolEvent(
+          sessionId,
+          "apply-patch",
+          "running",
+          `Applying ${changeset.summary}`,
+          "high"
+        )
+      );
+      const applied = await broker.applyPatch(changeset.id);
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "apply-patch",
+          "succeeded",
+          `Applied ${applied.summary}`,
+          "high"
+        ),
+        createPatchEvent(sessionId, applied)
+      );
+
+      if (broker.runCompile === undefined) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            `${codexResponse.message}\n\nApplied the patch, but this provider bridge cannot run compile verification.`
+          )
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events,
+          changeset: applied
+        };
+      }
+
+      pushAgentEvents(
+        events,
+        broker,
+        createVerificationEvent(
+          sessionId,
+          "running",
+          "Compile verification started after Codex applied the patch."
+        ),
+        createToolEvent(
+          sessionId,
+          "run-compile",
+          "running",
+          "Running compile verification",
+          "medium"
+        )
+      );
+      const buildResult = await broker.runCompile();
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "run-compile",
+          buildResult.status === "succeeded" ? "succeeded" : "failed",
+          `Compile ${buildResult.status} with ${buildResult.diagnostics.length} diagnostic${buildResult.diagnostics.length === 1 ? "" : "s"}`,
+          "medium"
+        ),
+        createVerificationEvent(
+          sessionId,
+          buildResult.status === "succeeded" ? "passed" : "failed",
+          `Compile verification ${buildResult.status} with ${buildResult.diagnostics.length} diagnostic${buildResult.diagnostics.length === 1 ? "" : "s"}.`,
+          buildResult.jobId
+        ),
+        createMessageEvent(
+          sessionId,
+          "assistant",
+          [codexResponse.message, formatCompileMessage(buildResult)]
+            .filter((line) => line.trim().length > 0)
+            .join("\n\n")
+        )
+      );
+
+      return {
+        sessionId,
+        providerId: this.id,
+        status: "completed",
+        events,
+        changeset: applied,
+        buildResult
+      };
+    }
+
+    pushAgentEvents(
+      events,
+      broker,
       createPatchEvent(sessionId, changeset),
       createApprovalEvent(sessionId),
       createVerificationEvent(
@@ -357,6 +722,431 @@ export class CodexCliProvider {
   cancelSession(sessionId: string): Promise<boolean> {
     this.cancelledSessionIds.add(sessionId);
     return Promise.resolve(true);
+  }
+
+  private async runPlannerWithRetry(
+    request: AgentStartRequest,
+    snapshot: ProjectFileSnapshot,
+    prompt: string,
+    events: AgentEvent[],
+    sessionId: string,
+    broker?: CodexCliToolBroker
+  ): Promise<CodexAgentResponse> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= maxCodexPlannerAttempts; attempt += 1) {
+      try {
+        return await this.runCodexExec({
+          projectRoot: request.projectRoot,
+          timeoutMs: this.timeoutMs,
+          prompt:
+            attempt === 1
+              ? prompt
+              : createCodexInterruptedRetryPrompt(request, snapshot, lastError)
+        });
+      } catch (error) {
+        lastError = error;
+
+        if (attempt >= maxCodexPlannerAttempts || !isRetryableCodexExecError(error)) {
+          throw error;
+        }
+
+        pushAgentEvents(
+          events,
+          broker,
+          createToolEvent(
+            sessionId,
+            "codex-exec",
+            "failed",
+            `${formatPlannerFailure(error)} Retrying with a narrower project-scoped prompt.`,
+            "medium"
+          ),
+          createToolEvent(
+            sessionId,
+            "codex-exec",
+            "running",
+            "Retrying Codex planner with focused project context",
+            "medium"
+          )
+        );
+      }
+    }
+
+    throw lastError;
+  }
+
+  private async repairFailedCompile({
+    broker,
+    buildResult,
+    events,
+    request,
+    sessionId,
+    snapshot
+  }: {
+    readonly broker: CodexCliToolBroker;
+    readonly buildResult: BuildResult;
+    readonly events: AgentEvent[];
+    readonly request: AgentStartRequest;
+    readonly sessionId: string;
+    readonly snapshot: ProjectFileSnapshot;
+  }): Promise<AgentSessionResult> {
+    let latestBuild = buildResult;
+    let latestChangeSet: HistoryChangeSet | undefined;
+    let currentSnapshot = snapshot;
+
+    for (let attempt = 1; attempt <= maxCodexCompileRepairAttempts; attempt += 1) {
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "running",
+          `Compile failed; asking Codex to repair the LaTeX error (attempt ${attempt} of ${maxCodexCompileRepairAttempts})`,
+          "medium"
+        )
+      );
+      let repairResponse = await this.runPlannerWithRetry(
+        request,
+        currentSnapshot,
+        createCodexCompileRepairPrompt(request, currentSnapshot, latestBuild, attempt),
+        events,
+        sessionId,
+        broker
+      );
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "succeeded",
+          repairResponse.notes,
+          "medium"
+        )
+      );
+
+      if (repairResponse.action !== "patch") {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            [
+              "Compile failed, and Codex did not return a safe source patch.",
+              repairResponse.message,
+              formatCompileMessage(latestBuild)
+            ]
+              .filter((line) => line.trim().length > 0)
+              .join("\n\n")
+          )
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events,
+          ...(latestChangeSet === undefined ? {} : { changeset: latestChangeSet }),
+          buildResult: latestBuild
+        };
+      }
+
+      let patchSnapshot =
+        repairResponse.targetFilePath === currentSnapshot.path
+          ? currentSnapshot
+          : await broker.readFile(repairResponse.targetFilePath);
+
+      if (
+        isLikelyOverbroadPatch(patchSnapshot.contents, repairResponse.afterContents)
+      ) {
+        pushAgentEvents(
+          events,
+          broker,
+          createToolEvent(
+            sessionId,
+            "codex-exec",
+            "running",
+            "Codex returned a repair patch that removed most of a large file; requesting a complete minimal patch",
+            "medium"
+          )
+        );
+        repairResponse = await this.runPlannerWithRetry(
+          request,
+          patchSnapshot,
+          createCodexOverbroadPatchRetryPrompt(request, patchSnapshot, repairResponse),
+          events,
+          sessionId,
+          broker
+        );
+        pushAgentEvents(
+          events,
+          broker,
+          createToolEvent(
+            sessionId,
+            "codex-exec",
+            "succeeded",
+            repairResponse.notes,
+            "medium"
+          )
+        );
+
+        if (repairResponse.action !== "patch") {
+          events.push(
+            createMessageEvent(
+              sessionId,
+              "assistant",
+              [
+                "Compile failed, and Codex did not return a complete repair patch.",
+                repairResponse.message,
+                formatCompileMessage(latestBuild)
+              ]
+                .filter((line) => line.trim().length > 0)
+                .join("\n\n")
+            )
+          );
+
+          return {
+            sessionId,
+            providerId: this.id,
+            status: "completed",
+            events,
+            ...(latestChangeSet === undefined ? {} : { changeset: latestChangeSet }),
+            buildResult: latestBuild
+          };
+        }
+
+        patchSnapshot =
+          repairResponse.targetFilePath === currentSnapshot.path
+            ? currentSnapshot
+            : await broker.readFile(repairResponse.targetFilePath);
+
+        if (
+          isLikelyOverbroadPatch(patchSnapshot.contents, repairResponse.afterContents)
+        ) {
+          pushAgentEvents(
+            events,
+            broker,
+            createToolEvent(
+              sessionId,
+              "propose-patch",
+              "blocked",
+              "Codex returned a repair patch that removed most of a large file, so ZeroLeaf did not apply it.",
+              "high"
+            ),
+            createMessageEvent(
+              sessionId,
+              "assistant",
+              [
+                "Compile failed, and the proposed repair patch removed too much of the file, so I did not apply it.",
+                formatCompileMessage(latestBuild)
+              ].join("\n\n")
+            )
+          );
+
+          return {
+            sessionId,
+            providerId: this.id,
+            status: "completed",
+            events,
+            ...(latestChangeSet === undefined ? {} : { changeset: latestChangeSet }),
+            buildResult: latestBuild
+          };
+        }
+      }
+
+      if (repairResponse.afterContents === patchSnapshot.contents) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            [
+              repairResponse.message ||
+                "Codex did not propose a source change for the compile failure.",
+              formatCompileMessage(latestBuild)
+            ]
+              .filter((line) => line.trim().length > 0)
+              .join("\n\n")
+          )
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events,
+          ...(latestChangeSet === undefined ? {} : { changeset: latestChangeSet }),
+          buildResult: latestBuild
+        };
+      }
+
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "propose-patch",
+          "running",
+          `Creating compile repair patch for ${patchSnapshot.path}`,
+          "medium"
+        )
+      );
+      const proposed = await broker.proposePatch(
+        patchSnapshot.path,
+        patchSnapshot.contents,
+        repairResponse.afterContents,
+        normalizeSummary(repairResponse.summary)
+      );
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "propose-patch",
+          "succeeded",
+          `Created changeset ${proposed.id}`,
+          "medium"
+        ),
+        createPatchEvent(sessionId, proposed),
+        createToolEvent(
+          sessionId,
+          "apply-patch",
+          "running",
+          `Applying ${proposed.summary}`,
+          "high"
+        )
+      );
+      const applied = await broker.applyPatch?.(proposed.id);
+
+      if (applied === undefined) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            "Codex prepared a compile repair patch, but this provider bridge cannot apply it automatically."
+          )
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "awaiting-approval",
+          events,
+          changeset: proposed,
+          buildResult: latestBuild
+        };
+      }
+
+      latestChangeSet = applied;
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "apply-patch",
+          "succeeded",
+          `Applied ${applied.summary}`,
+          "high"
+        ),
+        createPatchEvent(sessionId, applied),
+        createVerificationEvent(
+          sessionId,
+          "running",
+          `Recompile started after compile repair attempt ${attempt}.`
+        ),
+        createToolEvent(
+          sessionId,
+          "run-compile",
+          "running",
+          "Recompiling after Codex repair",
+          "medium"
+        )
+      );
+
+      const repairedBuild = await broker.runCompile?.();
+      if (repairedBuild === undefined) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            "Applied the compile repair patch, but this provider bridge cannot recompile."
+          )
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events,
+          changeset: applied
+        };
+      }
+      latestBuild = repairedBuild;
+
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "run-compile",
+          latestBuild.status === "succeeded" ? "succeeded" : "failed",
+          `Compile ${latestBuild.status} with ${latestBuild.diagnostics.length} diagnostic${latestBuild.diagnostics.length === 1 ? "" : "s"}`,
+          "medium"
+        ),
+        createVerificationEvent(
+          sessionId,
+          latestBuild.status === "succeeded" ? "passed" : "failed",
+          `Compile repair attempt ${attempt} ${latestBuild.status} with ${latestBuild.diagnostics.length} diagnostic${latestBuild.diagnostics.length === 1 ? "" : "s"}.`,
+          latestBuild.jobId
+        )
+      );
+
+      currentSnapshot = await broker.readFile(patchSnapshot.path);
+
+      if (latestBuild.status === "succeeded") {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            [
+              repairResponse.message,
+              `I fixed the compile issue and recompiled successfully on repair attempt ${attempt}.`,
+              formatCompileMessage(latestBuild)
+            ]
+              .filter((line) => line.trim().length > 0)
+              .join("\n\n")
+          )
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events,
+          changeset: applied,
+          buildResult: latestBuild
+        };
+      }
+    }
+
+    events.push(
+      createMessageEvent(
+        sessionId,
+        "assistant",
+        [
+          `I attempted ${maxCodexCompileRepairAttempts} compile repair turns, but the build still fails.`,
+          formatCompileMessage(latestBuild)
+        ].join("\n\n")
+      )
+    );
+
+    return {
+      sessionId,
+      providerId: this.id,
+      status: "completed",
+      events,
+      ...(latestChangeSet === undefined ? {} : { changeset: latestChangeSet }),
+      buildResult: latestBuild
+    };
   }
 }
 
@@ -391,22 +1181,7 @@ async function runCodexExec(
     await writeFile(schemaPath, JSON.stringify(codexOutputSchema, null, 2), "utf8");
     await runCommand(
       codexBinary,
-      [
-        "exec",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--sandbox",
-        "read-only",
-        "-c",
-        'model_reasoning_effort="low"',
-        "--output-schema",
-        schemaPath,
-        "--output-last-message",
-        outputPath,
-        "-C",
-        request.projectRoot,
-        "-"
-      ],
+      createCodexExecArgs(schemaPath, outputPath, request.projectRoot),
       request.timeoutMs,
       request.prompt
     );
@@ -415,6 +1190,31 @@ async function runCodexExec(
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
+}
+
+export function createCodexExecArgs(
+  schemaPath: string,
+  outputPath: string,
+  projectRoot: string
+): readonly string[] {
+  return [
+    "exec",
+    "--skip-git-repo-check",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--ephemeral",
+    "--sandbox",
+    "read-only",
+    "-c",
+    'model_reasoning_effort="low"',
+    "--output-schema",
+    schemaPath,
+    "--output-last-message",
+    outputPath,
+    "-C",
+    projectRoot,
+    "-"
+  ];
 }
 
 async function runCommand(
@@ -426,15 +1226,20 @@ async function runCommand(
   return new Promise((resolve, reject) => {
     let settled = false;
     let timedOut = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
     const child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env
+      env: process.env,
+      detached: process.platform !== "win32"
     });
     let stdout = "";
     let stderr = "";
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      terminateProcessTree(child.pid);
+      killTimer = setTimeout(() => {
+        terminateProcessTree(child.pid, "SIGKILL");
+      }, 5_000);
       if (!settled) {
         settled = true;
         reject(
@@ -455,6 +1260,9 @@ async function runCommand(
     });
     child.on("error", (error) => {
       clearTimeout(timeout);
+      if (killTimer !== undefined) {
+        clearTimeout(killTimer);
+      }
       if (!settled) {
         settled = true;
         reject(error);
@@ -462,6 +1270,9 @@ async function runCommand(
     });
     child.on("close", (code, signal) => {
       clearTimeout(timeout);
+      if (killTimer !== undefined) {
+        clearTimeout(killTimer);
+      }
       if (settled || timedOut) {
         return;
       }
@@ -472,7 +1283,7 @@ async function runCommand(
       } else if (code === null) {
         reject(
           new Error(
-            `${command} was terminated${signal === null ? "" : ` by ${signal}`}.`
+            `${command} was terminated${signal === null ? "" : ` by ${signal}`}: ${formatCodexFailureOutput(stderr || stdout)}`
           )
         );
       } else {
@@ -485,6 +1296,30 @@ async function runCommand(
     });
     child.stdin.end(stdin ?? "");
   });
+}
+
+function terminateProcessTree(
+  pid: number | undefined,
+  signal: NodeJS.Signals = "SIGTERM"
+) {
+  if (pid === undefined) {
+    return;
+  }
+
+  try {
+    if (process.platform === "win32") {
+      process.kill(pid, signal);
+      return;
+    }
+
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The process may have exited between timeout and cleanup.
+    }
+  }
 }
 
 export function parseCodexLoginStatus(output: string): CodexCliAuthStatus {
@@ -518,18 +1353,22 @@ function createCodexPrompt(
   return [
     "You are the OpenAI Codex provider inside a local-first LaTeX editor.",
     "Use your own judgment to decide how to complete the user's task.",
-    "You may inspect the project from the current working directory, but do not modify files.",
+    "You may inspect the project from the current working directory. Do not modify files directly inside Codex CLI; return a ZeroLeaf action so the app can perform project-scoped changes safely.",
+    'Do not run LaTeX compile commands inside Codex CLI. For compile, recompile, build, or PDF generation requests, return action "run-compile" so ZeroLeaf can run its local build tool.',
     "Return only JSON matching the provided schema.",
     'Set action to "answer" when the task is best completed by explanation, summary, review, diagnosis, or guidance.',
     'Set action to "patch" when the task requires or asks for a source edit. For patches, produce a minimal full-file replacement for targetFilePath.',
+    'Set action to "move-entry" when the task requires moving or renaming a project file without changing file contents. Put the current project path in targetFilePath and the destination project path in afterContents.',
     'Set action to "set-main-file" when the user asks to choose, change, set, or switch the project main/root TeX file without editing source contents. Put the desired .tex project path in targetFilePath.',
+    'Set action to "run-compile" when the user asks to compile, recompile, build, verify compilation, or generate/update the PDF.',
     request.mode === "read-only"
       ? 'The current ZeroLeaf mode is read-only, so action must be "answer". You may describe suggested edits in message, but do not return a patch action.'
-      : "ZeroLeaf will convert patch actions into a reviewable local changeset before any file is changed.",
+      : 'ZeroLeaf will perform returned actions through project-scoped app tools. In "apply-with-review" mode, patches wait for user approval; in "autonomous-local" mode, patches may be applied and compiled automatically.',
     request.mode === "read-only"
       ? ""
-      : 'For edit, change, rewrite, replace, set, insert, delete, fix, repair, compile-error, failing-build, and diagnostic tasks, return the concrete action whenever safe: "patch" for source edits and "set-main-file" for changing the project main TeX file. Do not stop at explaining the edit or app action.',
+      : 'For edit, change, rewrite, replace, insert, delete, fix, repair, compile, recompile, build, PDF generation, compile-error, failing-build, and diagnostic tasks, return the concrete action whenever safe: "patch" for source edits, "move-entry" for moving or renaming files, "set-main-file" for changing the project main TeX file, and "run-compile" for builds. Do not stop at explaining the edit or app action.',
     "Preserve all unrelated text and formatting when returning a patch.",
+    "For patches, afterContents must be the complete target file after the edit, not a snippet, diff, abbreviated file, or only the changed section. Never omit unchanged content.",
     request.selectedText === undefined
       ? ""
       : "The user selected text. Change only that exact selected span; preserve all unrelated paragraphs, LaTeX commands, labels, references, and citations unless the user explicitly asks to change one.",
@@ -571,12 +1410,122 @@ function createCodexPatchRetryPrompt(
     "Retry instruction:",
     "Your previous response answered with guidance instead of a concrete app action.",
     'If a concrete safe source edit exists, return action "patch" with afterContents set to the complete target file after the minimal fix.',
+    'If the user asked to move or rename a project file, return action "move-entry" with targetFilePath set to the current project path and afterContents set to the destination project path.',
     'If the user asked to set or change the project main TeX file, return action "set-main-file" with targetFilePath set to that .tex project path.',
+    'If the user asked to compile, recompile, build, verify compilation, or generate/update the PDF, return action "run-compile".',
     'Use action "answer" only if no source edit or app action is safe, or no change is actually needed.',
     "",
     "Previous message:",
     previousResponse.message
   ].join("\n");
+}
+
+function createCodexOverbroadPatchRetryPrompt(
+  request: AgentStartRequest,
+  snapshot: ProjectFileSnapshot,
+  previousResponse: CodexAgentResponse
+): string {
+  return [
+    createCodexPrompt(request, snapshot),
+    "",
+    "Safety retry instruction:",
+    "Your previous patch removed most of a large file, so ZeroLeaf rejected it before applying.",
+    "Return a safe minimal patch action only if you can preserve the entire target file.",
+    "afterContents must contain the complete target file after the edit, including all unchanged sections before and after the change.",
+    "Do not return only the preamble, only the changed lines, a partial file, or an abbreviated file.",
+    'Use action "answer" if you cannot safely return the complete target file.',
+    "",
+    "Previous summary:",
+    previousResponse.summary,
+    "",
+    "Previous message:",
+    previousResponse.message
+  ].join("\n");
+}
+
+function createCodexCompileRepairPrompt(
+  request: AgentStartRequest,
+  snapshot: ProjectFileSnapshot,
+  buildResult: BuildResult,
+  attempt: number
+): string {
+  const diagnostics = buildResult.diagnostics.slice(0, 8);
+
+  return [
+    createCodexPrompt(
+      {
+        ...request,
+        ...(diagnostics[0] === undefined ? {} : { diagnostic: diagnostics[0] })
+      },
+      snapshot
+    ),
+    "",
+    "Compile repair instruction:",
+    `ZeroLeaf already ran the local LaTeX build tool and the build failed. This is repair attempt ${attempt} of ${maxCodexCompileRepairAttempts}.`,
+    "Inspect the diagnostic and log excerpt below. Return a minimal source patch that fixes the compile failure, then ZeroLeaf will apply it and recompile.",
+    "Do not return action run-compile here; compile has already failed and the next required action is a source repair patch.",
+    'Use action "answer" only if the failure cannot be fixed safely by editing project files.',
+    "",
+    `Build status: ${buildResult.status}`,
+    `Build command: ${buildResult.command.join(" ")}`,
+    `Diagnostics (${buildResult.diagnostics.length} total):`,
+    diagnostics.length === 0
+      ? "- No structured diagnostics were parsed. Use the log excerpt."
+      : diagnostics
+          .map(
+            (diagnostic) =>
+              `- ${diagnostic.severity}: ${diagnostic.message} (${diagnostic.filePath ?? "unknown file"}:${diagnostic.line ?? "unknown line"})`
+          )
+          .join("\n"),
+    "",
+    "Build log excerpt:",
+    "```log",
+    createBuildLogExcerpt(buildResult),
+    "```"
+  ].join("\n");
+}
+
+function createCodexInterruptedRetryPrompt(
+  request: AgentStartRequest,
+  snapshot: ProjectFileSnapshot,
+  error: unknown
+): string {
+  return [
+    "You are the OpenAI Codex planner inside ZeroLeaf, a local-first LaTeX editor.",
+    "The previous Codex planner attempt was interrupted before it returned a valid action.",
+    "Use this smaller prompt and avoid broad project scans. Return one JSON action only.",
+    "Do not modify files or run LaTeX commands inside Codex CLI. ZeroLeaf will run returned app actions.",
+    'Use action "patch" for a minimal source edit, "move-entry" for file moves, "set-main-file" for changing the main TeX file, "run-compile" for compile requests, or "answer" only when no safe action exists.',
+    `Interrupted attempt: ${formatPlannerFailure(error)}`,
+    `User task: ${request.prompt}`,
+    `Project root: ${request.projectRoot}`,
+    `Target file: ${snapshot.path}`,
+    request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
+    request.selectedText === undefined ? "" : `Selected text:\n${request.selectedText}`,
+    request.diagnostic === undefined
+      ? ""
+      : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
+    "",
+    `Focused active file preview (${snapshot.path}):`,
+    "```tex",
+    createFocusedSourcePreview(snapshot.contents),
+    "```"
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
+function isRetryableCodexExecError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return (
+    message.includes("timed out") ||
+    message.includes("terminated by sigterm") ||
+    message.includes("terminated by sigkill")
+  );
+}
+
+function formatPlannerFailure(error: unknown): string {
+  return getErrorMessage(error).replace(/\s+/gu, " ").trim();
 }
 
 function shouldRetryForConcreteAction(
@@ -602,9 +1551,26 @@ function isConcreteActionPreferredRequest(request: AgentStartRequest): boolean {
     return true;
   }
 
-  return /\b(edit|change|set|switch|make|update|rewrite|replace|insert|add|remove|delete|fix|repair|compile error|compilation error|failing build|build failure|latex error|diagnostic|main\s+(?:tex|file)|root\s+(?:tex|file))\b/iu.test(
+  return /\b(edit|change|set|switch|make|update|rewrite|replace|insert|add|remove|delete|move|rename|fix|repair|compile|recompile|build|pdf|compile error|compilation error|failing build|build failure|latex error|diagnostic|main\s+(?:tex|file)|root\s+(?:tex|file))\b/iu.test(
     request.prompt
   );
+}
+
+function isLikelyOverbroadPatch(
+  beforeContents: string,
+  afterContents: string
+): boolean {
+  const before = beforeContents.trim();
+  const after = afterContents.trim();
+
+  if (before.length < 2_000 || after.length === 0) {
+    return false;
+  }
+
+  const beforeLines = before.split(/\r?\n/u).length;
+  const afterLines = after.split(/\r?\n/u).length;
+
+  return after.length < before.length * 0.65 || afterLines < beforeLines * 0.65;
 }
 
 function createSourcePreview(contents: string): string {
@@ -636,6 +1602,39 @@ function createSourcePreview(contents: string): string {
     .join("\n\n");
 }
 
+function createFocusedSourcePreview(contents: string): string {
+  const maxPreviewLength = 6_000;
+
+  if (contents.length <= maxPreviewLength) {
+    return contents;
+  }
+
+  const head = contents.slice(0, 4_000);
+  const tail = contents.slice(-1_500);
+
+  return [head, "% ... focused retry preview truncated ...", tail].join("\n\n");
+}
+
+function createBuildLogExcerpt(buildResult: BuildResult): string {
+  const combinedLog = [buildResult.stderr, buildResult.stdout, buildResult.rawLog]
+    .filter((part) => part.trim().length > 0)
+    .join("\n\n");
+  const normalizedLog =
+    combinedLog.trim().length === 0
+      ? "No LaTeX log output was captured."
+      : combinedLog.trim();
+
+  if (normalizedLog.length <= 8_000) {
+    return normalizedLog;
+  }
+
+  return [
+    normalizedLog.slice(0, 4_000),
+    "% ... build log excerpt truncated ...",
+    normalizedLog.slice(-3_000)
+  ].join("\n\n");
+}
+
 function parseCodexAgentResponse(value: unknown): CodexAgentResponse {
   if (typeof value !== "object" || value === null) {
     throw new Error("Codex output was not a JSON object.");
@@ -646,7 +1645,9 @@ function parseCodexAgentResponse(value: unknown): CodexAgentResponse {
   if (
     (candidate.action !== "answer" &&
       candidate.action !== "patch" &&
-      candidate.action !== "set-main-file") ||
+      candidate.action !== "move-entry" &&
+      candidate.action !== "set-main-file" &&
+      candidate.action !== "run-compile") ||
     typeof candidate.targetFilePath !== "string" ||
     typeof candidate.summary !== "string" ||
     typeof candidate.afterContents !== "string" ||
@@ -670,7 +1671,9 @@ const codexOutputSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    action: { enum: ["answer", "patch", "set-main-file"] },
+    action: {
+      enum: ["answer", "patch", "move-entry", "set-main-file", "run-compile"]
+    },
     targetFilePath: { type: "string" },
     summary: { type: "string" },
     afterContents: { type: "string" },
@@ -679,6 +1682,17 @@ const codexOutputSchema = {
   },
   required: ["action", "targetFilePath", "summary", "afterContents", "message", "notes"]
 } as const;
+
+function pushAgentEvents(
+  events: AgentEvent[],
+  broker: Pick<CodexCliToolBroker, "emitEvent"> | undefined,
+  ...nextEvents: readonly AgentEvent[]
+): void {
+  events.push(...nextEvents);
+  for (const event of nextEvents) {
+    broker?.emitEvent?.(event);
+  }
+}
 
 function createMessageEvent(
   sessionId: string,
@@ -744,7 +1758,8 @@ function createApprovalEvent(sessionId: string): AgentEvent {
 function createVerificationEvent(
   sessionId: string,
   status: "pending" | "running" | "passed" | "failed",
-  summary: string
+  summary: string,
+  buildJobId?: string
 ): AgentEvent {
   return {
     id: randomUUID(),
@@ -752,8 +1767,32 @@ function createVerificationEvent(
     createdAt: new Date().toISOString(),
     type: "verification",
     status,
-    summary
+    summary,
+    ...(buildJobId === undefined ? {} : { buildJobId })
   };
+}
+
+function formatCompileMessage(buildResult: BuildResult): string {
+  const diagnostics = buildResult.diagnostics.slice(0, 4);
+  const diagnosticSummary =
+    diagnostics.length === 0
+      ? "No diagnostics were reported."
+      : diagnostics
+          .map(
+            (diagnostic) =>
+              `- ${diagnostic.severity}: ${diagnostic.message}${
+                diagnostic.filePath === undefined
+                  ? ""
+                  : ` (${diagnostic.filePath}${diagnostic.line === undefined ? "" : `:${diagnostic.line}`})`
+              }`
+          )
+          .join("\n");
+
+  return [
+    `Compile ${buildResult.status}.`,
+    `Diagnostics: ${buildResult.diagnostics.length}.`,
+    diagnosticSummary
+  ].join("\n\n");
 }
 
 function createErrorEvent(sessionId: string, message: string): AgentEvent {

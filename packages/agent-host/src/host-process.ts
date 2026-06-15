@@ -396,6 +396,11 @@ function createBrokerProxy(
   context: AgentStartRequest
 ): AgentToolBroker {
   return {
+    emitEvent: (event) =>
+      sendHostMessage({
+        type: "session.event",
+        event
+      }),
     readFile: (path) => requestTool(sessionId, context, "read-file", { path }),
     searchProject: (query) =>
       requestTool(sessionId, context, "search-project", { query }),

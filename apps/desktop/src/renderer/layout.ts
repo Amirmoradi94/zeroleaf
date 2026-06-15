@@ -12,7 +12,7 @@ export type ResizeDelta = {
 
 export const paneConstraints = {
   sidebarWidth: { min: 220, max: 420 },
-  pdfWidth: { min: 320, max: 720 },
+  pdfWidth: { min: 320, max: 1400 },
   agentWidth: { min: 340, max: 560 },
   bottomPanelHeight: { min: 140, max: 360 }
 } as const;

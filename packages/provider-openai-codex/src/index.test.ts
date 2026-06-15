@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import type { BuildResult } from "@latex-agent/ipc-contracts";
 
 import {
   CodexCliProvider,
+  createCodexExecArgs,
   parseCodexLoginStatus,
   type CodexCliToolBroker
 } from "./index.js";
@@ -51,6 +53,29 @@ describe("CodexCliProvider", () => {
     expect(parseCodexLoginStatus("Not logged in. Run `codex login`.")).toEqual({
       loggedIn: false
     });
+  });
+
+  it("runs Codex exec with an isolated read-only planner configuration", () => {
+    expect(
+      createCodexExecArgs("/tmp/schema.json", "/tmp/output.json", "/tmp/project")
+    ).toEqual([
+      "exec",
+      "--skip-git-repo-check",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--ephemeral",
+      "--sandbox",
+      "read-only",
+      "-c",
+      'model_reasoning_effort="low"',
+      "--output-schema",
+      "/tmp/schema.json",
+      "--output-last-message",
+      "/tmp/output.json",
+      "-C",
+      "/tmp/project",
+      "-"
+    ]);
   });
 
   it("runs read-only tasks through Codex exec and returns the model answer", async () => {
@@ -336,9 +361,11 @@ describe("CodexCliProvider", () => {
     expect(providerPrompt).toContain(
       'return the concrete action whenever safe: "patch" for source edits'
     );
+    expect(providerPrompt).toContain('"move-entry" for moving or renaming files');
     expect(providerPrompt).toContain(
       '"set-main-file" for changing the project main TeX file'
     );
+    expect(providerPrompt).toContain('"run-compile" for builds');
     expect(providerPrompt).toContain("\\citep{smith2024}");
   });
 
@@ -386,8 +413,269 @@ describe("CodexCliProvider", () => {
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain("Retry instruction:");
     expect(prompts[1]).toContain('return action "patch"');
+    expect(prompts[1]).toContain('return action "move-entry"');
     expect(prompts[1]).toContain('return action "set-main-file"');
+    expect(prompts[1]).toContain('return action "run-compile"');
     expect(calls).toEqual(["read-file:main.tex", "propose-patch"]);
+  });
+
+  it("retries interrupted Codex planner runs once with focused context", async () => {
+    const calls: string[] = [];
+    const prompts: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: (request) => {
+        prompts.push(request.prompt);
+        if (prompts.length === 1) {
+          throw new Error("codex was terminated by SIGTERM: stdio transport closed");
+        }
+
+        return Promise.resolve({
+          action: "patch",
+          targetFilePath: "main.tex",
+          summary: "Add missing document end",
+          afterContents:
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+          message: "I prepared a reviewable patch after retrying.",
+          notes: "Focused retry produced patch"
+        });
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "apply-with-review",
+        projectRoot: "/tmp/project",
+        prompt: "Fix the compile error.",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex",
+        diagnostic: {
+          severity: "error",
+          filePath: "main.tex",
+          line: 3,
+          message: "Emergency stop"
+        }
+      },
+      createBroker(calls)
+    );
+
+    expect(result.status).toBe("awaiting-approval");
+    expect(result.changeset?.summary).toBe("Add missing document end");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("previous Codex planner attempt was interrupted");
+    expect(prompts[1]).toContain("avoid broad project scans");
+    expect(prompts[1]).toContain("Emergency stop");
+    expect(calls).toEqual(["read-file:main.tex", "propose-patch"]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "tool-call" &&
+          event.toolName === "codex-exec" &&
+          event.status === "failed" &&
+          event.summary.includes("SIGTERM") &&
+          event.summary.includes("Retrying")
+      )
+    ).toBe(true);
+  });
+
+  it("rejects overbroad large-file patches and retries for a complete file", async () => {
+    const calls: string[] = [];
+    const prompts: string[] = [];
+    const largeFile = [
+      "\\documentclass{article}",
+      "\\usepackage{graphicx}",
+      "\\begin{document}",
+      ...Array.from({ length: 180 }, (_, index) => `Paragraph ${index}.`),
+      "\\bibliography{references.bib}",
+      "\\end{document}",
+      ""
+    ].join("\n");
+    const provider = new CodexCliProvider({
+      runCodexExec: (request) => {
+        prompts.push(request.prompt);
+        if (prompts.length === 1) {
+          return Promise.resolve({
+            action: "patch",
+            targetFilePath: "main.tex",
+            summary: "Add graphics path",
+            afterContents:
+              "\\documentclass{article}\n\\usepackage{graphicx}\n\\graphicspath{{figures/}}\n",
+            message: "I added the graphics path.",
+            notes: "Returned an incomplete patch"
+          });
+        }
+
+        return Promise.resolve({
+          action: "patch",
+          targetFilePath: "main.tex",
+          summary: "Add graphics path",
+          afterContents: largeFile.replace(
+            "\\usepackage{graphicx}",
+            "\\usepackage{graphicx}\n\\graphicspath{{figures/}}"
+          ),
+          message: "I added the graphics path while preserving the full file.",
+          notes: "Returned a complete patch"
+        });
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "apply-with-review",
+        projectRoot: "/tmp/project",
+        prompt: "Fix the root-relative graphics path.",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls, { readFiles: { "main.tex": largeFile } })
+    );
+
+    expect(result.status).toBe("awaiting-approval");
+    expect(result.changeset?.summary).toBe("Add graphics path");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("previous patch removed most of a large file");
+    expect(prompts[1]).toContain("complete target file");
+    expect(calls).toEqual(["read-file:main.tex", "propose-patch"]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "tool-call" &&
+          event.toolName === "codex-exec" &&
+          event.status === "running" &&
+          event.summary.includes("removed most of a large file")
+      )
+    ).toBe(true);
+  });
+
+  it("does not retry non-transient Codex planner failures", async () => {
+    const prompts: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: (request) => {
+        prompts.push(request.prompt);
+        throw new Error(
+          "Codex output did not match the expected agent response schema."
+        );
+      }
+    });
+
+    await expect(
+      provider.startSession(
+        {
+          providerId: "openai-codex",
+          mode: "apply-with-review",
+          projectRoot: "/tmp/project",
+          prompt: "Fix the compile error.",
+          activeFilePath: "main.tex",
+          mainFilePath: "main.tex",
+          compiler: "pdflatex"
+        },
+        createBroker()
+      )
+    ).rejects.toThrow("expected agent response schema");
+    expect(prompts).toHaveLength(1);
+  });
+
+  it("applies Codex patches and compiles in autonomous-local mode", async () => {
+    const calls: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: () =>
+        Promise.resolve({
+          action: "patch",
+          targetFilePath: "main.tex",
+          summary: "Add missing document end",
+          afterContents:
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+          message: "I fixed the missing document terminator.",
+          notes: "Generated by fake Codex runner"
+        })
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "autonomous-local",
+        projectRoot: "/tmp/project",
+        prompt: "Fix the compile error and recompile.",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(result.changeset?.status).toBe("applied");
+    expect(result.buildResult?.status).toBe("succeeded");
+    expect(calls).toEqual([
+      "read-file:main.tex",
+      "propose-patch",
+      "apply-patch:changeset-1",
+      "run-compile"
+    ]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "tool-call" &&
+          event.toolName === "apply-patch" &&
+          event.status === "succeeded"
+      )
+    ).toBe(true);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "verification" &&
+          event.status === "passed" &&
+          event.buildJobId === "build-1"
+      )
+    ).toBe(true);
+  });
+
+  it("turns file move requests into a project-scoped app tool call", async () => {
+    const calls: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: () =>
+        Promise.resolve({
+          action: "move-entry",
+          targetFilePath: "fig1.png",
+          summary: "Move figure next to manuscript path",
+          afterContents: "figures/fig1.png",
+          message: "I moved `fig1.png` to `figures/fig1.png`.",
+          notes: "Generated by fake Codex runner"
+        })
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "autonomous-local",
+        projectRoot: "/tmp/project",
+        prompt: "Move fig1.png into figures/fig1.png",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(result.moveEntries).toEqual([
+      { fromPath: "fig1.png", toPath: "figures/fig1.png" }
+    ]);
+    expect(calls).toEqual([
+      "read-file:main.tex",
+      "move-entry:fig1.png->figures/fig1.png"
+    ]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "tool-call" &&
+          event.toolName === "move-entry" &&
+          event.status === "succeeded"
+      )
+    ).toBe(true);
   });
 
   it("turns main-file change requests into an app tool call", async () => {
@@ -444,6 +732,249 @@ describe("CodexCliProvider", () => {
     ).toBe(true);
   });
 
+  it("turns compile requests into an app build tool call", async () => {
+    const calls: string[] = [];
+    const prompts: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: (request) => {
+        prompts.push(request.prompt);
+        if (prompts.length === 1) {
+          return Promise.resolve(
+            createCodexAnswer(
+              "I attempted to recompile, but the read-only environment prevented LaTeX from writing main.aux."
+            )
+          );
+        }
+
+        return Promise.resolve({
+          action: "run-compile",
+          targetFilePath: "main.tex",
+          summary: "Run project compile",
+          afterContents: "",
+          message: "I ran the project compile.",
+          notes: "Retry produced app build action"
+        });
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "autonomous-local",
+        projectRoot: "/tmp/project",
+        prompt: "recompile to make sure there is no error",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(result.buildResult?.status).toBe("succeeded");
+    expect(prompts).toHaveLength(2);
+    expect(calls).toEqual(["read-file:main.tex", "run-compile"]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "tool-call" &&
+          event.toolName === "run-compile" &&
+          event.status === "succeeded"
+      )
+    ).toBe(true);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "verification" &&
+          event.status === "passed" &&
+          event.buildJobId === "build-1"
+      )
+    ).toBe(true);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "message" &&
+          event.role === "assistant" &&
+          event.content.includes("Compile succeeded.")
+      )
+    ).toBe(true);
+  });
+
+  it("repairs a failed autonomous compile and recompiles before answering", async () => {
+    const calls: string[] = [];
+    const prompts: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: (request) => {
+        prompts.push(request.prompt);
+        if (prompts.length === 1) {
+          return Promise.resolve({
+            action: "run-compile",
+            targetFilePath: "main.tex",
+            summary: "Run project compile",
+            afterContents: "",
+            message: "I will compile the project.",
+            notes: "Initial compile action"
+          });
+        }
+
+        return Promise.resolve({
+          action: "patch",
+          targetFilePath: "main.tex",
+          summary: "Fix missing input path",
+          afterContents:
+            "\\documentclass{article}\n\\begin{document}\n\\input{tracked.tex}\n\\end{document}\n",
+          message: "I fixed the missing input path.",
+          notes: "Repair patch produced from compile log"
+        });
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "autonomous-local",
+        projectRoot: "/tmp/project",
+        prompt: "compile again the main tex file",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls, {
+        compileResults: [
+          createBuildResult({
+            diagnostics: [
+              {
+                severity: "error",
+                filePath: "main.tex",
+                line: 1,
+                message: "File `tracked.tex' not found."
+              }
+            ],
+            jobId: "build-failed",
+            rawLog: "! LaTeX Error: File `tracked.tex' not found.",
+            status: "failed"
+          }),
+          createBuildResult({
+            artifact: {
+              byteLength: 1234,
+              pdfPath: "main.pdf",
+              updatedAt: "2026-06-08T00:00:02.000Z"
+            },
+            jobId: "build-fixed",
+            rawLog: "Output written on main.pdf",
+            status: "succeeded"
+          })
+        ],
+        readFiles: {
+          "main.tex":
+            "\\documentclass{article}\n\\begin{document}\n\\input{missing.tex}\n"
+        }
+      })
+    );
+
+    expect(result.status).toBe("completed");
+    expect(result.changeset?.status).toBe("applied");
+    expect(result.buildResult?.status).toBe("succeeded");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("Compile repair instruction:");
+    expect(prompts[1]).toContain("File `tracked.tex' not found.");
+    expect(prompts[1]).toContain("! LaTeX Error: File `tracked.tex' not found.");
+    expect(calls).toEqual([
+      "read-file:main.tex",
+      "run-compile",
+      "propose-patch",
+      "apply-patch:changeset-1",
+      "run-compile",
+      "read-file:main.tex"
+    ]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "tool-call" &&
+          event.toolName === "codex-exec" &&
+          event.summary.includes("Compile failed; asking Codex to repair")
+      )
+    ).toBe(true);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "message" &&
+          event.role === "assistant" &&
+          event.content.includes(
+            "I fixed the compile issue and recompiled successfully"
+          )
+      )
+    ).toBe(true);
+  });
+
+  it("reports a failed compile when Codex cannot produce a safe repair patch", async () => {
+    const calls: string[] = [];
+    const prompts: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: (request) => {
+        prompts.push(request.prompt);
+        if (prompts.length === 1) {
+          return Promise.resolve({
+            action: "run-compile",
+            targetFilePath: "main.tex",
+            summary: "Run project compile",
+            afterContents: "",
+            message: "I will compile the project.",
+            notes: "Initial compile action"
+          });
+        }
+
+        return Promise.resolve(
+          createCodexAnswer("The compile failure requires a missing external file.")
+        );
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "autonomous-local",
+        projectRoot: "/tmp/project",
+        prompt: "compile again the main tex file",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls, {
+        compileResults: [
+          createBuildResult({
+            diagnostics: [
+              {
+                severity: "error",
+                filePath: "main.tex",
+                line: 1,
+                message: "File `outside.tex' not found."
+              }
+            ],
+            jobId: "build-failed",
+            rawLog: "! LaTeX Error: File `outside.tex' not found.",
+            status: "failed"
+          })
+        ]
+      })
+    );
+
+    expect(result.status).toBe("completed");
+    expect(result.changeset).toBeUndefined();
+    expect(result.buildResult?.status).toBe("failed");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("Compile repair instruction:");
+    expect(calls).toEqual(["read-file:main.tex", "run-compile"]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "message" &&
+          event.role === "assistant" &&
+          event.content.includes("did not return a safe source patch")
+      )
+    ).toBe(true);
+  });
+
   it("does not retry answer-only questions in autonomous mode", async () => {
     const prompts: string[] = [];
     const provider = new CodexCliProvider({
@@ -483,15 +1014,59 @@ function createCodexAnswer(message: string) {
   };
 }
 
+function createBuildResult(
+  overrides: Partial<BuildResult> & Pick<BuildResult, "jobId" | "status">
+): BuildResult {
+  return {
+    jobId: overrides.jobId,
+    status: overrides.status,
+    compiler: overrides.compiler ?? "pdflatex",
+    command: overrides.command ?? ["latexmk", "-pdf", "main.tex"],
+    securityPolicy: overrides.securityPolicy ?? {
+      shellEscape: {
+        enabled: false,
+        commandFlag: "-no-shell-escape",
+        approvalRequiredToEnable: true,
+        agentMayEnable: false,
+        message:
+          "Shell escape is disabled for LaTeX builds. Enabling it requires explicit user approval."
+      }
+    },
+    startedAt: overrides.startedAt ?? "2026-06-08T00:00:00.000Z",
+    finishedAt: overrides.finishedAt ?? "2026-06-08T00:00:01.000Z",
+    durationMs: overrides.durationMs ?? 1000,
+    ...(overrides.exitCode === undefined ? {} : { exitCode: overrides.exitCode }),
+    diagnostics: overrides.diagnostics ?? [],
+    rawLog:
+      overrides.rawLog ??
+      (overrides.status === "succeeded" ? "Output written on main.pdf" : ""),
+    ...(overrides.rawLogTruncated === undefined
+      ? {}
+      : { rawLogTruncated: overrides.rawLogTruncated }),
+    ...(overrides.rawLogBytes === undefined
+      ? {}
+      : { rawLogBytes: overrides.rawLogBytes }),
+    ...(overrides.rawLogOriginalBytes === undefined
+      ? {}
+      : { rawLogOriginalBytes: overrides.rawLogOriginalBytes }),
+    stdout: overrides.stdout ?? "",
+    stderr: overrides.stderr ?? "",
+    ...(overrides.artifact === undefined ? {} : { artifact: overrides.artifact })
+  };
+}
+
 function createBroker(
   calls: string[] = [],
   options: {
+    readonly compileResults?: readonly BuildResult[];
     readonly readFiles?: Readonly<Record<string, string>>;
     readonly searchResults?: Readonly<
       Record<string, readonly { readonly path: string; readonly contents: string }[]>
     >;
   } = {}
 ): CodexCliToolBroker {
+  let compileRunCount = 0;
+
   return {
     readFile: (path) => {
       calls.push(`read-file:${path}`);
@@ -517,6 +1092,19 @@ function createBroker(
       calls.push(`set-main-file:${path}`);
       return Promise.resolve({ path });
     },
+    moveEntry: (fromPath, toPath) => {
+      calls.push(`move-entry:${fromPath}->${toPath}`);
+      return Promise.resolve({ fromPath, toPath });
+    },
+    runCompile: () => {
+      calls.push("run-compile");
+      const result =
+        options.compileResults?.[
+          Math.min(compileRunCount, options.compileResults.length - 1)
+        ] ?? createBuildResult({ jobId: "build-1", status: "succeeded" });
+      compileRunCount += 1;
+      return Promise.resolve(result);
+    },
     proposePatch: (_filePath, _beforeContents, afterContents, summary) => {
       calls.push("propose-patch");
       return Promise.resolve({
@@ -529,6 +1117,20 @@ function createBroker(
         baseSnapshotId: "snapshot-1",
         createdAt: "2026-06-08T00:00:00.000Z",
         updatedAt: "2026-06-08T00:00:00.000Z"
+      });
+    },
+    applyPatch: (changesetId) => {
+      calls.push(`apply-patch:${changesetId}`);
+      return Promise.resolve({
+        id: changesetId,
+        projectRoot: "/tmp/project",
+        filePath: "main.tex",
+        summary: "Add missing document end",
+        patch: "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+        status: "applied",
+        baseSnapshotId: "snapshot-1",
+        createdAt: "2026-06-08T00:00:00.000Z",
+        updatedAt: "2026-06-08T00:00:01.000Z"
       });
     }
   };

@@ -1,28 +1,16 @@
 <claude-mem-context>
 # Memory Context
 
-# [overleaf-clone] recent context, 2026-06-13 12:13am EDT
+# [overleaf-clone] recent context, 2026-06-15 1:28pm EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 50 obs (18,424t read) | 850,963t work | 98% savings
+Stats: 50 obs (19,451t read) | 990,373t work | 98% savings
 
-### Jun 10, 2026
-7373 12:38a 🔵 Full Repo Build Succeeds After Agent-Host and Test Changes
-7452 3:28p 🔵 Project Identity: ai-latex-editor (overleaf-clone)
-7453 3:31p 🟣 Font Comparison Preview Page Created for Overleaf Clone
-7454 3:42p 🔵 Font Configuration Locations Mapped in Overleaf Clone
-7455 " ✅ App Fonts Changed to Nunito Sans + JetBrains Mono
-7457 " 🔵 Dev Server Started on Port 5175 After Port Conflicts
-7456 3:43p 🔴 Remaining Monaco Font Stack in .log-output Fixed
-7458 3:44p 🔵 Ports 5173–5174 Occupied by Separate Postdoc Dashboard Vite Instances
-7459 " 🔵 Duplicate Dev Server Processes Killed; Overleaf Clone Now on Port 5174
-7460 " 🔵 Electron Main Window Configuration Documented
 ### Jun 11, 2026
-7517 12:59p 🟣 LaTeX Agent Real-World Test Plan Defined
-7518 " 🔵 Codex Provider Architecture and Agent Host IPC Contracts Mapped
+7518 12:59p 🔵 Codex Provider Architecture and Agent Host IPC Contracts Mapped
 7519 " 🔵 createFileBackedAgentBroker and HistoryStore Integration Pattern Confirmed
 7521 " 🔵 project-service Public API Surface Mapped for Test Runner
 7523 " 🟣 Real Codex Agent Test Runner Script Created
@@ -62,8 +50,20 @@ Stats: 50 obs (18,424t read) | 850,963t work | 98% savings
 7644 " 🔵 Full Diff Reveals Agent Panel Redesign Scope vs Pre-Existing Changes
 7655 " ⚖️ Two Agent Panel UX Requirements Identified: Activity Cleanup and Markdown Rendering
 7645 2:34p 🔵 Working-Tree Diff Scale: 5145 Insertions, 720 Deletions Across Agent Panel Files
+### Jun 14, 2026
+7822 11:13p ✅ Remove Bibliography/References from Left Panel
+7823 11:14p 🔵 Bibliography/References Left Panel Location Identified in App.tsx
+7824 " 🔵 References Panel Exists in Both Left Sidebar AND Bottom Panel
+7825 " ✅ Removed Bibliography/References Panel from Left Sidebar Activity Rail
+7826 " 🟣 Agent History Persisted to localStorage Across Sessions
+7827 " ✅ Agent Mode "read-only" Renamed to "suggest" Throughout Codebase
+7828 " 🟣 Agent Can Create Projects Without an Open Project via NLP Command Parsing
+7829 " 🟣 Agent Pane Gains Elapsed Timer, Clear History Button, and Auto-Scroll
+7830 " 🟣 Agent Build Results Update PDF Preview After Successful Compile
+7832 " ⚖️ Cloud-Based Project Sharing Identified as Required Feature
+7831 11:16p ✅ References Removal Verified: TypeCheck and Render Tests Pass
 
-Access 851k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 990k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>
 
 # Project Guidance

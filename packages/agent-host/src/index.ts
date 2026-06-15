@@ -30,6 +30,7 @@ export type AgentProvider = {
 };
 
 export type AgentToolBroker = {
+  readonly emitEvent?: (event: AgentEvent) => void;
   readonly readFile: (path: string) => Promise<ProjectFileSnapshot>;
   readonly searchProject: (query: string) => Promise<readonly ProjectFileSnapshot[]>;
   readonly moveEntry?: (
@@ -145,6 +146,10 @@ export type AgentHostOutboundMessage =
       readonly type: "session.result";
       readonly requestId: string;
       readonly result: AgentSessionResult;
+    }
+  | {
+      readonly type: "session.event";
+      readonly event: AgentEvent;
     }
   | {
       readonly type: "session.cancelled";
@@ -299,6 +304,11 @@ export class AgentHostClient {
       const pending = this.pendingSessionRequests.get(message.requestId);
       this.pendingSessionRequests.delete(message.requestId);
       pending?.resolve(message.result);
+      return;
+    }
+
+    if (message.type === "session.event") {
+      this.emitEvent(message.event);
       return;
     }
 
@@ -3456,6 +3466,7 @@ function isHostOutboundMessage(value: unknown): value is AgentHostOutboundMessag
     type === "auth.result" ||
     type === "host.ready" ||
     type === "session.result" ||
+    type === "session.event" ||
     type === "session.cancelled" ||
     type === "tool.request" ||
     type === "host.error"

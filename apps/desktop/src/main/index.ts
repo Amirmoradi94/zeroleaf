@@ -138,12 +138,7 @@ function normalizeWorkbenchLayout(value: unknown): WorkbenchLayout {
 
 const compilerIds = ["pdflatex", "xelatex", "lualatex"] as const;
 const agentProviderIds = ["mock", "openai-codex", "anthropic-claude"] as const;
-const agentModes = [
-  "read-only",
-  "suggest",
-  "apply-with-review",
-  "autonomous-local"
-] as const;
+const agentModes = ["suggest", "apply-with-review", "autonomous-local"] as const;
 
 function normalizeAppSettings(value: unknown): AppSettings {
   const candidate =
