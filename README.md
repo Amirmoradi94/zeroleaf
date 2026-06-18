@@ -49,24 +49,40 @@ scope for now.
 ## Requirements
 
 - macOS for the current packaged alpha.
-- Node.js `20.19` or newer and npm `10` or newer for source builds.
 - A TeX distribution with `latexmk` and `pdflatex` available on `PATH`.
 - Optional: Codex CLI and/or Claude Code installed and logged in for real agent
   workflows.
 
-Check the local toolchain:
+Check the LaTeX toolchain:
 
 ```bash
-node --version
-npm --version
 latexmk -version
 pdflatex --version
 ```
 
-## Install From Source
+## Install
 
-Clone the repository, install dependencies, build the main and renderer bundles,
-then start the desktop app:
+Download the latest packaged macOS alpha from GitHub Releases:
+
+- [ZeroLeaf-0.0.0-alpha.2-mac.zip](https://github.com/Amirmoradi94/zeroleaf/releases/download/v0.0.0-alpha.2/ZeroLeaf-0.0.0-alpha.2-mac.zip)
+- [All releases](https://github.com/Amirmoradi94/zeroleaf/releases)
+
+Then:
+
+1. Unzip `ZeroLeaf-0.0.0-alpha.2-mac.zip`.
+2. Move `ZeroLeaf.app` to `Applications` or another local folder.
+3. Right-click `ZeroLeaf.app` and choose `Open`.
+4. Confirm the macOS security prompt.
+
+This alpha build is unsigned and not notarized. If macOS blocks it, open
+`System Settings > Privacy & Security` and allow the app from there.
+
+## Build From Source
+
+Source builds are for contributors and local development. You need Node.js
+`20.19` or newer and npm `10` or newer.
+
+Clone the repository, install dependencies, build the app, then launch Electron:
 
 ```bash
 git clone <repo-url>
@@ -79,7 +95,7 @@ npm run dev
 During development, `npm run dev` starts the Vite renderer server and launches
 Electron.
 
-Package the macOS alpha artifact:
+To package a macOS ZIP locally:
 
 ```bash
 npm run package:mac:zip
