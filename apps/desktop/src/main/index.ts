@@ -1,4 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
+import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,9 +61,12 @@ import {
   defaultAppSettings,
   defaultWorkbenchLayout,
   ipcChannels,
+  type AgentProviderId,
+  type AgentProviderSetupAction,
   type AgentEvent,
   type AppSettings,
   type EditorProjectState,
+  type ExternalProjectTemplateId,
   type IpcChannel,
   type IpcRequestMap,
   type IpcResponseMap,
@@ -71,6 +75,7 @@ import {
   type WorkbenchLayout
 } from "@latex-agent/ipc-contracts";
 import { ProjectChangeDebouncer } from "./projectWatcher.js";
+import { PdfPreviewCaptureStore } from "./pdfPreviewCapture.js";
 
 const rendererDevServerUrl = process.env["VITE_DEV_SERVER_URL"];
 const mainDir = fileURLToPath(new URL(".", import.meta.url));
@@ -100,6 +105,7 @@ const agentHostClient = new AgentHostClient({
 let activeProjectWatcher: FSWatcher | undefined;
 let activeProjectRoot: string | undefined;
 let projectChangeDebouncer: ProjectChangeDebouncer | undefined;
+const pdfPreviewCaptureStore = new PdfPreviewCaptureStore();
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number) {
   return typeof value === "number" && Number.isFinite(value)
@@ -139,6 +145,20 @@ function normalizeWorkbenchLayout(value: unknown): WorkbenchLayout {
 const compilerIds = ["pdflatex", "xelatex", "lualatex"] as const;
 const agentProviderIds = ["mock", "openai-codex", "anthropic-claude"] as const;
 const agentModes = ["suggest", "apply-with-review", "autonomous-local"] as const;
+const externalProjectTemplates = {
+  "ieee-systems-journal": {
+    baseTemplateId: "article",
+    mainFilePath: "main.tex",
+    sourceUrl: "https://mirrors.ctan.org/macros/latex/contrib/IEEEtran/bare_jrnl.tex"
+  }
+} as const satisfies Record<
+  ExternalProjectTemplateId,
+  {
+    readonly baseTemplateId: IpcRequestMap[typeof ipcChannels.lifecycleCreateFromTemplate]["templateId"];
+    readonly mainFilePath: string;
+    readonly sourceUrl: string;
+  }
+>;
 
 function normalizeAppSettings(value: unknown): AppSettings {
   const candidate =
@@ -463,6 +483,37 @@ function normalizeEditorProjectState(
       };
 }
 
+async function fetchExternalTemplateMainTex(sourceUrl: string): Promise<string> {
+  const response = await fetch(sourceUrl, {
+    headers: {
+      accept: "text/x-tex,text/plain,*/*"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Could not fetch external template (${response.status}).`);
+  }
+
+  const contents = await response.text();
+
+  if (
+    contents.length < 1_000 ||
+    contents.length > 200_000 ||
+    !contents.includes("\\documentclass") ||
+    !contents.includes("IEEEtran")
+  ) {
+    throw new Error("Fetched template did not look like a valid IEEEtran source.");
+  }
+
+  return [
+    "% Source: CTAN IEEEtran journal skeleton fetched by ZeroLeaf.",
+    `% URL: ${sourceUrl}`,
+    "",
+    contents.trimEnd(),
+    ""
+  ].join("\n");
+}
+
 function handleIpc<TChannel extends IpcChannel>(
   channel: TChannel,
   handler: (
@@ -588,6 +639,11 @@ function registerIpcHandlers() {
   handleIpc(ipcChannels.pdfReadArtifact, (_event, request) =>
     readPdfArtifact(request.projectRoot, request.pdfPath)
   );
+
+  handleIpc(ipcChannels.pdfReportPreviewBounds, (event, request) => {
+    pdfPreviewCaptureStore.report(event.sender.id, request);
+    return { reported: true };
+  });
 
   handleIpc(ipcChannels.synctexForward, (_event, request) =>
     runSyncTexForward(request)
@@ -826,6 +882,42 @@ function registerIpcHandlers() {
     return project;
   });
 
+  handleIpc(ipcChannels.lifecycleCreateFromExternalTemplate, async (event, request) => {
+    const template = externalProjectTemplates[request.templateId];
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const dialogOptions: OpenDialogOptions = {
+      title: "Choose Project Location",
+      properties: ["openDirectory", "createDirectory"]
+    };
+    const result =
+      window === null
+        ? await dialog.showOpenDialog(dialogOptions)
+        : await dialog.showOpenDialog(window, dialogOptions);
+
+    if (result.canceled || result.filePaths[0] === undefined) {
+      return undefined;
+    }
+
+    const createdProject = await createProjectFromTemplate({
+      templateId: template.baseTemplateId,
+      projectName: request.projectName,
+      destinationParentPath: result.filePaths[0]
+    });
+    const templateContents = await fetchExternalTemplateMainTex(template.sourceUrl);
+
+    await writeProjectFile(
+      createdProject.projectRoot,
+      template.mainFilePath,
+      templateContents
+    );
+    const project = await openProject(
+      createdProject.projectRoot,
+      getProjectMetadataStore()
+    );
+    startProjectWatcher(project.project.rootPath);
+    return project;
+  });
+
   handleIpc(ipcChannels.lifecycleCheckSubmission, async (_event, request) => {
     return await checkSubmissionBundle(request.projectRoot, request.mainFilePath);
   });
@@ -840,6 +932,29 @@ function registerIpcHandlers() {
     }
 
     return await agentHostClient.getAuthStatus(request.providerId);
+  });
+
+  handleIpc(ipcChannels.agentOpenProviderSetupTerminal, async (_event, request) => {
+    if (
+      request.providerId !== "openai-codex" &&
+      request.providerId !== "anthropic-claude"
+    ) {
+      throw new Error("This provider does not need CLI setup.");
+    }
+
+    const command = getProviderSetupCommand(
+      request.providerId,
+      request.action,
+      process.platform
+    );
+    await openSetupTerminal(command, process.platform);
+
+    return {
+      opened: true,
+      command,
+      providerId: request.providerId,
+      action: request.action
+    };
   });
 
   handleIpc(ipcChannels.agentStart, async (_event, request) => {
@@ -908,6 +1023,20 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
       case "search-project": {
         const payload = message.payload as AgentToolRequestPayloadMap["search-project"];
         return await searchProjectFiles(projectRoot, payload.query);
+      }
+      case "capture-pdf-preview":
+        return await pdfPreviewCaptureStore.capture(projectRoot);
+      case "delete-entry": {
+        const payload = message.payload as AgentToolRequestPayloadMap["delete-entry"];
+        const deletedEntry = await deleteProjectEntry(projectRoot, payload.path);
+        if (activeProjectRoot === projectRoot) {
+          const refreshed = await refreshProject(
+            projectRoot,
+            getProjectMetadataStore()
+          );
+          startProjectWatcher(refreshed.project.rootPath);
+        }
+        return { path: deletedEntry.deletedPath };
       }
       case "move-entry": {
         const payload = message.payload as AgentToolRequestPayloadMap["move-entry"];
@@ -1008,6 +1137,101 @@ async function searchProjectFiles(projectRoot: string, query: string) {
         snapshot.contents.toLowerCase().includes(normalizedQuery)
     )
     .slice(0, 50);
+}
+
+function getProviderSetupCommand(
+  providerId: Exclude<AgentProviderId, "mock">,
+  action: AgentProviderSetupAction,
+  platform: NodeJS.Platform
+): string {
+  if (action === "login") {
+    return providerId === "openai-codex" ? "codex login" : "claude";
+  }
+
+  if (providerId === "openai-codex") {
+    return platform === "win32"
+      ? "irm https://chatgpt.com/codex/install.ps1 | iex"
+      : "curl -fsSL https://chatgpt.com/codex/install.sh | sh";
+  }
+
+  return platform === "win32"
+    ? "irm https://claude.ai/install.ps1 | iex"
+    : "curl -fsSL https://claude.ai/install.sh | bash";
+}
+
+async function openSetupTerminal(
+  command: string,
+  platform: NodeJS.Platform
+): Promise<void> {
+  if (platform === "darwin") {
+    await spawnDetached("osascript", [
+      "-e",
+      `tell application "Terminal" to do script "${escapeAppleScriptString(command)}"`,
+      "-e",
+      'tell application "Terminal" to activate'
+    ]);
+    return;
+  }
+
+  if (platform === "win32") {
+    await spawnDetached("powershell.exe", [
+      "-NoProfile",
+      "-Command",
+      `Start-Process powershell.exe -ArgumentList '-NoExit','-Command',${quotePowerShellString(command)}`
+    ]);
+    return;
+  }
+
+  const wrappedCommand = `${command}; printf '\\nSetup command finished. You can close this window.\\n'; exec bash`;
+  const terminals: readonly (readonly string[])[] = [
+    ["x-terminal-emulator", "-e", "bash", "-lc", wrappedCommand],
+    ["gnome-terminal", "--", "bash", "-lc", wrappedCommand],
+    ["konsole", "-e", "bash", "-lc", wrappedCommand],
+    ["xterm", "-e", "bash", "-lc", wrappedCommand]
+  ];
+  const failures: string[] = [];
+
+  for (const terminalArgs of terminals) {
+    const [terminal, ...args] = terminalArgs;
+
+    if (terminal === undefined) {
+      continue;
+    }
+
+    try {
+      await spawnDetached(terminal, args);
+      return;
+    } catch (error) {
+      failures.push(getErrorMessage(error));
+    }
+  }
+
+  throw new Error(
+    `Could not open a terminal window. Run this command manually: ${command}. ${failures.join(" ")}`
+  );
+}
+
+function spawnDetached(command: string, args: readonly string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore"
+    });
+
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
+}
+
+function escapeAppleScriptString(value: string): string {
+  return value.replace(/\\/gu, "\\\\").replace(/"/gu, '\\"');
+}
+
+function quotePowerShellString(value: string): string {
+  return `'${value.replace(/'/gu, "''")}'`;
 }
 
 async function recordAgentEvents(

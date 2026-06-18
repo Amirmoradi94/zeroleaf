@@ -203,7 +203,7 @@ describe("MockAgentProvider", () => {
     expect(calls).toEqual(["read-file:main.tex"]);
     expect(result.events.some((event) => event.type === "patch")).toBe(false);
     expect(result.events.some((event) => event.type === "approval")).toBe(false);
-    expect(assistantMessages).toContain("Selected LaTeX:");
+    expect(assistantMessages).toContain("Selected text:");
     expect(assistantMessages).toContain("\\begin{align}");
     expect(assistantMessages).toContain("aligned equation block");
     expect(assistantMessages).not.toContain("Unrelated theorem");
@@ -2507,16 +2507,22 @@ describe("MockAgentProvider", () => {
   it("enforces agent mode tool allowlists", () => {
     expect(isAgentToolAllowed("read-only", "read-file", false)).toBe(true);
     expect(isAgentToolAllowed("read-only", "search-project", false)).toBe(true);
+    expect(isAgentToolAllowed("read-only", "capture-pdf-preview", false)).toBe(true);
     expect(isAgentToolAllowed("read-only", "propose-patch", false)).toBe(false);
+    expect(isAgentToolAllowed("read-only", "delete-entry", true)).toBe(false);
     expect(isAgentToolAllowed("read-only", "set-main-file", true)).toBe(false);
     expect(isAgentToolAllowed("read-only", "reject-patch", false)).toBe(false);
     expect(isAgentToolAllowed("read-only", "apply-patch", true)).toBe(false);
     expect(isAgentToolAllowed("read-only", "run-compile", true)).toBe(false);
     expect(isAgentToolAllowed("suggest", "propose-patch", false)).toBe(true);
+    expect(isAgentToolAllowed("suggest", "delete-entry", true)).toBe(false);
     expect(isAgentToolAllowed("suggest", "set-main-file", true)).toBe(false);
     expect(isAgentToolAllowed("suggest", "reject-patch", false)).toBe(false);
+    expect(isAgentToolAllowed("apply-with-review", "delete-entry", false)).toBe(false);
+    expect(isAgentToolAllowed("apply-with-review", "delete-entry", true)).toBe(true);
     expect(isAgentToolAllowed("apply-with-review", "set-main-file", false)).toBe(false);
     expect(isAgentToolAllowed("apply-with-review", "set-main-file", true)).toBe(true);
+    expect(isAgentToolAllowed("autonomous-local", "delete-entry", false)).toBe(true);
     expect(isAgentToolAllowed("autonomous-local", "set-main-file", false)).toBe(true);
     expect(isAgentToolAllowed("apply-with-review", "reject-patch", false)).toBe(true);
     expect(isAgentToolAllowed("suggest", "apply-patch", true)).toBe(false);
@@ -2527,6 +2533,7 @@ describe("MockAgentProvider", () => {
   });
 
   it("marks provider-local model calls as medium risk and broker-blocked", () => {
+    expect(getAgentToolRisk("capture-pdf-preview")).toBe("low");
     expect(getAgentToolRisk("codex-exec")).toBe("medium");
     expect(getAgentToolRisk("claude-code")).toBe("medium");
     expect(isAgentToolAllowed("apply-with-review", "claude-code", true)).toBe(false);

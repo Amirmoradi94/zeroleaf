@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
+import { formatAgentSelectionContextForPrompt } from "@latex-agent/ipc-contracts";
 import type {
   AgentAuthStatus,
   AgentEvent,
@@ -511,7 +512,7 @@ function createClaudePrompt(
     "Preserve all unrelated text and formatting when returning a patch.",
     request.selectedText === undefined
       ? ""
-      : "The user selected text. Change only that exact selected span; preserve all unrelated paragraphs, LaTeX commands, labels, references, and citations unless the user explicitly asks to change one.",
+      : "The user selected text inside a containing paragraph. Use the paragraph as context. Change only that exact selected span unless the user explicitly asks for a broader paragraph rewrite; preserve all unrelated paragraphs, LaTeX commands, labels, references, and citations unless the user explicitly asks to change one.",
     request.selectedText === undefined
       ? ""
       : "For writing edits, do not add new claims or citations. If expanding rough notes into prose, preserve TODO lines that require user input instead of resolving them. If shortening an abstract, keep the abstract environment valid and preserve required contribution statements.",
@@ -525,7 +526,7 @@ function createClaudePrompt(
     `Project root: ${request.projectRoot}`,
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
-    request.selectedText === undefined ? "" : `Selected text:\n${request.selectedText}`,
+    formatAgentSelectionContextForPrompt(request) ?? "",
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,

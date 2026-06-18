@@ -88,4 +88,21 @@ describe("desktop main process project watcher", () => {
     expect(source).toContain("openedInViewer: true");
     expect(source).toContain("viewerOpenError");
   });
+
+  it("creates external template projects through the main process", async () => {
+    const source = await readFile(
+      fileURLToPath(new URL("./index.ts", import.meta.url)),
+      "utf8"
+    );
+
+    expect(source).toContain("lifecycleCreateFromExternalTemplate");
+    expect(source).toContain("fetchExternalTemplateMainTex");
+    expect(source).toContain(
+      "https://mirrors.ctan.org/macros/latex/contrib/IEEEtran/bare_jrnl.tex"
+    );
+    expect(source).toContain("writeProjectFile(");
+    expect(source).toContain(
+      "Fetched template did not look like a valid IEEEtran source."
+    );
+  });
 });

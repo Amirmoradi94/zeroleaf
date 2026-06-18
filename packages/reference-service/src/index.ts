@@ -1,5 +1,7 @@
-import { readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { extname, join, relative, resolve, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 export type BibliographyEntry = {
   readonly type: string;
@@ -72,6 +74,7 @@ const ignoredDirectories = new Set([
 ]);
 const maxProjectFiles = 5_000;
 const maxFileBytes = 2_000_000;
+const transientReadRetryDelaysMs = [120, 240, 480, 960, 1_500] as const;
 
 export function parseBibFile(
   contents: string,
@@ -349,10 +352,74 @@ async function readCappedFile(filePath: string): Promise<string> {
   const stats = await stat(filePath);
 
   if (stats.size > maxFileBytes) {
-    return (await readFile(filePath, "utf8")).slice(0, maxFileBytes);
+    return (await readReferenceFile(filePath)).slice(0, maxFileBytes);
   }
 
-  return readFile(filePath, "utf8");
+  return readReferenceFile(filePath);
+}
+
+async function readReferenceFile(filePath: string): Promise<string> {
+  for (let attempt = 0; attempt <= transientReadRetryDelaysMs.length; attempt += 1) {
+    try {
+      return await readUtf8FileStream(filePath);
+    } catch (error) {
+      const retryDelay = transientReadRetryDelaysMs[attempt];
+
+      if (!isTransientReadError(error)) {
+        throw error;
+      }
+
+      if (retryDelay === undefined) {
+        throw new ReferenceServiceError(
+          "Reference file is temporarily unavailable. Wait for the file to finish downloading locally, then try again.",
+          "invalid-file"
+        );
+      }
+
+      await delay(retryDelay);
+    }
+  }
+
+  throw new ReferenceServiceError("Unable to read reference file.", "invalid-file");
+}
+
+function readUtf8FileStream(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let contents = "";
+    const stream = createReadStream(filePath, { encoding: "utf8" });
+    const timeout = setTimeout(() => {
+      const error = new Error("Timed out while reading reference file.") as Error & {
+        code: string;
+      };
+      error.code = "ETIMEDOUT";
+      stream.destroy(error);
+    }, 5_000);
+
+    stream.on("data", (chunk) => {
+      contents += chunk;
+    });
+    stream.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    stream.once("end", () => {
+      clearTimeout(timeout);
+      resolve(contents);
+    });
+  });
+}
+
+function isTransientReadError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const candidate = error as { readonly code?: unknown; readonly errno?: unknown };
+  return (
+    candidate.code === "EAGAIN" ||
+    candidate.code === "ETIMEDOUT" ||
+    candidate.errno === -11
+  );
 }
 
 function normalizeProjectFilePath(

@@ -149,7 +149,8 @@ const fallbackApi: DesktopApi = {
     stop: () => Promise.resolve({ stopped: false })
   },
   pdf: {
-    readArtifact: () => Promise.reject(new Error("Electron PDF API unavailable."))
+    readArtifact: () => Promise.reject(new Error("Electron PDF API unavailable.")),
+    reportPreviewBounds: () => Promise.resolve({ reported: false })
   },
   synctex: {
     forward: () =>
@@ -224,6 +225,7 @@ const fallbackApi: DesktopApi = {
     exportPdf: () => Promise.resolve(undefined),
     importSourceZip: () => Promise.resolve(undefined),
     createFromTemplate: () => Promise.resolve(undefined),
+    createFromExternalTemplate: () => Promise.resolve(undefined),
     checkSubmission: () =>
       Promise.resolve({
         checkedAt: new Date().toISOString(),
@@ -278,6 +280,8 @@ const fallbackApi: DesktopApi = {
             ? "Mock provider is available in browser fallback."
             : "Electron agent host is unavailable."
       }),
+    openProviderSetupTerminal: () =>
+      Promise.reject(new Error("Electron terminal setup API unavailable.")),
     start: () => Promise.reject(new Error("Electron agent API unavailable.")),
     respondApproval: () => Promise.reject(new Error("Electron agent API unavailable.")),
     cancel: () => Promise.resolve({ cancelled: false }),

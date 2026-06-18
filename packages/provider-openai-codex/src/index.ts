@@ -4,8 +4,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { formatAgentSelectionContextForPrompt } from "@latex-agent/ipc-contracts";
 import type {
   AgentAuthStatus,
+  AgentDeleteEntryOperation,
   AgentEvent,
   AgentMoveEntryOperation,
   AgentProviderId,
@@ -16,11 +18,13 @@ import type {
   AgentToolRisk,
   BuildResult,
   HistoryChangeSet,
+  PdfPreviewCaptureResult,
   ProjectFileSnapshot
 } from "@latex-agent/ipc-contracts";
 
 export const openAiCodexProviderId = "openai-codex" as const;
 const defaultCodexExecTimeoutMs = 7_200_000;
+const defaultCodexProgressHeartbeatMs = 15_000;
 const maxCodexPlannerAttempts = 2;
 const maxCodexCompileRepairAttempts = 2;
 
@@ -28,6 +32,8 @@ export type CodexCliToolBroker = {
   readonly emitEvent?: (event: AgentEvent) => void;
   readonly readFile: (path: string) => Promise<ProjectFileSnapshot>;
   readonly searchProject: (query: string) => Promise<readonly ProjectFileSnapshot[]>;
+  readonly capturePdfPreview?: () => Promise<PdfPreviewCaptureResult>;
+  readonly deleteEntry?: (path: string) => Promise<AgentDeleteEntryOperation>;
   readonly moveEntry?: (
     fromPath: string,
     toPath: string
@@ -44,13 +50,21 @@ export type CodexCliToolBroker = {
 };
 
 export type CodexExecRequest = {
+  readonly onCodexEvent?: (event: unknown) => void;
   readonly projectRoot: string;
   readonly prompt: string;
   readonly timeoutMs: number;
 };
 
 export type CodexAgentResponse = {
-  readonly action: "answer" | "patch" | "move-entry" | "set-main-file" | "run-compile";
+  readonly action:
+    | "answer"
+    | "patch"
+    | "delete-entry"
+    | "move-entry"
+    | "set-main-file"
+    | "capture-pdf-preview"
+    | "run-compile";
   readonly targetFilePath: string;
   readonly summary: string;
   readonly afterContents: string;
@@ -71,6 +85,7 @@ export type CodexAuthStatusRunner = () => Promise<CodexCliAuthStatus>;
 
 export type CodexCliProviderOptions = {
   readonly codexBinary?: string;
+  readonly progressHeartbeatMs?: number;
   readonly timeoutMs?: number;
   readonly runCodexExec?: CodexExecRunner;
   readonly getCliAuthStatus?: CodexAuthStatusRunner;
@@ -79,6 +94,7 @@ export type CodexCliProviderOptions = {
 export class CodexCliProvider {
   readonly id: AgentProviderId = openAiCodexProviderId;
   private readonly codexBinary: string;
+  private readonly progressHeartbeatMs: number;
   private readonly timeoutMs: number;
   private readonly runCodexExec: CodexExecRunner;
   private readonly getCliAuthStatus: CodexAuthStatusRunner;
@@ -87,6 +103,8 @@ export class CodexCliProvider {
   constructor(options: CodexCliProviderOptions = {}) {
     this.codexBinary =
       options.codexBinary ?? process.env["LATEX_AGENT_CODEX_BIN"] ?? "codex";
+    this.progressHeartbeatMs =
+      options.progressHeartbeatMs ?? defaultCodexProgressHeartbeatMs;
     this.timeoutMs = options.timeoutMs ?? defaultCodexExecTimeoutMs;
     this.runCodexExec =
       options.runCodexExec ?? ((request) => runCodexExec(this.codexBinary, request));
@@ -179,7 +197,7 @@ export class CodexCliProvider {
     let codexResponse = await this.runPlannerWithRetry(
       request,
       snapshot,
-      createCodexPrompt(request, snapshot),
+      createInitialCodexPrompt(request, snapshot),
       events,
       sessionId,
       broker
@@ -238,6 +256,101 @@ export class CodexCliProvider {
       };
     }
 
+    if (codexResponse.action === "capture-pdf-preview") {
+      if (broker.capturePdfPreview === undefined) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            [
+              codexResponse.message,
+              "Codex requested a rendered PDF preview screenshot, but this provider bridge cannot run that app tool."
+            ]
+              .filter((line) => line.trim().length > 0)
+              .join("\n\n")
+          )
+        );
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
+
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "capture-pdf-preview",
+          "running",
+          "Capturing the rendered PDF preview pane",
+          "low"
+        )
+      );
+      const previewCapture = await broker.capturePdfPreview();
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "capture-pdf-preview",
+          "succeeded",
+          `Captured PDF preview page ${previewCapture.pageNumber} / ${previewCapture.pageCount}`,
+          "low"
+        ),
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "running",
+          "Asking Codex to assess the captured PDF preview evidence",
+          "medium"
+        )
+      );
+
+      codexResponse = await this.runPlannerWithRetry(
+        request,
+        snapshot,
+        createCodexPdfPreviewAssessmentPrompt(request, snapshot, previewCapture),
+        events,
+        sessionId,
+        broker
+      );
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "succeeded",
+          codexResponse.notes,
+          "medium"
+        )
+      );
+
+      if (codexResponse.action === "capture-pdf-preview") {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            [
+              codexResponse.message,
+              `PDF preview screenshot captured at ${previewCapture.imagePath}, but Codex did not return a final assessment action.`
+            ]
+              .filter((line) => line.trim().length > 0)
+              .join("\n\n")
+          )
+        );
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
+    }
+
     if (
       codexResponse.action === "answer" ||
       (request.mode === "read-only" && codexResponse.action === "patch")
@@ -261,6 +374,102 @@ export class CodexCliProvider {
         providerId: this.id,
         status: "completed",
         events
+      };
+    }
+
+    if (codexResponse.action === "delete-entry") {
+      if (
+        request.mode === "read-only" ||
+        request.mode === "suggest" ||
+        broker.deleteEntry === undefined ||
+        codexResponse.targetFilePath.trim().length === 0
+      ) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            [
+              codexResponse.message,
+              request.mode === "read-only" || request.mode === "suggest"
+                ? "Codex identified a project file deletion, but the current agent mode cannot delete project entries."
+                : broker.deleteEntry === undefined
+                  ? "Codex identified a project file deletion, but this provider bridge cannot run that app tool."
+                  : "Codex identified a project file deletion, but did not provide a project path."
+            ]
+              .filter((line) => line.trim().length > 0)
+              .join("\n\n")
+          )
+        );
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
+
+      const deletePath = codexResponse.targetFilePath.trim();
+
+      if (request.mode === "autonomous-local") {
+        pushAgentEvents(
+          events,
+          broker,
+          createToolEvent(
+            sessionId,
+            "delete-entry",
+            "running",
+            `Deleting ${deletePath}`,
+            "high"
+          )
+        );
+        const deletedEntry = await broker.deleteEntry(deletePath);
+        pushAgentEvents(
+          events,
+          broker,
+          createToolEvent(
+            sessionId,
+            "delete-entry",
+            "succeeded",
+            `Deleted ${deletedEntry.path}`,
+            "high"
+          ),
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            codexResponse.message || `Deleted ${deletedEntry.path}.`
+          )
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events,
+          deleteEntries: [deletedEntry]
+        };
+      }
+
+      pushAgentEvents(
+        events,
+        broker,
+        createMessageEvent(
+          sessionId,
+          "assistant",
+          codexResponse.message || `I can delete ${deletePath} after your approval.`
+        ),
+        createApprovalEvent(
+          sessionId,
+          "delete-entry",
+          `Delete ${deletePath} from the project? A local backup will be kept.`
+        )
+      );
+
+      return {
+        sessionId,
+        providerId: this.id,
+        status: "awaiting-approval",
+        events,
+        deleteEntries: [{ path: deletePath }]
       };
     }
 
@@ -736,14 +945,24 @@ export class CodexCliProvider {
 
     for (let attempt = 1; attempt <= maxCodexPlannerAttempts; attempt += 1) {
       try {
-        return await this.runCodexExec({
-          projectRoot: request.projectRoot,
-          timeoutMs: this.timeoutMs,
-          prompt:
-            attempt === 1
-              ? prompt
-              : createCodexInterruptedRetryPrompt(request, snapshot, lastError)
-        });
+        return await this.runCodexExecWithProgress(
+          {
+            projectRoot: request.projectRoot,
+            ...(broker === undefined
+              ? {}
+              : {
+                  onCodexEvent: (event: unknown) =>
+                    emitCodexPublicEvents(event, sessionId, broker)
+                }),
+            timeoutMs: this.timeoutMs,
+            prompt:
+              attempt === 1
+                ? prompt
+                : createCodexInterruptedRetryPrompt(request, snapshot, lastError)
+          },
+          sessionId,
+          broker
+        );
       } catch (error) {
         lastError = error;
 
@@ -773,6 +992,37 @@ export class CodexCliProvider {
     }
 
     throw lastError;
+  }
+
+  private async runCodexExecWithProgress(
+    request: CodexExecRequest,
+    sessionId: string,
+    broker?: CodexCliToolBroker
+  ): Promise<CodexAgentResponse> {
+    if (this.progressHeartbeatMs <= 0 || broker?.emitEvent === undefined) {
+      return await this.runCodexExec(request);
+    }
+
+    const startedAt = Date.now();
+    const heartbeat = setInterval(() => {
+      pushAgentEvents(
+        undefined,
+        broker,
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "running",
+          `Codex CLI is still analyzing the project (${formatElapsedDuration(Date.now() - startedAt)} elapsed).`,
+          "medium"
+        )
+      );
+    }, this.progressHeartbeatMs);
+
+    try {
+      return await this.runCodexExec(request);
+    } finally {
+      clearInterval(heartbeat);
+    }
   }
 
   private async repairFailedCompile({
@@ -1183,7 +1433,8 @@ async function runCodexExec(
       codexBinary,
       createCodexExecArgs(schemaPath, outputPath, request.projectRoot),
       request.timeoutMs,
-      request.prompt
+      request.prompt,
+      request.onCodexEvent
     );
     const parsed = JSON.parse(await readFile(outputPath, "utf8")) as unknown;
     return parseCodexAgentResponse(parsed);
@@ -1203,6 +1454,7 @@ export function createCodexExecArgs(
     "--ignore-user-config",
     "--ignore-rules",
     "--ephemeral",
+    "--json",
     "--sandbox",
     "read-only",
     "-c",
@@ -1221,7 +1473,8 @@ async function runCommand(
   command: string,
   args: readonly string[],
   timeoutMs: number,
-  stdin?: string
+  stdin?: string,
+  onCodexEvent?: (event: unknown) => void
 ): Promise<{ readonly stdout: string; readonly stderr: string }> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1233,6 +1486,7 @@ async function runCommand(
       detached: process.platform !== "win32"
     });
     let stdout = "";
+    let stdoutLineBuffer = "";
     let stderr = "";
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -1254,6 +1508,12 @@ async function runCommand(
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       stdout = appendCapped(stdout, chunk, 80_000);
+      if (onCodexEvent !== undefined) {
+        stdoutLineBuffer = processCodexJsonLines(
+          stdoutLineBuffer + chunk,
+          onCodexEvent
+        );
+      }
     });
     child.stderr.on("data", (chunk: string) => {
       stderr = appendCapped(stderr, chunk, 160_000);
@@ -1275,6 +1535,10 @@ async function runCommand(
       }
       if (settled || timedOut) {
         return;
+      }
+      if (onCodexEvent !== undefined && stdoutLineBuffer.trim().length > 0) {
+        processCodexJsonLine(stdoutLineBuffer.trim(), onCodexEvent);
+        stdoutLineBuffer = "";
       }
 
       settled = true;
@@ -1358,20 +1622,22 @@ function createCodexPrompt(
     "Return only JSON matching the provided schema.",
     'Set action to "answer" when the task is best completed by explanation, summary, review, diagnosis, or guidance.',
     'Set action to "patch" when the task requires or asks for a source edit. For patches, produce a minimal full-file replacement for targetFilePath.',
+    'Set action to "delete-entry" when the user asks to remove or delete a project file or folder without editing source contents. Put the project path to delete in targetFilePath.',
     'Set action to "move-entry" when the task requires moving or renaming a project file without changing file contents. Put the current project path in targetFilePath and the destination project path in afterContents.',
     'Set action to "set-main-file" when the user asks to choose, change, set, or switch the project main/root TeX file without editing source contents. Put the desired .tex project path in targetFilePath.',
+    'Set action to "capture-pdf-preview" when the user asks for visual assessment, rendered PDF layout review, screenshot inspection, figure/table ordering in the preview, clipping, overlap, or other PDF preview-only evidence. ZeroLeaf will capture the current PDF preview pane and ask you again with the screenshot path.',
     'Set action to "run-compile" when the user asks to compile, recompile, build, verify compilation, or generate/update the PDF.',
     request.mode === "read-only"
       ? 'The current ZeroLeaf mode is read-only, so action must be "answer". You may describe suggested edits in message, but do not return a patch action.'
       : 'ZeroLeaf will perform returned actions through project-scoped app tools. In "apply-with-review" mode, patches wait for user approval; in "autonomous-local" mode, patches may be applied and compiled automatically.',
     request.mode === "read-only"
       ? ""
-      : 'For edit, change, rewrite, replace, insert, delete, fix, repair, compile, recompile, build, PDF generation, compile-error, failing-build, and diagnostic tasks, return the concrete action whenever safe: "patch" for source edits, "move-entry" for moving or renaming files, "set-main-file" for changing the project main TeX file, and "run-compile" for builds. Do not stop at explaining the edit or app action.',
+      : 'For edit, change, rewrite, replace, insert, delete, fix, repair, compile, recompile, build, PDF generation, compile-error, failing-build, visual PDF review, and diagnostic tasks, return the concrete action whenever safe: "patch" for source edits, "delete-entry" for deleting project files or folders, "move-entry" for moving or renaming files, "set-main-file" for changing the project main TeX file, "capture-pdf-preview" for rendered preview evidence, and "run-compile" for builds. Do not stop at explaining the edit or app action.',
     "Preserve all unrelated text and formatting when returning a patch.",
     "For patches, afterContents must be the complete target file after the edit, not a snippet, diff, abbreviated file, or only the changed section. Never omit unchanged content.",
     request.selectedText === undefined
       ? ""
-      : "The user selected text. Change only that exact selected span; preserve all unrelated paragraphs, LaTeX commands, labels, references, and citations unless the user explicitly asks to change one.",
+      : "The user selected text inside a containing paragraph. Use the paragraph as context. Change only that exact selected span unless the user explicitly asks for a broader paragraph rewrite; preserve all unrelated paragraphs, LaTeX commands, labels, references, and citations unless the user explicitly asks to change one.",
     request.selectedText === undefined
       ? ""
       : "For writing edits, do not add new claims or citations. If expanding rough notes into prose, preserve TODO lines that require user input instead of resolving them. If shortening an abstract, keep the abstract environment valid and preserve required contribution statements.",
@@ -1385,7 +1651,7 @@ function createCodexPrompt(
     `Project root: ${request.projectRoot}`,
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
-    request.selectedText === undefined ? "" : `Selected text:\n${request.selectedText}`,
+    formatAgentSelectionContextForPrompt(request) ?? "",
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
@@ -1399,19 +1665,62 @@ function createCodexPrompt(
     .join("\n");
 }
 
+function createInitialCodexPrompt(
+  request: AgentStartRequest,
+  snapshot: ProjectFileSnapshot
+): string {
+  return isSelectedTextEditRequest(request)
+    ? createCodexSelectedTextPrompt(request, snapshot)
+    : createCodexPrompt(request, snapshot);
+}
+
+function createCodexSelectedTextPrompt(
+  request: AgentStartRequest,
+  snapshot: ProjectFileSnapshot
+): string {
+  return [
+    "You are the OpenAI Codex provider inside ZeroLeaf, a local-first LaTeX editor.",
+    "The user selected text in a TeX source file and asked for a focused writing edit.",
+    "Do not modify files directly inside Codex CLI. Return only JSON matching the provided schema so ZeroLeaf can perform the project-scoped action.",
+    request.mode === "read-only"
+      ? 'The current ZeroLeaf mode is read-only, so action must be "answer". Describe the suggested replacement in message, but do not return a patch action.'
+      : 'Return action "patch" with afterContents set to the complete target file after the edit. ZeroLeaf will apply the patch according to the current mode.',
+    "Change only the exact selected span unless the user explicitly asks for a broader paragraph rewrite.",
+    "Preserve all unrelated paragraphs, LaTeX commands, labels, references, citation keys, file paths, and command arguments.",
+    "Do not add new claims or citations. If expanding rough notes into prose, preserve TODO lines that require user input instead of resolving them.",
+    "For afterContents, return the complete target file after the edit, not a snippet, diff, abbreviated file, or only the changed paragraph.",
+    'If no edit is needed, use action "answer" and put the user-facing answer in message.',
+    "",
+    `User task: ${request.prompt}`,
+    `Project root: ${request.projectRoot}`,
+    `Target file: ${snapshot.path}`,
+    request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
+    formatAgentSelectionContextForPrompt(request) ?? "",
+    "",
+    `Focused file context (${snapshot.path}):`,
+    "```tex",
+    createSelectedTextSourcePreview(request, snapshot.contents),
+    "```"
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
 function createCodexPatchRetryPrompt(
   request: AgentStartRequest,
   snapshot: ProjectFileSnapshot,
   previousResponse: CodexAgentResponse
 ): string {
   return [
-    createCodexPrompt(request, snapshot),
+    createInitialCodexPrompt(request, snapshot),
     "",
     "Retry instruction:",
     "Your previous response answered with guidance instead of a concrete app action.",
     'If a concrete safe source edit exists, return action "patch" with afterContents set to the complete target file after the minimal fix.',
+    'If the user asked to delete or remove a project file or folder, return action "delete-entry" with targetFilePath set to that project path.',
     'If the user asked to move or rename a project file, return action "move-entry" with targetFilePath set to the current project path and afterContents set to the destination project path.',
     'If the user asked to set or change the project main TeX file, return action "set-main-file" with targetFilePath set to that .tex project path.',
+    'If the user asked for visual PDF preview assessment, rendered layout review, clipping/overlap checks, or screenshot-backed review, return action "capture-pdf-preview".',
     'If the user asked to compile, recompile, build, verify compilation, or generate/update the PDF, return action "run-compile".',
     'Use action "answer" only if no source edit or app action is safe, or no change is actually needed.',
     "",
@@ -1426,7 +1735,7 @@ function createCodexOverbroadPatchRetryPrompt(
   previousResponse: CodexAgentResponse
 ): string {
   return [
-    createCodexPrompt(request, snapshot),
+    createInitialCodexPrompt(request, snapshot),
     "",
     "Safety retry instruction:",
     "Your previous patch removed most of a large file, so ZeroLeaf rejected it before applying.",
@@ -1485,6 +1794,32 @@ function createCodexCompileRepairPrompt(
   ].join("\n");
 }
 
+function createCodexPdfPreviewAssessmentPrompt(
+  request: AgentStartRequest,
+  snapshot: ProjectFileSnapshot,
+  capture: PdfPreviewCaptureResult
+): string {
+  return [
+    createCodexPrompt(request, snapshot),
+    "",
+    "Rendered PDF preview evidence:",
+    `Screenshot path: ${capture.imagePath}`,
+    `Image: ${capture.width}x${capture.height} ${capture.mimeType}, ${capture.byteLength} bytes`,
+    `Preview page: ${capture.pageNumber} / ${capture.pageCount}`,
+    capture.pdfPath === undefined ? "" : `PDF artifact: ${capture.pdfPath}`,
+    `Preview stale: ${capture.stale ? "yes" : "no"}`,
+    `Captured at: ${capture.capturedAt}`,
+    "",
+    "Assessment instruction:",
+    "Use the screenshot path above as the rendered PDF preview evidence if your environment can inspect local images.",
+    "Answer with visual findings grounded in that rendered evidence. If you cannot inspect the PNG, say that plainly and limit claims to the source, compile log, and screenshot metadata.",
+    'Return a source patch only when the visual evidence identifies a concrete LaTeX source fix. Otherwise return action "answer" with the assessment.',
+    "Do not request another PDF preview capture in this follow-up response."
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
 function createCodexInterruptedRetryPrompt(
   request: AgentStartRequest,
   snapshot: ProjectFileSnapshot,
@@ -1495,13 +1830,13 @@ function createCodexInterruptedRetryPrompt(
     "The previous Codex planner attempt was interrupted before it returned a valid action.",
     "Use this smaller prompt and avoid broad project scans. Return one JSON action only.",
     "Do not modify files or run LaTeX commands inside Codex CLI. ZeroLeaf will run returned app actions.",
-    'Use action "patch" for a minimal source edit, "move-entry" for file moves, "set-main-file" for changing the main TeX file, "run-compile" for compile requests, or "answer" only when no safe action exists.',
+    'Use action "patch" for a minimal source edit, "delete-entry" for deleting project files or folders, "move-entry" for file moves, "set-main-file" for changing the main TeX file, "capture-pdf-preview" for rendered preview evidence, "run-compile" for compile requests, or "answer" only when no safe action exists.',
     `Interrupted attempt: ${formatPlannerFailure(error)}`,
     `User task: ${request.prompt}`,
     `Project root: ${request.projectRoot}`,
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
-    request.selectedText === undefined ? "" : `Selected text:\n${request.selectedText}`,
+    formatAgentSelectionContextForPrompt(request) ?? "",
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
@@ -1526,6 +1861,16 @@ function isRetryableCodexExecError(error: unknown): boolean {
 
 function formatPlannerFailure(error: unknown): string {
   return getErrorMessage(error).replace(/\s+/gu, " ").trim();
+}
+
+function formatElapsedDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  return minutes === 0
+    ? `${seconds}s`
+    : `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
 }
 
 function shouldRetryForConcreteAction(
@@ -1553,6 +1898,29 @@ function isConcreteActionPreferredRequest(request: AgentStartRequest): boolean {
 
   return /\b(edit|change|set|switch|make|update|rewrite|replace|insert|add|remove|delete|move|rename|fix|repair|compile|recompile|build|pdf|compile error|compilation error|failing build|build failure|latex error|diagnostic|main\s+(?:tex|file)|root\s+(?:tex|file))\b/iu.test(
     request.prompt
+  );
+}
+
+function isSelectedTextEditRequest(request: AgentStartRequest): boolean {
+  const selectedText = request.selectionContext?.selectedText ?? request.selectedText;
+
+  if (selectedText === undefined || selectedText.trim().length === 0) {
+    return false;
+  }
+
+  const prompt = request.prompt.toLowerCase();
+
+  if (
+    request.diagnostic !== undefined ||
+    /\b(compile|recompile|build|pdf|latex error|compile error|compilation error|failing build|build failure|diagnostic)\b/iu.test(
+      prompt
+    )
+  ) {
+    return false;
+  }
+
+  return /\b(edit|change|make|update|rewrite|replace|improve|shorten|expand|tone|polish|revise|rephrase)\b/iu.test(
+    prompt
   );
 }
 
@@ -1615,6 +1983,30 @@ function createFocusedSourcePreview(contents: string): string {
   return [head, "% ... focused retry preview truncated ...", tail].join("\n\n");
 }
 
+function createSelectedTextSourcePreview(
+  request: AgentStartRequest,
+  contents: string
+): string {
+  const context = request.selectionContext;
+
+  if (context === undefined) {
+    return createFocusedSourcePreview(contents);
+  }
+
+  const lines = contents.split(/\r?\n/u);
+  const startLine = Math.max(1, context.startLine - 20);
+  const endLine = Math.min(lines.length, context.endLine + 20);
+  const excerpt = lines.slice(startLine - 1, endLine).join("\n");
+  const beforeMarker =
+    startLine > 1 ? "% ... selection-focused preview truncated before ...\n" : "";
+  const afterMarker =
+    endLine < lines.length
+      ? "\n% ... selection-focused preview truncated after ..."
+      : "";
+
+  return `${beforeMarker}${excerpt}${afterMarker}`;
+}
+
 function createBuildLogExcerpt(buildResult: BuildResult): string {
   const combinedLog = [buildResult.stderr, buildResult.stdout, buildResult.rawLog]
     .filter((part) => part.trim().length > 0)
@@ -1645,8 +2037,10 @@ function parseCodexAgentResponse(value: unknown): CodexAgentResponse {
   if (
     (candidate.action !== "answer" &&
       candidate.action !== "patch" &&
+      candidate.action !== "delete-entry" &&
       candidate.action !== "move-entry" &&
       candidate.action !== "set-main-file" &&
+      candidate.action !== "capture-pdf-preview" &&
       candidate.action !== "run-compile") ||
     typeof candidate.targetFilePath !== "string" ||
     typeof candidate.summary !== "string" ||
@@ -1672,7 +2066,15 @@ const codexOutputSchema = {
   additionalProperties: false,
   properties: {
     action: {
-      enum: ["answer", "patch", "move-entry", "set-main-file", "run-compile"]
+      enum: [
+        "answer",
+        "patch",
+        "delete-entry",
+        "move-entry",
+        "set-main-file",
+        "capture-pdf-preview",
+        "run-compile"
+      ]
     },
     targetFilePath: { type: "string" },
     summary: { type: "string" },
@@ -1683,12 +2085,190 @@ const codexOutputSchema = {
   required: ["action", "targetFilePath", "summary", "afterContents", "message", "notes"]
 } as const;
 
+function processCodexJsonLines(
+  buffer: string,
+  onCodexEvent: (event: unknown) => void
+): string {
+  const lines = buffer.split(/\r?\n/u);
+  const rest = lines.pop() ?? "";
+
+  for (const line of lines) {
+    processCodexJsonLine(line, onCodexEvent);
+  }
+
+  return rest;
+}
+
+function processCodexJsonLine(
+  line: string,
+  onCodexEvent: (event: unknown) => void
+): void {
+  const trimmedLine = line.trim();
+
+  if (trimmedLine.length === 0) {
+    return;
+  }
+
+  try {
+    onCodexEvent(JSON.parse(trimmedLine) as unknown);
+  } catch {
+    // Codex can still write non-JSON diagnostics on stdout in failure paths.
+  }
+}
+
+function emitCodexPublicEvents(
+  event: unknown,
+  sessionId: string,
+  broker: Pick<CodexCliToolBroker, "emitEvent">
+): void {
+  pushAgentEvents(
+    undefined,
+    broker,
+    ...createCodexAgentEventsFromJson(event, sessionId)
+  );
+}
+
+export function createCodexAgentEventsFromJson(
+  event: unknown,
+  sessionId: string
+): readonly AgentEvent[] {
+  const eventType = getCodexJsonEventType(event);
+
+  if (eventType.length === 0 || eventType.includes("reasoning")) {
+    return [];
+  }
+
+  const events: AgentEvent[] = [];
+  const publicText = extractCodexJsonPublicText(event, eventType);
+  if (publicText !== undefined) {
+    events.push(createMessageEvent(sessionId, "assistant", publicText));
+  }
+
+  return events;
+}
+
+function getCodexJsonEventType(event: unknown): string {
+  return (
+    readStringAtPath(event, ["type"]) ??
+    readStringAtPath(event, ["event"]) ??
+    readStringAtPath(event, ["kind"]) ??
+    readStringAtPath(event, ["msg", "type"]) ??
+    readStringAtPath(event, ["item", "type"]) ??
+    ""
+  )
+    .trim()
+    .toLowerCase()
+    .replaceAll(".", "_")
+    .replaceAll("-", "_");
+}
+
+function extractCodexJsonPublicText(
+  event: unknown,
+  eventType: string
+): string | undefined {
+  if (
+    eventType.includes("reasoning") ||
+    (!eventType.includes("message") &&
+      !eventType.includes("text") &&
+      !eventType.includes("answer"))
+  ) {
+    return undefined;
+  }
+
+  const text = readFirstStringAtPaths(event, [
+    ["text"],
+    ["content"],
+    ["message"],
+    ["delta"],
+    ["msg", "text"],
+    ["msg", "content"],
+    ["msg", "message"],
+    ["item", "text"],
+    ["item", "content"],
+    ["item", "message"]
+  ])?.trim();
+
+  if (
+    text === undefined ||
+    text.length === 0 ||
+    text.length > 1_500 ||
+    isLikelyStructuredCodexFinalResponse(text)
+  ) {
+    return undefined;
+  }
+
+  return text;
+}
+
+function isLikelyStructuredCodexFinalResponse(text: string): boolean {
+  const trimmedText = text.trim();
+  return (
+    trimmedText.startsWith("{") &&
+    trimmedText.includes('"action"') &&
+    trimmedText.includes('"targetFilePath"')
+  );
+}
+
+function readFirstStringAtPaths(
+  value: unknown,
+  paths: readonly (readonly string[])[]
+): string | undefined {
+  for (const path of paths) {
+    const result = readStringAtPath(value, path);
+
+    if (result !== undefined) {
+      return result;
+    }
+  }
+
+  return undefined;
+}
+
+function readStringAtPath(value: unknown, path: readonly string[]): string | undefined {
+  const result = readValueAtPath(value, path);
+
+  if (typeof result === "string") {
+    return result;
+  }
+
+  if (Array.isArray(result)) {
+    const text = result
+      .map((part) =>
+        typeof part === "string"
+          ? part
+          : typeof part === "object" && part !== null && "text" in part
+            ? String((part as { readonly text?: unknown }).text ?? "")
+            : ""
+      )
+      .filter((part) => part.length > 0)
+      .join("");
+
+    return text.length === 0 ? undefined : text;
+  }
+
+  return undefined;
+}
+
+function readValueAtPath(value: unknown, path: readonly string[]): unknown {
+  let current = value;
+
+  for (const key of path) {
+    if (typeof current !== "object" || current === null || !(key in current)) {
+      return undefined;
+    }
+
+    current = (current as Record<string, unknown>)[key];
+  }
+
+  return current;
+}
+
 function pushAgentEvents(
-  events: AgentEvent[],
+  events: AgentEvent[] | undefined,
   broker: Pick<CodexCliToolBroker, "emitEvent"> | undefined,
   ...nextEvents: readonly AgentEvent[]
 ): void {
-  events.push(...nextEvents);
+  events?.push(...nextEvents);
   for (const event of nextEvents) {
     broker?.emitEvent?.(event);
   }
@@ -1741,16 +2321,20 @@ function createPatchEvent(sessionId: string, changeset: HistoryChangeSet): Agent
   };
 }
 
-function createApprovalEvent(sessionId: string): AgentEvent {
+function createApprovalEvent(
+  sessionId: string,
+  toolName: AgentToolName = "apply-patch",
+  prompt = "Review the Codex patch before applying it to the project."
+): AgentEvent {
   return {
     id: randomUUID(),
     sessionId,
     createdAt: new Date().toISOString(),
     type: "approval",
     approvalId: randomUUID(),
-    toolName: "apply-patch",
+    toolName,
     risk: "high",
-    prompt: "Review the Codex patch before applying it to the project.",
+    prompt,
     status: "requested"
   };
 }

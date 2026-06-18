@@ -1,4 +1,5 @@
 import type {
+  AgentSelectionContext,
   BibliographyEntry,
   BuildResult,
   CitationOccurrence,
@@ -68,6 +69,13 @@ export type MissingCitationGroup = {
 export type EditorRestorePlan = {
   readonly filePaths: readonly string[];
   readonly activeFilePath: string | undefined;
+};
+
+export type TextSelectionRange = {
+  readonly startLineNumber: number;
+  readonly startColumn: number;
+  readonly endLineNumber: number;
+  readonly endColumn: number;
 };
 
 const internalProjectPathPrefixes = [".latex-agent/"] as const;
@@ -676,6 +684,95 @@ function resolveIncludedTexPath(
   ];
 
   return candidates.find((candidate) => filesByPath.has(candidate));
+}
+
+export function createSelectionContextFromText({
+  contents,
+  selection
+}: {
+  readonly contents: string;
+  readonly selection: TextSelectionRange;
+}): AgentSelectionContext | null {
+  const lines = contents.split("\n").map((line) => line.replace(/\r$/u, ""));
+  const lineStartOffsets = createLineStartOffsets(contents);
+  const startOffset = getTextOffsetAt(
+    selection.startLineNumber,
+    selection.startColumn,
+    lineStartOffsets
+  );
+  const endOffset = getTextOffsetAt(
+    selection.endLineNumber,
+    selection.endColumn,
+    lineStartOffsets
+  );
+
+  if (startOffset === endOffset) {
+    return null;
+  }
+
+  const selectedText = contents.slice(startOffset, endOffset);
+
+  if (selectedText.trim().length === 0) {
+    return null;
+  }
+
+  const lastSelectedLine =
+    selection.endColumn === 1 && selection.endLineNumber > selection.startLineNumber
+      ? selection.endLineNumber - 1
+      : selection.endLineNumber;
+  let paragraphStartLine = selection.startLineNumber;
+  let paragraphEndLine = Math.max(selection.startLineNumber, lastSelectedLine);
+
+  while (
+    paragraphStartLine > 1 &&
+    (lines[paragraphStartLine - 2] ?? "").trim().length > 0
+  ) {
+    paragraphStartLine -= 1;
+  }
+
+  while (
+    paragraphEndLine < lines.length &&
+    (lines[paragraphEndLine] ?? "").trim().length > 0
+  ) {
+    paragraphEndLine += 1;
+  }
+
+  const paragraphStartOffset = getTextOffsetAt(paragraphStartLine, 1, lineStartOffsets);
+  const paragraphEndOffset = getTextOffsetAt(
+    paragraphEndLine,
+    (lines[paragraphEndLine - 1] ?? "").length + 1,
+    lineStartOffsets
+  );
+
+  return {
+    containingParagraph: contents.slice(paragraphStartOffset, paragraphEndOffset),
+    endLine: paragraphEndLine,
+    selectedText,
+    selectionEndOffset: Math.max(0, endOffset - paragraphStartOffset),
+    selectionStartOffset: Math.max(0, startOffset - paragraphStartOffset),
+    startLine: paragraphStartLine
+  };
+}
+
+function createLineStartOffsets(contents: string): readonly number[] {
+  const offsets = [0];
+
+  for (let index = 0; index < contents.length; index += 1) {
+    if (contents[index] === "\n") {
+      offsets.push(index + 1);
+    }
+  }
+
+  return offsets;
+}
+
+function getTextOffsetAt(
+  lineNumber: number,
+  column: number,
+  lineStartOffsets: readonly number[]
+): number {
+  const lineIndex = Math.max(0, Math.min(lineNumber - 1, lineStartOffsets.length - 1));
+  return (lineStartOffsets[lineIndex] ?? 0) + Math.max(0, column - 1);
 }
 
 function getDirectoryPath(path: string) {

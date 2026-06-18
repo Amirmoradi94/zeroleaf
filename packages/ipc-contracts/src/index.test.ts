@@ -5,6 +5,7 @@ import {
   createReadOnlyAgentResponse,
   defaultAppSettings,
   defaultWorkbenchLayout,
+  formatAgentSelectionContextForPrompt,
   ipcChannels
 } from "./index.js";
 
@@ -16,6 +17,9 @@ describe("ipc contracts", () => {
       "history.createAppliedChangeSet"
     );
     expect(ipcChannels.historyApplyChangeSetHunks).toBe("history.applyChangeSetHunks");
+    expect(ipcChannels.lifecycleCreateFromExternalTemplate).toBe(
+      "lifecycle.createFromExternalTemplate"
+    );
   });
 
   it("defines default workbench pane sizes", () => {
@@ -31,6 +35,27 @@ describe("ipc contracts", () => {
 
   it("defaults new agent sessions to suggest mode", () => {
     expect(defaultAppSettings.agentPermissions.defaultMode).toBe("suggest");
+  });
+
+  it("formats selected text with containing paragraph context", () => {
+    const context = formatAgentSelectionContextForPrompt({
+      selectedText: "otherwise",
+      selectionContext: {
+        containingParagraph:
+          "If no exception is raised, the algorithm is otherwise stated.",
+        endLine: 12,
+        selectedText: "otherwise",
+        selectionEndOffset: 45,
+        selectionStartOffset: 36,
+        startLine: 12
+      }
+    });
+
+    expect(context).toContain("Selected text:");
+    expect(context).toContain("otherwise");
+    expect(context).toContain("Containing paragraph:");
+    expect(context).toContain("algorithm is otherwise stated");
+    expect(context).toContain("Selection offsets in paragraph: 36-45");
   });
 
   it("allows agent starts to continue an existing project session explicitly", () => {

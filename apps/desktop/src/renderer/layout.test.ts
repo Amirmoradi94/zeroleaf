@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   clampPaneSizes,
+  constrainWorkbenchLayoutToContentWidth,
+  contentRowGutterWidth,
   initialWorkbenchLayout,
+  paneConstraints,
   resizeWorkbenchPane
 } from "./layout.js";
 
@@ -50,5 +53,25 @@ describe("workbench layout", () => {
       1_400
     );
     expect(resizeWorkbenchPane("pdf", layout, { x: 400, y: 0 }).pdfWidth).toBe(320);
+  });
+
+  it("caps secondary panes so the source editor keeps a readable width", () => {
+    const contentWidth = 1_502;
+    const constrainedLayout = constrainWorkbenchLayoutToContentWidth(
+      {
+        ...initialWorkbenchLayout,
+        pdfWidth: 1_000
+      },
+      contentWidth
+    );
+
+    const editorWidth =
+      contentWidth -
+      contentRowGutterWidth -
+      constrainedLayout.pdfWidth -
+      constrainedLayout.agentWidth;
+
+    expect(editorWidth).toBeGreaterThanOrEqual(paneConstraints.editorWidth.min);
+    expect(constrainedLayout.pdfWidth).toBeLessThan(1_000);
   });
 });

@@ -20,6 +20,7 @@ export const ipcChannels = {
   buildRun: "build.run",
   buildStop: "build.stop",
   pdfReadArtifact: "pdf.readArtifact",
+  pdfReportPreviewBounds: "pdf.reportPreviewBounds",
   synctexForward: "synctex.forward",
   synctexReverse: "synctex.reverse",
   historyListChangeSets: "history.listChangeSets",
@@ -39,12 +40,14 @@ export const ipcChannels = {
   lifecycleExportPdf: "lifecycle.exportPdf",
   lifecycleImportSourceZip: "lifecycle.importSourceZip",
   lifecycleCreateFromTemplate: "lifecycle.createFromTemplate",
+  lifecycleCreateFromExternalTemplate: "lifecycle.createFromExternalTemplate",
   lifecycleCheckSubmission: "lifecycle.checkSubmission",
   settingsLoad: "settings.load",
   settingsSave: "settings.save",
   settingsGetPrivacySummary: "settings.getPrivacySummary",
   settingsClearLocalHistory: "settings.clearLocalHistory",
   agentGetAuthStatus: "agent.getAuthStatus",
+  agentOpenProviderSetupTerminal: "agent.openProviderSetupTerminal",
   agentStart: "agent.start",
   agentRespondApproval: "agent.respondApproval",
   agentCancel: "agent.cancel",
@@ -202,6 +205,37 @@ export type PdfArtifactData = PdfArtifact & {
   readonly dataUrl: string;
 };
 
+export type PdfPreviewBounds = {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+};
+
+export type PdfPreviewCaptureState = {
+  readonly projectRoot: string;
+  readonly bounds: PdfPreviewBounds | null;
+  readonly pdfPath?: string;
+  readonly pageNumber: number;
+  readonly pageCount: number;
+  readonly stale: boolean;
+  readonly reason?: string;
+};
+
+export type PdfPreviewCaptureResult = {
+  readonly projectRoot: string;
+  readonly imagePath: string;
+  readonly mimeType: "image/png";
+  readonly byteLength: number;
+  readonly width: number;
+  readonly height: number;
+  readonly pageNumber: number;
+  readonly pageCount: number;
+  readonly stale: boolean;
+  readonly pdfPath?: string;
+  readonly capturedAt: string;
+};
+
 export type SyncTexForwardRequest = {
   readonly projectRoot: string;
   readonly sourceFilePath: string;
@@ -309,6 +343,7 @@ export type RemoveUnusedReferenceResult = {
 };
 
 export type ProjectTemplateId = "article" | "report" | "thesis" | "beamer" | "cv";
+export type ExternalProjectTemplateId = "ieee-systems-journal";
 
 export type ProjectTemplate = {
   readonly id: ProjectTemplateId;
@@ -358,9 +393,29 @@ export type AgentAuthStatus = {
   readonly message?: string;
 };
 
+export type AgentProviderSetupAction = "install" | "login";
+
+export type AgentProviderSetupTerminalResult = {
+  readonly opened: true;
+  readonly command: string;
+  readonly providerId: AgentProviderId;
+  readonly action: AgentProviderSetupAction;
+};
+
+export type AgentSelectionContext = {
+  readonly selectedText: string;
+  readonly containingParagraph: string;
+  readonly selectionStartOffset: number;
+  readonly selectionEndOffset: number;
+  readonly startLine: number;
+  readonly endLine: number;
+};
+
 export type AgentToolName =
   | "read-file"
   | "search-project"
+  | "capture-pdf-preview"
+  | "delete-entry"
   | "move-entry"
   | "set-main-file"
   | "network-fetch"
@@ -440,6 +495,7 @@ export type AgentStartRequest = {
   readonly prompt: string;
   readonly activeFilePath?: string;
   readonly selectedText?: string;
+  readonly selectionContext?: AgentSelectionContext;
   readonly mainFilePath?: string;
   readonly compiler?: LatexCompiler;
   readonly diagnostic?: LatexDiagnostic;
@@ -465,8 +521,13 @@ export type AgentSessionResult = {
   readonly events: readonly AgentEvent[];
   readonly changeset?: HistoryChangeSet;
   readonly changesets?: readonly HistoryChangeSet[];
+  readonly deleteEntries?: readonly AgentDeleteEntryOperation[];
   readonly moveEntries?: readonly AgentMoveEntryOperation[];
   readonly buildResult?: BuildResult;
+};
+
+export type AgentDeleteEntryOperation = {
+  readonly path: string;
 };
 
 export type AgentMoveEntryOperation = {
@@ -480,7 +541,7 @@ export function createReadOnlyAgentExplanation(
 ): string {
   const target = request.diagnostic?.filePath ?? snapshot.path;
   const location = formatDiagnosticLocation(request.diagnostic);
-  const selection = formatSelectedLatexContext(request.selectedText);
+  const selection = formatAgentSelectionContextForPrompt(request);
   const lines = [
     ...(selection === undefined
       ? []
@@ -514,9 +575,11 @@ export async function createReadOnlyAgentResponse(
   return inspection ?? createReadOnlyAgentExplanation(request, snapshot);
 }
 
-function formatSelectedLatexContext(
-  selectedText: string | undefined
+export function formatAgentSelectionContextForPrompt(
+  request: Pick<AgentStartRequest, "selectedText" | "selectionContext">
 ): string | undefined {
+  const selectedText = request.selectionContext?.selectedText ?? request.selectedText;
+
   if (selectedText === undefined || selectedText.trim().length === 0) {
     return undefined;
   }
@@ -527,7 +590,26 @@ function formatSelectedLatexContext(
       ? `${normalizedSelection.slice(0, 1_200).trimEnd()}\n...`
       : normalizedSelection;
 
-  return `Selected LaTeX:\n${cappedSelection}`;
+  if (
+    request.selectionContext === undefined ||
+    request.selectionContext.containingParagraph.trim().length === 0
+  ) {
+    return `Selected text:\n${cappedSelection}`;
+  }
+
+  const normalizedParagraph = request.selectionContext.containingParagraph.trim();
+  const cappedParagraph =
+    normalizedParagraph.length > 2_400
+      ? `${normalizedParagraph.slice(0, 2_400).trimEnd()}\n...`
+      : normalizedParagraph;
+
+  return [
+    `Selected text:\n${cappedSelection}`,
+    "",
+    `Containing paragraph:\n${cappedParagraph}`,
+    "",
+    `Selection offsets in paragraph: ${request.selectionContext.selectionStartOffset}-${request.selectionContext.selectionEndOffset}`
+  ].join("\n");
 }
 
 function explainSelectedLatex(selectedText: string): string {
@@ -1982,6 +2064,7 @@ export type IpcRequestMap = {
     readonly projectRoot: string;
     readonly pdfPath: string;
   };
+  readonly [ipcChannels.pdfReportPreviewBounds]: PdfPreviewCaptureState;
   readonly [ipcChannels.synctexForward]: SyncTexForwardRequest;
   readonly [ipcChannels.synctexReverse]: SyncTexReverseRequest;
   readonly [ipcChannels.historyListChangeSets]: { readonly projectRoot: string };
@@ -2036,6 +2119,10 @@ export type IpcRequestMap = {
     readonly templateId: ProjectTemplateId;
     readonly projectName: string;
   };
+  readonly [ipcChannels.lifecycleCreateFromExternalTemplate]: {
+    readonly templateId: ExternalProjectTemplateId;
+    readonly projectName: string;
+  };
   readonly [ipcChannels.lifecycleCheckSubmission]: {
     readonly projectRoot: string;
     readonly mainFilePath?: string;
@@ -2045,6 +2132,10 @@ export type IpcRequestMap = {
   readonly [ipcChannels.settingsGetPrivacySummary]: undefined;
   readonly [ipcChannels.settingsClearLocalHistory]: undefined;
   readonly [ipcChannels.agentGetAuthStatus]: { readonly providerId: AgentProviderId };
+  readonly [ipcChannels.agentOpenProviderSetupTerminal]: {
+    readonly providerId: AgentProviderId;
+    readonly action: AgentProviderSetupAction;
+  };
   readonly [ipcChannels.agentStart]: AgentStartRequest;
   readonly [ipcChannels.agentRespondApproval]: AgentApprovalResponseRequest;
   readonly [ipcChannels.agentCancel]: { readonly sessionId: string };
@@ -2076,6 +2167,7 @@ export type IpcResponseMap = {
   readonly [ipcChannels.buildRun]: BuildResult;
   readonly [ipcChannels.buildStop]: { readonly stopped: boolean };
   readonly [ipcChannels.pdfReadArtifact]: PdfArtifactData;
+  readonly [ipcChannels.pdfReportPreviewBounds]: { readonly reported: boolean };
   readonly [ipcChannels.synctexForward]: SyncTexForwardResult;
   readonly [ipcChannels.synctexReverse]: SyncTexReverseResult;
   readonly [ipcChannels.historyListChangeSets]: readonly HistoryChangeSet[];
@@ -2095,12 +2187,16 @@ export type IpcResponseMap = {
   readonly [ipcChannels.lifecycleExportPdf]: ExportPdfResult | undefined;
   readonly [ipcChannels.lifecycleImportSourceZip]: ProjectOpenResult | undefined;
   readonly [ipcChannels.lifecycleCreateFromTemplate]: ProjectOpenResult | undefined;
+  readonly [ipcChannels.lifecycleCreateFromExternalTemplate]:
+    | ProjectOpenResult
+    | undefined;
   readonly [ipcChannels.lifecycleCheckSubmission]: SubmissionCheckResult;
   readonly [ipcChannels.settingsLoad]: AppSettings;
   readonly [ipcChannels.settingsSave]: AppSettings;
   readonly [ipcChannels.settingsGetPrivacySummary]: PrivacySummary;
   readonly [ipcChannels.settingsClearLocalHistory]: PrivacySummary;
   readonly [ipcChannels.agentGetAuthStatus]: AgentAuthStatus;
+  readonly [ipcChannels.agentOpenProviderSetupTerminal]: AgentProviderSetupTerminalResult;
   readonly [ipcChannels.agentStart]: AgentSessionResult;
   readonly [ipcChannels.agentRespondApproval]: AgentSessionResult;
   readonly [ipcChannels.agentCancel]: { readonly cancelled: boolean };
@@ -2170,6 +2266,9 @@ export type DesktopApi = {
     readonly readArtifact: (
       request: IpcRequestMap[typeof ipcChannels.pdfReadArtifact]
     ) => Promise<PdfArtifactData>;
+    readonly reportPreviewBounds: (
+      request: PdfPreviewCaptureState
+    ) => Promise<{ readonly reported: boolean }>;
   };
   readonly synctex: {
     readonly forward: (request: SyncTexForwardRequest) => Promise<SyncTexForwardResult>;
@@ -2221,6 +2320,9 @@ export type DesktopApi = {
     readonly createFromTemplate: (
       request: IpcRequestMap[typeof ipcChannels.lifecycleCreateFromTemplate]
     ) => Promise<ProjectOpenResult | undefined>;
+    readonly createFromExternalTemplate: (
+      request: IpcRequestMap[typeof ipcChannels.lifecycleCreateFromExternalTemplate]
+    ) => Promise<ProjectOpenResult | undefined>;
     readonly checkSubmission: (
       request: IpcRequestMap[typeof ipcChannels.lifecycleCheckSubmission]
     ) => Promise<SubmissionCheckResult>;
@@ -2233,6 +2335,10 @@ export type DesktopApi = {
   };
   readonly agent: {
     readonly getAuthStatus: (providerId: AgentProviderId) => Promise<AgentAuthStatus>;
+    readonly openProviderSetupTerminal: (
+      providerId: AgentProviderId,
+      action: AgentProviderSetupAction
+    ) => Promise<AgentProviderSetupTerminalResult>;
     readonly start: (request: AgentStartRequest) => Promise<AgentSessionResult>;
     readonly respondApproval: (
       request: AgentApprovalResponseRequest

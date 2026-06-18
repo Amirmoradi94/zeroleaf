@@ -11,11 +11,14 @@ export type ResizeDelta = {
 };
 
 export const paneConstraints = {
+  editorWidth: { min: 520 },
   sidebarWidth: { min: 220, max: 420 },
   pdfWidth: { min: 320, max: 1400 },
   agentWidth: { min: 340, max: 560 },
   bottomPanelHeight: { min: 140, max: 360 }
 } as const;
+
+export const contentRowGutterWidth = 12;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -73,6 +76,38 @@ export function resizeWorkbenchPane(
         bottomPanelHeight: startLayout.bottomPanelHeight - delta.y
       });
   }
+}
+
+export function constrainWorkbenchLayoutToContentWidth(
+  layout: WorkbenchLayout,
+  contentWidth: number
+): WorkbenchLayout {
+  const clampedLayout = clampPaneSizes(layout);
+  const availableForSecondaryPanes = Math.max(
+    0,
+    contentWidth - contentRowGutterWidth - paneConstraints.editorWidth.min
+  );
+  const minPdfWidth = paneConstraints.pdfWidth.min;
+  const minAgentWidth = paneConstraints.agentWidth.min;
+
+  const pdfWidth = Math.min(
+    clampedLayout.pdfWidth,
+    Math.max(minPdfWidth, availableForSecondaryPanes - clampedLayout.agentWidth)
+  );
+  const agentWidth = Math.min(
+    clampedLayout.agentWidth,
+    Math.max(minAgentWidth, availableForSecondaryPanes - pdfWidth)
+  );
+  const finalPdfWidth = Math.min(
+    pdfWidth,
+    Math.max(minPdfWidth, availableForSecondaryPanes - agentWidth)
+  );
+
+  return clampPaneSizes({
+    ...clampedLayout,
+    pdfWidth: finalPdfWidth,
+    agentWidth
+  });
 }
 
 export const initialWorkbenchLayout = defaultWorkbenchLayout;

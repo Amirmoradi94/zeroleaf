@@ -3,11 +3,13 @@ import { fork, type ChildProcess } from "node:child_process";
 
 import { createReadOnlyAgentResponse } from "@latex-agent/ipc-contracts";
 import type {
+  AgentDeleteEntryOperation,
   AgentMoveEntryOperation,
   AgentApprovalResponseRequest,
   AgentAuthStatus,
   AgentEvent,
   AgentProviderId,
+  AgentSelectionContext,
   AgentSessionResult,
   AgentStartRequest,
   AgentToolCallEvent,
@@ -15,6 +17,7 @@ import type {
   AgentToolRisk,
   BuildResult,
   HistoryChangeSet,
+  PdfPreviewCaptureResult,
   LatexCompiler,
   ProjectFileSnapshot
 } from "@latex-agent/ipc-contracts";
@@ -33,6 +36,8 @@ export type AgentToolBroker = {
   readonly emitEvent?: (event: AgentEvent) => void;
   readonly readFile: (path: string) => Promise<ProjectFileSnapshot>;
   readonly searchProject: (query: string) => Promise<readonly ProjectFileSnapshot[]>;
+  readonly capturePdfPreview?: () => Promise<PdfPreviewCaptureResult>;
+  readonly deleteEntry?: (path: string) => Promise<AgentDeleteEntryOperation>;
   readonly moveEntry?: (
     fromPath: string,
     toPath: string
@@ -52,6 +57,8 @@ export type AgentToolBroker = {
 export type AgentToolRequestPayloadMap = {
   readonly "read-file": { readonly path: string };
   readonly "search-project": { readonly query: string };
+  readonly "capture-pdf-preview": { readonly approved: false };
+  readonly "delete-entry": AgentDeleteEntryOperation & { readonly approved: true };
   readonly "move-entry": AgentMoveEntryOperation & { readonly approved: true };
   readonly "set-main-file": { readonly path: string; readonly approved: true };
   readonly "network-fetch": { readonly resource: string };
@@ -79,6 +86,8 @@ export type AgentToolRequestPayloadMap = {
 export type AgentToolResultMap = {
   readonly "read-file": ProjectFileSnapshot;
   readonly "search-project": readonly ProjectFileSnapshot[];
+  readonly "capture-pdf-preview": PdfPreviewCaptureResult;
+  readonly "delete-entry": AgentDeleteEntryOperation;
   readonly "move-entry": AgentMoveEntryOperation;
   readonly "set-main-file": { readonly path: string };
   readonly "network-fetch": { readonly fetched: false };
@@ -714,7 +723,11 @@ export function isAgentToolAllowed(
   toolName: AgentToolName,
   approved: boolean
 ): boolean {
-  if (toolName === "read-file" || toolName === "search-project") {
+  if (
+    toolName === "read-file" ||
+    toolName === "search-project" ||
+    toolName === "capture-pdf-preview"
+  ) {
     return true;
   }
 
@@ -730,6 +743,10 @@ export function isAgentToolAllowed(
     return (
       mode === "suggest" || mode === "apply-with-review" || mode === "autonomous-local"
     );
+  }
+
+  if (toolName === "delete-entry") {
+    return mode === "autonomous-local" || (mode === "apply-with-review" && approved);
   }
 
   if (toolName === "move-entry") {
@@ -755,6 +772,7 @@ export function getAgentToolRisk(toolName: AgentToolName): AgentToolRisk {
   switch (toolName) {
     case "read-file":
     case "search-project":
+    case "capture-pdf-preview":
       return "low";
     case "network-fetch":
     case "codex-exec":
@@ -762,6 +780,7 @@ export function getAgentToolRisk(toolName: AgentToolName): AgentToolRisk {
     case "propose-patch":
     case "run-compile":
       return "medium";
+    case "delete-entry":
     case "move-entry":
     case "set-main-file":
     case "reject-patch":
@@ -793,7 +812,8 @@ function createMockPatchContents(
     return replaceSelectedText(
       beforeContents,
       request.selectedText,
-      createMockSelectionRevision(request)
+      createMockSelectionRevision(request),
+      request.selectionContext
     );
   }
 
@@ -968,10 +988,37 @@ async function createMockPreflightMessage({
 function replaceSelectedText(
   beforeContents: string,
   selectedText: string,
-  revisedSelection: string
+  revisedSelection: string,
+  selectionContext?: AgentSelectionContext
 ): string {
   if (revisedSelection === selectedText || !beforeContents.includes(selectedText)) {
     return beforeContents;
+  }
+
+  if (
+    selectionContext !== undefined &&
+    selectionContext.selectionStartOffset >= 0 &&
+    selectionContext.selectionEndOffset > selectionContext.selectionStartOffset &&
+    selectionContext.selectionEndOffset <=
+      selectionContext.containingParagraph.length &&
+    selectionContext.containingParagraph.slice(
+      selectionContext.selectionStartOffset,
+      selectionContext.selectionEndOffset
+    ) === selectedText &&
+    beforeContents.includes(selectionContext.containingParagraph)
+  ) {
+    const beforeSelection = selectionContext.containingParagraph.slice(
+      0,
+      selectionContext.selectionStartOffset
+    );
+    const afterSelection = selectionContext.containingParagraph.slice(
+      selectionContext.selectionEndOffset
+    );
+
+    return beforeContents.replace(
+      selectionContext.containingParagraph,
+      `${beforeSelection}${revisedSelection}${afterSelection}`
+    );
   }
 
   return beforeContents.replace(selectedText, revisedSelection);
@@ -3382,6 +3429,12 @@ function summarizeClientToolRequest(message: AgentHostToolRequestMessage): strin
       const payload = message.payload as AgentToolRequestPayloadMap["search-project"];
       return `Searching project for "${payload.query}"`;
     }
+    case "capture-pdf-preview":
+      return "Capturing the PDF preview";
+    case "delete-entry": {
+      const payload = message.payload as AgentToolRequestPayloadMap["delete-entry"];
+      return `Deleting ${payload.path}`;
+    }
     case "move-entry": {
       const payload = message.payload as AgentToolRequestPayloadMap["move-entry"];
       return `Moving ${payload.fromPath} to ${payload.toPath}`;
@@ -3424,6 +3477,10 @@ function summarizeClientToolResult(
       return "Read project file";
     case "search-project":
       return "Project search completed";
+    case "capture-pdf-preview":
+      return "Captured PDF preview";
+    case "delete-entry":
+      return "Deleted project entry";
     case "move-entry":
       return "Moved project entry";
     case "set-main-file":

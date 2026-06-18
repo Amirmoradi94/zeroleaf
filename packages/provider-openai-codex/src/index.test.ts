@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { BuildResult } from "@latex-agent/ipc-contracts";
+import type {
+  AgentEvent,
+  BuildResult,
+  PdfPreviewCaptureResult
+} from "@latex-agent/ipc-contracts";
 
 import {
   CodexCliProvider,
+  createCodexAgentEventsFromJson,
   createCodexExecArgs,
   parseCodexLoginStatus,
   type CodexCliToolBroker
@@ -64,6 +69,7 @@ describe("CodexCliProvider", () => {
       "--ignore-user-config",
       "--ignore-rules",
       "--ephemeral",
+      "--json",
       "--sandbox",
       "read-only",
       "-c",
@@ -76,6 +82,58 @@ describe("CodexCliProvider", () => {
       "/tmp/project",
       "-"
     ]);
+  });
+
+  it("ignores public Codex JSONL command events in the persisted transcript", () => {
+    expect(
+      createCodexAgentEventsFromJson(
+        {
+          type: "exec_command_begin",
+          command: "rg author summary_of_changes.tex"
+        },
+        "session-1"
+      )
+    ).toEqual([]);
+  });
+
+  it("maps public Codex assistant text while ignoring structured final JSON", () => {
+    expect(
+      createCodexAgentEventsFromJson(
+        {
+          type: "agent_message",
+          message: "I found the file and am preparing the edit."
+        },
+        "session-1"
+      )
+    ).toEqual([
+      expect.objectContaining({
+        type: "message",
+        role: "assistant",
+        content: "I found the file and am preparing the edit."
+      })
+    ]);
+    expect(
+      createCodexAgentEventsFromJson(
+        {
+          type: "agent_message",
+          message:
+            '{"action":"answer","targetFilePath":"main.tex","summary":"","afterContents":"","message":"","notes":""}'
+        },
+        "session-1"
+      )
+    ).toEqual([]);
+  });
+
+  it("ignores Codex reasoning JSONL events", () => {
+    expect(
+      createCodexAgentEventsFromJson(
+        {
+          type: "agent_reasoning",
+          text: "private scratchpad"
+        },
+        "session-1"
+      )
+    ).toEqual([]);
   });
 
   it("runs read-only tasks through Codex exec and returns the model answer", async () => {
@@ -126,6 +184,106 @@ describe("CodexCliProvider", () => {
         (event) =>
           event.type === "message" &&
           event.content.includes("The active file is a short article")
+      )
+    ).toBe(true);
+  });
+
+  it("captures the PDF preview and asks Codex for screenshot-backed assessment", async () => {
+    const calls: string[] = [];
+    const prompts: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: (request) => {
+        prompts.push(request.prompt);
+
+        if (prompts.length === 1) {
+          return Promise.resolve({
+            action: "capture-pdf-preview",
+            targetFilePath: "",
+            summary: "Need rendered preview evidence",
+            afterContents: "",
+            message: "I need to inspect the rendered PDF preview.",
+            notes: "Requested PDF preview capture"
+          });
+        }
+
+        return Promise.resolve(
+          createCodexAnswer("The captured PDF preview shows no visible clipping.")
+        );
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "read-only",
+        projectRoot: "/tmp/project",
+        prompt:
+          "Take a screenshot of the PDF preview and assess whether it is clipped.",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(calls).toEqual(["read-file:main.tex", "capture-pdf-preview"]);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain('Set action to "capture-pdf-preview"');
+    expect(prompts[1]).toContain("Rendered PDF preview evidence:");
+    expect(prompts[1]).toContain(
+      "Screenshot path: /tmp/project/.latex-agent/visual-captures/pdf-preview.png"
+    );
+    expect(prompts[1]).toContain("Preview page: 1 / 2");
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "tool-call" &&
+          event.toolName === "capture-pdf-preview" &&
+          event.status === "succeeded"
+      )
+    ).toBe(true);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "message" &&
+          event.role === "assistant" &&
+          event.content.includes("no visible clipping")
+      )
+    ).toBe(true);
+  });
+
+  it("emits Codex CLI heartbeat events during long planner runs", async () => {
+    const emittedEvents: AgentEvent[] = [];
+    const provider = new CodexCliProvider({
+      progressHeartbeatMs: 5,
+      runCodexExec: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return createCodexAnswer("The project has one active source file.");
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "read-only",
+        projectRoot: "/tmp/project",
+        prompt: "Summarize the active file",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker([], { emittedEvents })
+    );
+
+    expect(result.status).toBe("completed");
+    expect(
+      emittedEvents.some(
+        (event) =>
+          event.type === "tool-call" &&
+          event.toolName === "codex-exec" &&
+          event.status === "running" &&
+          event.summary.includes("Codex CLI is still analyzing")
       )
     ).toBe(true);
   });
@@ -361,12 +519,78 @@ describe("CodexCliProvider", () => {
     expect(providerPrompt).toContain(
       'return the concrete action whenever safe: "patch" for source edits'
     );
+    expect(providerPrompt).toContain('"delete-entry" for deleting project files');
     expect(providerPrompt).toContain('"move-entry" for moving or renaming files');
     expect(providerPrompt).toContain(
       '"set-main-file" for changing the project main TeX file'
     );
     expect(providerPrompt).toContain('"run-compile" for builds');
     expect(providerPrompt).toContain("\\citep{smith2024}");
+  });
+
+  it("uses focused Codex context for selected text writing edits", async () => {
+    let providerPrompt = "";
+    const source = [
+      "\\documentclass{article}",
+      "\\begin{document}",
+      ...Array.from({ length: 80 }, (_, index) =>
+        index === 40
+          ? "We show the method is very good and it works well."
+          : `Context line ${index + 1}.`
+      ),
+      "\\end{document}",
+      ""
+    ].join("\n");
+    const provider = new CodexCliProvider({
+      runCodexExec: (request) => {
+        providerPrompt = request.prompt;
+        return Promise.resolve({
+          action: "patch",
+          targetFilePath: "main.tex",
+          summary: "Improve selected sentence",
+          afterContents: source.replace(
+            "We show the method is very good and it works well.",
+            "We demonstrate that the method performs robustly across the evaluated scenarios."
+          ),
+          message: "I prepared a focused rewrite.",
+          notes: "Generated by fake Codex runner"
+        });
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "apply-with-review",
+        projectRoot: "/tmp/project",
+        prompt: "Rewrite the selected text while preserving the meaning.",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex",
+        selectedText: "very good and it works well",
+        selectionContext: {
+          containingParagraph: "We show the method is very good and it works well.",
+          endLine: 43,
+          selectedText: "very good and it works well",
+          selectionEndOffset: 47,
+          selectionStartOffset: 22,
+          startLine: 43
+        }
+      },
+      createBroker([], { readFiles: { "main.tex": source } })
+    );
+
+    expect(result.status).toBe("awaiting-approval");
+    expect(result.changeset?.summary).toBe("Improve selected sentence");
+    expect(providerPrompt).toContain("focused writing edit");
+    expect(providerPrompt).toContain("Change only the exact selected span");
+    expect(providerPrompt).toContain("Focused file context");
+    expect(providerPrompt).toContain("Context line 21.");
+    expect(providerPrompt).toContain("Context line 61.");
+    expect(providerPrompt).not.toContain("Context line 1.");
+    expect(providerPrompt).not.toContain("Context line 80.");
+    expect(providerPrompt).not.toContain("For table generation from pasted data");
+    expect(providerPrompt).not.toContain("For unbalanced-brace repairs");
   });
 
   it("retries concrete fix answers once to request a reviewable patch", async () => {
@@ -413,6 +637,7 @@ describe("CodexCliProvider", () => {
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain("Retry instruction:");
     expect(prompts[1]).toContain('return action "patch"');
+    expect(prompts[1]).toContain('return action "delete-entry"');
     expect(prompts[1]).toContain('return action "move-entry"');
     expect(prompts[1]).toContain('return action "set-main-file"');
     expect(prompts[1]).toContain('return action "run-compile"');
@@ -674,6 +899,47 @@ describe("CodexCliProvider", () => {
           event.type === "tool-call" &&
           event.toolName === "move-entry" &&
           event.status === "succeeded"
+      )
+    ).toBe(true);
+  });
+
+  it("turns file delete requests into an approval-gated app tool call", async () => {
+    const calls: string[] = [];
+    const provider = new CodexCliProvider({
+      runCodexExec: () =>
+        Promise.resolve({
+          action: "delete-entry",
+          targetFilePath: "references.bib",
+          summary: "Remove unused bibliography file",
+          afterContents: "",
+          message: "I can remove `references.bib` from the project after approval.",
+          notes: "Generated by fake Codex runner"
+        })
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "openai-codex",
+        mode: "apply-with-review",
+        projectRoot: "/tmp/project",
+        prompt: "Remove references.bib from project",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls)
+    );
+
+    expect(result.status).toBe("awaiting-approval");
+    expect(result.deleteEntries).toEqual([{ path: "references.bib" }]);
+    expect(calls).toEqual(["read-file:main.tex"]);
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === "approval" &&
+          event.toolName === "delete-entry" &&
+          event.status === "requested" &&
+          event.prompt.includes("Delete references.bib")
       )
     ).toBe(true);
   });
@@ -1059,6 +1325,8 @@ function createBroker(
   calls: string[] = [],
   options: {
     readonly compileResults?: readonly BuildResult[];
+    readonly captureResult?: PdfPreviewCaptureResult;
+    readonly emittedEvents?: AgentEvent[];
     readonly readFiles?: Readonly<Record<string, string>>;
     readonly searchResults?: Readonly<
       Record<string, readonly { readonly path: string; readonly contents: string }[]>
@@ -1068,6 +1336,9 @@ function createBroker(
   let compileRunCount = 0;
 
   return {
+    emitEvent: (event) => {
+      options.emittedEvents?.push(event);
+    },
     readFile: (path) => {
       calls.push(`read-file:${path}`);
       return Promise.resolve({
@@ -1088,6 +1359,24 @@ function createBroker(
         }))
       );
     },
+    capturePdfPreview: () => {
+      calls.push("capture-pdf-preview");
+      return Promise.resolve(
+        options.captureResult ?? {
+          projectRoot: "/tmp/project",
+          imagePath: "/tmp/project/.latex-agent/visual-captures/pdf-preview.png",
+          mimeType: "image/png",
+          byteLength: 4096,
+          width: 640,
+          height: 900,
+          pageNumber: 1,
+          pageCount: 2,
+          stale: false,
+          pdfPath: "/tmp/project/.latex-agent/build/main.pdf",
+          capturedAt: "2026-06-17T00:00:00.000Z"
+        }
+      );
+    },
     setMainFile: (path) => {
       calls.push(`set-main-file:${path}`);
       return Promise.resolve({ path });
@@ -1095,6 +1384,10 @@ function createBroker(
     moveEntry: (fromPath, toPath) => {
       calls.push(`move-entry:${fromPath}->${toPath}`);
       return Promise.resolve({ fromPath, toPath });
+    },
+    deleteEntry: (path) => {
+      calls.push(`delete-entry:${path}`);
+      return Promise.resolve({ path });
     },
     runCompile: () => {
       calls.push("run-compile");

@@ -17,6 +17,7 @@ import {
   createDiagnosticAgentPrompt,
   createFinalFormattingReviewPrompt,
   createNumberingMismatchAgentPrompt,
+  createSelectionContextFromText,
   createLatexCompletionState,
   createReferenceEntryAgentPrompt,
   detectPreferredCitationCommand,
@@ -39,6 +40,36 @@ import {
 
 const tempRoots: string[] = [];
 
+function createSelectionFromOffsets(
+  contents: string,
+  startOffset: number,
+  endOffset: number
+): {
+  readonly startLineNumber: number;
+  readonly startColumn: number;
+  readonly endLineNumber: number;
+  readonly endColumn: number;
+} {
+  const start = createPositionFromOffset(contents, startOffset);
+  const end = createPositionFromOffset(contents, endOffset);
+
+  return {
+    startLineNumber: start.lineNumber,
+    startColumn: start.column,
+    endLineNumber: end.lineNumber,
+    endColumn: end.column
+  };
+}
+
+function createPositionFromOffset(contents: string, offset: number) {
+  const beforeOffset = contents.slice(0, offset);
+  const lines = beforeOffset.split("\n");
+  const lineNumber = lines.length;
+  const column = (lines.at(-1) ?? "").length + 1;
+
+  return { column, lineNumber };
+}
+
 afterEach(async () => {
   await Promise.all(
     tempRoots.map((root) => rm(root, { recursive: true, force: true }))
@@ -47,6 +78,47 @@ afterEach(async () => {
 });
 
 describe("editor model", () => {
+  it("identifies the containing paragraph for a selected word", () => {
+    const paragraph = [
+      "We sincerely thank the Editor-in-Chief, the Associate Editor, and both reviewers for their careful",
+      "reading of our manuscript and their insightful, constructive comments. The feedback has substantially",
+      "improved the technical rigor, clarity, and feasibility framing of the paper. Below, we provide a detailed",
+      "point-by-point response to the reviewers."
+    ].join("\n");
+    const contents = [
+      "Previous response text should not be included.",
+      "",
+      paragraph,
+      "",
+      "==========================",
+      "Response to Reviewer 1",
+      "=========================="
+    ].join("\n");
+    const rigorOffset = contents.indexOf("rigor");
+    const selection = createSelectionFromOffsets(
+      contents,
+      rigorOffset,
+      rigorOffset + "rigor".length
+    );
+    const context = createSelectionContextFromText({ contents, selection });
+
+    if (context === null) {
+      throw new Error("Expected selection context for rigor.");
+    }
+
+    expect(context.selectedText).toBe("rigor");
+    expect(context.containingParagraph).toBe(paragraph);
+    expect(context.containingParagraph).toContain("technical rigor, clarity");
+    expect(context.containingParagraph).not.toContain("Previous response text");
+    expect(context.containingParagraph).not.toContain("Response to Reviewer 1");
+    expect(
+      context.containingParagraph.slice(
+        context.selectionStartOffset,
+        context.selectionEndOffset
+      )
+    ).toBe("rigor");
+  });
+
   it("parses LaTeX section and label outline items", () => {
     expect(
       parseLatexOutline(

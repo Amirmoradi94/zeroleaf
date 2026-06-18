@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import {
   access,
   mkdir,
@@ -20,6 +20,7 @@ import {
   resolve,
   sep
 } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 export type ProjectSummary = {
   readonly rootPath: string;
@@ -87,6 +88,7 @@ const maxTreeDepth = 8;
 const maxTreeEntries = 2500;
 const mainFileReadLimit = 80_000;
 const internalMetadataPath = ".latex-agent";
+const transientReadRetryDelaysMs = [120, 240, 480, 960, 1_500] as const;
 
 export class ProjectServiceError extends Error {
   constructor(
@@ -336,9 +338,73 @@ export async function readProjectFile(
 
   return {
     path: toProjectPath(root, absolutePath),
-    contents: await readFile(absolutePath, "utf8"),
+    contents: await readProjectFileContents(absolutePath),
     mtimeMs: fileStats.mtimeMs
   };
+}
+
+async function readProjectFileContents(absolutePath: string): Promise<string> {
+  for (let attempt = 0; attempt <= transientReadRetryDelaysMs.length; attempt += 1) {
+    try {
+      return await readUtf8FileStream(absolutePath);
+    } catch (error) {
+      const retryDelay = transientReadRetryDelaysMs[attempt];
+
+      if (!isTransientReadError(error)) {
+        throw error;
+      }
+
+      if (retryDelay === undefined) {
+        throw new ProjectServiceError(
+          "Project file is temporarily unavailable. Wait for the file to finish downloading locally, then try again.",
+          "not-readable"
+        );
+      }
+
+      await delay(retryDelay);
+    }
+  }
+
+  throw new ProjectServiceError("Unable to read project file.", "not-readable");
+}
+
+function readUtf8FileStream(absolutePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let contents = "";
+    const stream = createReadStream(absolutePath, { encoding: "utf8" });
+    const timeout = setTimeout(() => {
+      const error = new Error("Timed out while reading project file.") as Error & {
+        code: string;
+      };
+      error.code = "ETIMEDOUT";
+      stream.destroy(error);
+    }, 5_000);
+
+    stream.on("data", (chunk) => {
+      contents += chunk;
+    });
+    stream.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    stream.once("end", () => {
+      clearTimeout(timeout);
+      resolve(contents);
+    });
+  });
+}
+
+function isTransientReadError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const candidate = error as { readonly code?: unknown; readonly errno?: unknown };
+  return (
+    candidate.code === "EAGAIN" ||
+    candidate.code === "ETIMEDOUT" ||
+    candidate.errno === -11
+  );
 }
 
 export async function writeProjectFile(
@@ -479,7 +545,7 @@ export async function detectMainTexFile(
 
   for (const texPath of texPaths) {
     const absolutePath = await resolveExistingProjectPath(root, texPath);
-    const contents = await readFile(absolutePath, "utf8");
+    const contents = await readProjectFileContents(absolutePath);
 
     if (contents.slice(0, mainFileReadLimit).includes("\\documentclass")) {
       return texPath;

@@ -9,12 +9,27 @@ describe("App renderer shell", () => {
       fileURLToPath(new URL("./App.tsx", import.meta.url)),
       "utf8"
     );
+    const pdfPaneSource = await readFile(
+      fileURLToPath(new URL("./components/PdfPane.tsx", import.meta.url)),
+      "utf8"
+    );
+    const pdfPreviewModelSource = await readFile(
+      fileURLToPath(new URL("./pdfPreviewModel.ts", import.meta.url)),
+      "utf8"
+    );
+    const rendererSource = [appSource, pdfPaneSource, pdfPreviewModelSource].join("\n");
 
-    expect(appSource).toContain("ZeroLeaf");
+    expect(rendererSource).toContain("ZeroLeaf");
     expect(appSource).toContain("Command Palette");
     expect(appSource).toContain("Open Folder");
     expect(appSource).toContain("Import ZIP");
     expect(appSource).toContain("Create Project");
+    expect(appSource).toContain("Template project name");
+    expect(appSource).toContain("getDefaultProjectNameForTemplate");
+    expect(appSource).toContain(
+      "Enter a project name before creating a template project."
+    );
+    expect(appSource).not.toContain('window.prompt("Project name"');
     expect(appSource).toContain("latexmk is missing.");
     expect(appSource).toContain("is not available. Set one of:");
     expect(appSource).toContain("Delete selected entry");
@@ -29,7 +44,7 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("onRemoveUnusedReference");
     expect(appSource).toContain("Remove unused bibliography entry");
     expect(appSource).toContain("Removed unused reference");
-    expect(appSource).toContain("Set active file as main");
+    expect(appSource).toContain("file-row__main-action");
     expect(appSource).toContain("file-row__badge");
     expect(appSource).toContain("buildProjectLatexOutline");
     expect(appSource).toContain(
@@ -41,7 +56,7 @@ describe("App renderer shell", () => {
       "shouldMarkPdfStaleForProjectChange(staleCandidatePaths)"
     );
     expect(appSource).toContain("appWrittenProjectPathsRef");
-    expect(appSource).toContain("PDF Preview");
+    expect(rendererSource).toContain("PDF Preview");
     expect(appSource).toContain("startPdfPreviewBuild");
     expect(appSource).toContain("finishPdfPreviewBuild");
     expect(appSource).toContain("Stop Build");
@@ -51,25 +66,27 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("Build log search excerpt");
     expect(appSource).toContain("Log truncated: showing");
     expect(appSource).toContain("Recompile before SyncTeX; PDF is stale.");
-    expect(appSource).toContain("Stale: unsaved source changes");
-    expect(appSource).toContain("Stale: saved source newer than PDF");
-    expect(appSource).toContain("Stale: project changed outside editor");
+    expect(rendererSource).toContain("Stale: unsaved source changes");
+    expect(rendererSource).toContain("Stale: saved source newer than PDF");
+    expect(rendererSource).toContain("Stale: project changed outside editor");
     expect(appSource).toContain("No SyncTeX source target found.");
     expect(appSource).toContain("getEditorPosition");
     expect(appSource).toContain("installE2EEditorHooks");
-    expect(appSource).toContain("Fit PDF width");
-    expect(appSource).toContain("Zoom in");
-    expect(appSource).toContain("Zoom out");
+    expect(rendererSource).toContain("Fit PDF width");
+    expect(rendererSource).toContain("Zoom in");
+    expect(rendererSource).toContain("Zoom out");
     expect(appSource).toContain("collectPdfSearchMatches");
     expect(appSource).toContain("PDF match ${nextIndex + 1} of");
-    expect(appSource).toContain("Previous PDF match");
-    expect(appSource).toContain("Next PDF match");
+    expect(rendererSource).toContain("Previous PDF match");
+    expect(rendererSource).toContain("Next PDF match");
     expect(appSource).toContain('No PDF search match for "${query}"');
-    expect(appSource).toContain("Save PDF");
+    expect(rendererSource).toContain("Save PDF");
     expect(appSource).toContain("Include generated build artifacts and cache files");
     expect(appSource).toContain("The current PDF preview is stale");
     expect(appSource).toContain("Agent");
-    expect(appSource).toContain("local CLI login state");
+    expect(appSource).toContain("Connect an AI provider once on this computer");
+    expect(appSource).toContain("openProviderSetupTerminal");
+    expect(appSource).toContain("Log in with your subscription");
     expect(appSource).toMatch(/does\s+not request or store provider API keys/u);
     expect(appSource).toContain("scoped edit, compile, or project inspection");
     expect(appSource).toContain("Explain selection");
@@ -79,8 +96,20 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("openInlineSelectionPrompt");
     expect(appSource).toContain("runInlineSelectionPrompt");
     expect(appSource).toContain("AI for selected text");
+    expect(appSource).toContain("INLINE_SELECTION_PROMPT_AUTO_OPEN_DELAY_MS");
+    expect(appSource).toContain("editorSelectionPointerDownRef");
+    expect(appSource).toContain("editorSelectionPendingAfterPointerUpRef");
+    expect(appSource).toContain('"pointerup"');
+    expect(appSource).toContain('"pointercancel"');
+    expect(appSource).toContain("createAgentSelectionContext");
+    expect(appSource).toContain("activeAgentSelectionContext");
+    expect(appSource).toContain("selectionContext");
+    expect(appSource).toContain("getSelectionAgentDefaultPrompt");
     expect(appSource).toContain(
-      'inlineSelectionPrompt.action === "explain" ? "suggest" : "apply-with-review"'
+      'const effectiveAgentMode = action === "explain" ? "suggest" : agentMode;'
+    );
+    expect(appSource).toContain(
+      'formatAgentModeLabel(action === "explain" ? "suggest" : mode)'
     );
     expect(appSource).toContain("selectedText");
     expect(appSource).toContain("createDiagnosticAgentPrompt");
@@ -109,6 +138,11 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("parseNoProjectAgentCommand");
     expect(appSource).toContain("runNoProjectAgentCommand");
     expect(appSource).toContain("desktopApi.lifecycle.createFromTemplate");
+    expect(appSource).toContain("parseExternalTemplateAgentCommand");
+    expect(appSource).toContain("runExternalTemplateAgentCommand");
+    expect(appSource).toContain("desktopApi.lifecycle.createFromExternalTemplate");
+    expect(appSource).toContain("ieee-systems-journal-template");
+    expect(appSource).toContain("Created **${result.project.displayName}**");
     expect(appSource).toContain("Creating project");
     expect(appSource).toContain(
       "Open or create a project before project-scoped agent work."
@@ -116,6 +150,9 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("create a new project and name it front-postdoc");
     expect(appSource).toContain("formatElapsedTime");
     expect(appSource).toContain("RevealedAgentRichText");
+    expect(appSource).toContain("parseMarkdownCodeFence");
+    expect(appSource).toContain('type: "code-block"');
+    expect(appSource).toContain("agent-rich-code-block");
     expect(appSource).toContain("setVisibleTokenCount");
     expect(appSource).toContain("content.match(/\\S+\\s*|\\s+/gu)");
     expect(appSource).not.toContain("scheduleBackgroundUpdate");
@@ -132,8 +169,45 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("mergeAgentThreadEvents");
     expect(appSource).toContain("buildAgentCompletionSummaryEvent(result)");
     expect(appSource).toContain("I compiled the project.");
-    expect(appSource).toContain("createTransientAgentMessage");
-    expect(appSource).toContain("agent-progress-message");
+    expect(appSource).not.toContain(
+      "I inspected the scoped project context and answered without changing files."
+    );
+    expect(appSource).not.toContain(
+      "I completed the request without changing project files."
+    );
+    expect(appSource).toContain("AgentRunLiveStatus");
+    expect(appSource).toContain("createAgentToolLiveStatus");
+    expect(appSource).toContain("createAgentRunLiveStatus");
+    expect(appSource).toContain("createStartingAgentLiveStatus");
+    expect(appSource).toContain("createAwaitingApprovalLiveStatus");
+    expect(appSource).toContain("Understanding request");
+    expect(appSource).toContain("Network approval required");
+    expect(appSource).toContain("Searching official sources");
+    expect(appSource).toContain("Verifying source");
+    expect(appSource).toContain("Inspecting template");
+    expect(appSource).toContain("Comparing with project");
+    expect(appSource).toContain("Preparing recommendation");
+    expect(appSource).toContain("Final response");
+    expect(appSource).toContain("isExternalResearchPrompt");
+    expect(appSource).toContain("getRequestedApprovalToolName");
+    expect(appSource).toContain("Web access is required");
+    expect(appSource).toContain("Analyzing project");
+    expect(appSource).toContain("Reading project file");
+    expect(appSource).not.toContain(
+      "`${formatAgentToolName(event.toolName)} ${event.status}`"
+    );
+    expect(appSource).toContain("compactAgentWorkflowEvents");
+    expect(appSource).toContain("getLatestAssistantRunItemKey");
+    expect(appSource).toContain('items[index + 1]?.type === "assistant-run"');
+    expect(appSource).toContain("findPreviousUserThreadItem");
+    expect(appSource).toContain("findNextUserThreadItem");
+    expect(appSource).toContain("isAgentEventInRunWindow");
+    expect(appSource).not.toContain(
+      "getAgentRunWorkflowEvents(events, item.sessionId)"
+    );
+    expect(appSource).toContain('return event.type === "tool-call";');
+    expect(appSource).not.toContain("createTransientAgentMessage");
+    expect(appSource).not.toContain("agent-progress-message");
     expect(appSource).not.toContain("agent-activity-feed");
     expect(appSource).toContain("isOperationalAgentStatusMessage");
     expect(appSource).not.toContain("Atlas is preparing your request context");
@@ -161,7 +235,10 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("Rollback failed:");
     expect(appSource).toContain('"apply" ? "Agent patch" : "Rollback"');
     expect(appSource).toContain("compileAfterPatch");
-    expect(appSource).toContain("Autonomous local");
+    expect(appSource).toContain("Ask only");
+    expect(appSource).toContain("Review changes first");
+    expect(appSource).toContain("Auto-apply local changes");
+    expect(appSource).toContain("Auto-apply local changes is advanced");
     expect(appSource).toContain("prompt.trim().length > 0");
     expect(appSource).toContain("!event.shiftKey");
   }, 20_000);

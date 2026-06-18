@@ -17,11 +17,19 @@ describe("renderer accessibility hardening", () => {
 
   it("keeps icon buttons labelled and major regions named", async () => {
     const appSource = await readFile(join(rendererDir, "App.tsx"), "utf8");
+    const iconButtonSource = await readFile(
+      join(rendererDir, "components", "IconButton.tsx"),
+      "utf8"
+    );
+    const pdfPaneSource = await readFile(
+      join(rendererDir, "components", "PdfPane.tsx"),
+      "utf8"
+    );
 
-    expect(appSource).toContain("aria-label={label}");
+    expect(iconButtonSource).toContain("aria-label={label}");
     expect(appSource).toContain('aria-label="Project files"');
     expect(appSource).toContain('aria-label="Source editor"');
-    expect(appSource).toContain('aria-label="PDF preview"');
+    expect(pdfPaneSource).toContain('aria-label="PDF preview"');
     expect(appSource).toContain('aria-label="AI agent"');
     expect(appSource).toContain('aria-label="Bottom panel"');
   });

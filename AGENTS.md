@@ -1,31 +1,16 @@
 <claude-mem-context>
 # Memory Context
 
-# [overleaf-clone] recent context, 2026-06-15 1:28pm EDT
+# [overleaf-clone] recent context, 2026-06-17 8:39pm EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 50 obs (19,451t read) | 990,373t work | 98% savings
+Stats: 50 obs (19,893t read) | 1,211,380t work | 98% savings
 
 ### Jun 11, 2026
-7518 12:59p 🔵 Codex Provider Architecture and Agent Host IPC Contracts Mapped
-7519 " 🔵 createFileBackedAgentBroker and HistoryStore Integration Pattern Confirmed
-7521 " 🔵 project-service Public API Surface Mapped for Test Runner
-7523 " 🟣 Real Codex Agent Test Runner Script Created
-7524 1:02p 🔴 Case 01 Initial Compile Expectation Corrected to "succeeded"
-7525 " 🔵 First Real Codex Test Run: Two Initial Compile Expectation Mismatches Found
-7526 " 🔴 Both Compile Expectation Mismatches Fixed After Real Test Run Evidence
-7527 " 🔴 Compile Expectation Patch Matched Wrong Cases — Case 02 Accidentally Swapped
-7529 " 🔵 Third Run: Cases 01, 02, 03 All PASS — Compile Expectations Now Correct
-7528 1:03p 🔴 Compile Expectations for Cases 02 and 04 Correctly Fixed Using ID Anchors
-7530 1:04p 🟣 All 5 Real Codex Agent Test Cases Pass — Full Suite Green
-7531 " 🔵 Codex Agent Patch Content Verified — All Four Edit Cases Produced Minimal Correct Diffs
-7532 1:05p ✅ Real Codex Agent QA Session Completed — All Artifacts Untracked, AGENTS.md Updated
-7542 2:46p 🔵 Workbench Layout System Mapped — Default Widths May Clip Agent Panel
-7543 " 🔵 content-row Grid Structure Requires ~1472px Total to Show All Panes at Defaults
-7544 " 🔵 Layout Load Effect Does Not Call constrainLayoutToContentWidth — Root Cause Confirmed
+7544 2:46p 🔵 Layout Load Effect Does Not Call constrainLayoutToContentWidth — Root Cause Confirmed
 7545 2:47p 🔴 Default Agent Panel Width Increased and Minimum Raised to Fix Agent Panel Clipping
 7546 " 🔴 useLayoutEffect Added to Constrain Layout After Load and on Window Resize
 7547 2:48p ✅ Dev Server Restarted on Port 5174 to Apply Layout Fix
@@ -62,8 +47,24 @@ Stats: 50 obs (19,451t read) | 990,373t work | 98% savings
 7830 " 🟣 Agent Build Results Update PDF Preview After Successful Compile
 7832 " ⚖️ Cloud-Based Project Sharing Identified as Required Feature
 7831 11:16p ✅ References Removal Verified: TypeCheck and Render Tests Pass
+### Jun 15, 2026
+8016 7:16p 🔵 PDF Preview is a shared pane within the single main BrowserWindow, not a separate window
+8017 7:18p 🔵 Workbench pane layout is a persisted, resizable CSS-variable system with defined pixel constraints
+8019 " 🔵 Bug reported: PDF preview pane visually cuts into and obscures the source editor content
+8020 " 🔵 constrainLayoutToContentWidth has no unit test and has a timing gap before IPC layout loads
+8018 7:19p 🔵 PDF/agent pane resize is content-width-aware and keyboard-accessible with pointer capture
+8022 7:20p 🔴 constrainWorkbenchLayoutToContentWidth extracted to layout.ts and editor minimum width raised from 320px to 520px
+8021 7:21p 🟣 Agent provider setup UI redesigned with step-by-step Terminal install/login flow
+8023 7:22p 🔄 App.tsx constrainLayoutToContentWidth simplified to delegate to extracted pure function; new unit test added
+8024 " 🔵 PDF pane overlap fix verified: 6/6 tests pass, TypeScript compiles clean, Prettier passes
+8025 " 🔵 Production build succeeds with layout fix: tsc + Vite renderer bundle built clean in 381ms
+8026 " 🔵 Full working tree diff scope: 10 modified files spanning IPC contracts, main process, renderer, and styles
+8027 " 🔵 ZeroLeaf dev server and Electron app confirmed not running before test launch
+8028 " 🔵 Dev server launch via nohup silently failed — process 92332 exited immediately with empty log
+8030 7:53p 🔵 Dev server launched successfully interactively — Vite renderer at http://127.0.0.1:5173/ after tsc -b compiled main process
+8031 7:54p 🔵 ZeroLeaf dev app fully running: dev.mjs, Electron main, renderer, agent-host subprocess all active with Vite on :5173
 
-Access 990k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 1211k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>
 
 # Project Guidance

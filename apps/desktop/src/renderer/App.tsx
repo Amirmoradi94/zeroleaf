@@ -26,7 +26,10 @@ import type {
   AgentEvent,
   AgentMode,
   AgentProviderId,
+  AgentSelectionContext,
+  AgentProviderSetupAction,
   AgentSessionResult,
+  AgentToolCallEvent,
   AgentToolName,
   AppInfo,
   AppSettings,
@@ -34,6 +37,7 @@ import type {
   BuildResult,
   AuditEvent,
   CitationOccurrence,
+  ExternalProjectTemplateId,
   HistoryChangeSet,
   LatexCompiler,
   LatexDiagnostic,
@@ -64,7 +68,6 @@ import {
   FolderPlus,
   FolderOpen,
   MessageSquareText,
-  PanelRight,
   Pencil,
   Plus,
   Play,
@@ -85,8 +88,11 @@ import {
   type CommandDefinition,
   type CommandId
 } from "./commands.js";
+import { IconButton } from "./components/IconButton.js";
+import { PdfPane } from "./components/PdfPane.js";
 import { desktopApi } from "./desktopApi.js";
 import zeroleafMarkUrl from "./assets/zeroleaf-mark.png";
+import { formatPdfStaleReason, type PdfStaleReason } from "./pdfPreviewModel.js";
 import {
   buildProjectLatexOutline,
   clearLatexCompletionProject,
@@ -94,6 +100,7 @@ import {
   createDiagnosticAgentPrompt,
   createFinalFormattingReviewPrompt,
   createNumberingMismatchAgentPrompt,
+  createSelectionContextFromText,
   createLatexCompletionState,
   createReferenceEntryAgentPrompt,
   getEditableProjectFiles,
@@ -117,8 +124,8 @@ import {
 } from "./editorModel.js";
 import {
   initialWorkbenchLayout,
-  paneConstraints,
   clampPaneSizes,
+  constrainWorkbenchLayoutToContentWidth,
   resizeWorkbenchPane,
   type ResizeTarget
 } from "./layout.js";
@@ -148,6 +155,8 @@ type BottomTab =
   | "Log"
   | "Output";
 type SidebarTab = "files" | "search" | "templates";
+
+const INLINE_SELECTION_PROMPT_AUTO_OPEN_DELAY_MS = 450;
 type AgentAuthStatusByProvider = Readonly<Record<AgentProviderId, AgentAuthStatus>>;
 type SelectionAgentAction =
   | "explain"
@@ -165,6 +174,11 @@ type NoProjectAgentCommand = {
   readonly projectName: string;
   readonly templateId: ProjectTemplateId;
 };
+type ExternalTemplateAgentCommand = {
+  readonly kind: "create-external-template-project";
+  readonly projectName: string;
+  readonly templateId: ExternalProjectTemplateId;
+};
 type AgentEventTone = "neutral" | "running" | "success" | "warning" | "danger";
 type AgentThreadItem =
   | {
@@ -181,6 +195,11 @@ type AgentRichTextBlock =
   | {
       readonly type: "paragraph";
       readonly lines: readonly string[];
+    }
+  | {
+      readonly type: "code-block";
+      readonly code: string;
+      readonly language: string | null;
     }
   | {
       readonly type: "ordered-list";
@@ -201,6 +220,7 @@ type InlineSelectionPromptState = {
   readonly left: number;
   readonly open: boolean;
   readonly prompt: string;
+  readonly selectionContext: AgentSelectionContext | null;
   readonly selectedText: string;
   readonly top: number;
 };
@@ -235,7 +255,6 @@ type PdfSearchMatch = {
   readonly matchIndex: number;
 };
 
-type PdfStaleReason = "unsaved" | "saved" | "external";
 type ChangeSetVerificationStatus =
   | "pending"
   | "running"
@@ -285,6 +304,7 @@ export function App() {
   );
   const [selectedTemplateId, setSelectedTemplateId] =
     useState<ProjectTemplateId>("article");
+  const [templateProjectName, setTemplateProjectName] = useState("article");
   const [submissionCheckResult, setSubmissionCheckResult] =
     useState<SubmissionCheckResult | null>(null);
   const [toolchainStatus, setToolchainStatus] = useState<LatexToolchainStatus | null>(
@@ -347,12 +367,15 @@ export function App() {
   );
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentSelectedText, setAgentSelectedText] = useState<string | null>(null);
+  const [activeAgentSelectionContext, setActiveAgentSelectionContext] =
+    useState<AgentSelectionContext | null>(null);
   const [inlineSelectionPrompt, setInlineSelectionPrompt] =
     useState<InlineSelectionPromptState>({
       action: "rewrite",
       left: 0,
       open: false,
       prompt: "",
+      selectionContext: null,
       selectedText: "",
       top: 0
     });
@@ -375,11 +398,17 @@ export function App() {
   const editorLayoutRafRef = useRef<ReturnType<typeof requestAnimationFrame> | null>(
     null
   );
+  const editorResizeObserverRef = useRef<ResizeObserver | null>(null);
   const contentRowRef = useRef<HTMLElement | null>(null);
   const editorRef = useRef<MonacoStandaloneEditor | null>(null);
   const pdfCanvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map());
   const pdfDocumentRef = useRef<PDFDocumentProxy | null>(null);
   const selectionChangeSubscriptionRef = useRef<{ dispose: () => void } | null>(null);
+  const editorSelectionPointerListenersRef = useRef<{ dispose: () => void } | null>(
+    null
+  );
+  const editorSelectionPointerDownRef = useRef(false);
+  const editorSelectionPendingAfterPointerUpRef = useRef(false);
   const selectionPromptOpenTimeoutRef = useRef<
     number | ReturnType<typeof setTimeout> | null
   >(null);
@@ -391,9 +420,9 @@ export function App() {
     }
 
     editorLayoutRafRef.current = window.requestAnimationFrame(() => {
-      editorRef.current?.layout();
+      layoutMonacoEditorToContainer(editorRef.current);
       editorLayoutRafRef.current = window.requestAnimationFrame(() => {
-        editorRef.current?.layout();
+        layoutMonacoEditorToContainer(editorRef.current);
         editorLayoutRafRef.current = null;
       });
     });
@@ -402,6 +431,8 @@ export function App() {
   useEffect(() => {
     return () => {
       selectionChangeSubscriptionRef.current?.dispose();
+      editorSelectionPointerListenersRef.current?.dispose();
+      editorSelectionPointerListenersRef.current = null;
       if (selectionPromptOpenTimeoutRef.current !== null) {
         window.clearTimeout(selectionPromptOpenTimeoutRef.current);
         selectionPromptOpenTimeoutRef.current = null;
@@ -414,6 +445,8 @@ export function App() {
         window.cancelAnimationFrame(editorLayoutRafRef.current);
         editorLayoutRafRef.current = null;
       }
+      editorResizeObserverRef.current?.disconnect();
+      editorResizeObserverRef.current = null;
     };
   }, []);
 
@@ -460,6 +493,29 @@ export function App() {
       )
     );
   }, []);
+
+  const openProviderSetupTerminal = useCallback(
+    async (providerId: AgentProviderId, action: AgentProviderSetupAction) => {
+      try {
+        const result = await desktopApi.agent.openProviderSetupTerminal(
+          providerId,
+          action
+        );
+        setStatusMessage(
+          `Opened Terminal for ${getAgentProviderLabel(providerId)} ${action}.`
+        );
+
+        if (result.action === "login") {
+          window.setTimeout(() => {
+            void refreshAgentAuthStatuses();
+          }, 1000);
+        }
+      } catch (error) {
+        setStatusMessage(getErrorMessage(error));
+      }
+    },
+    [refreshAgentAuthStatuses]
+  );
 
   const refreshToolchainStatus = useCallback(async () => {
     const status = await desktopApi.build.detectToolchain();
@@ -587,6 +643,7 @@ export function App() {
     setAgentSessionId(null);
     setAgentSessionProjectRoot(null);
     setAgentSessionProviderId(null);
+    setActiveAgentSelectionContext(null);
     setStatusMessage("Agent transcript cleared.");
   }, []);
 
@@ -756,6 +813,7 @@ export function App() {
     setHistoryMessage("No history action yet.");
     setAgentEvents([]);
     setAgentSelectedText(null);
+    setActiveAgentSelectionContext(null);
     setAgentSessionId(null);
     setAgentSessionProjectRoot(null);
     setAgentSessionProviderId(null);
@@ -838,6 +896,7 @@ export function App() {
       if (projectChanged) {
         setAgentEvents([]);
         setAgentSelectedText(null);
+        setActiveAgentSelectionContext(null);
         setAgentSessionId(null);
         setAgentSessionProjectRoot(null);
         setAgentSessionProviderId(null);
@@ -983,27 +1042,49 @@ export function App() {
 
   const createProjectFromSelectedTemplate = useCallback(() => {
     void runProjectOperation(async () => {
-      const template =
-        projectTemplates.find((candidate) => candidate.id === selectedTemplateId) ??
-        projectTemplates[0];
-      const fallbackName =
-        template?.name.toLowerCase().replace(/\s+/gu, "-") ?? "paper";
-      const projectName = window.prompt("Project name", fallbackName);
+      const projectName = templateProjectName.trim();
 
-      if (projectName === null || projectName.trim().length === 0) {
+      if (projectName.length === 0) {
+        setStatusMessage("Enter a project name before creating a template project.");
         return;
       }
 
       const result = await desktopApi.lifecycle.createFromTemplate({
         templateId: selectedTemplateId,
-        projectName: projectName.trim()
+        projectName
       });
       if (result !== undefined) {
         await applyProjectResult(result, result.project.mainFilePath);
         setStatusMessage(`Created ${result.project.displayName}`);
       }
     });
-  }, [applyProjectResult, projectTemplates, runProjectOperation, selectedTemplateId]);
+  }, [
+    applyProjectResult,
+    runProjectOperation,
+    selectedTemplateId,
+    templateProjectName
+  ]);
+
+  const changeSelectedTemplate = useCallback(
+    (templateId: ProjectTemplateId) => {
+      const currentDefaultName = getDefaultProjectNameForTemplate(
+        projectTemplates,
+        selectedTemplateId
+      );
+      const nextDefaultName = getDefaultProjectNameForTemplate(
+        projectTemplates,
+        templateId
+      );
+
+      setSelectedTemplateId(templateId);
+      setTemplateProjectName((currentName) =>
+        currentName.trim().length === 0 || currentName === currentDefaultName
+          ? nextDefaultName
+          : currentName
+      );
+    },
+    [projectTemplates, selectedTemplateId]
+  );
 
   const runNoProjectAgentCommand = useCallback(
     async (prompt: string, command: NoProjectAgentCommand) => {
@@ -1090,6 +1171,103 @@ export function App() {
     [applyProjectResult, projectTemplates]
   );
 
+  const runExternalTemplateAgentCommand = useCallback(
+    async (prompt: string, command: ExternalTemplateAgentCommand) => {
+      const sessionId = `agent-session-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+      const userEvent = buildAgentMessageEvent({
+        content: prompt,
+        role: "user",
+        sessionId
+      });
+
+      setAgentRunning(true);
+      setAgentEvents((events) => mergeAgentThreadEvents([...events, userEvent]));
+      setAgentLiveStatus({
+        detail:
+          "Preparing the project name, template source, and destination workflow.",
+        title: "Understanding request",
+        tone: "running"
+      });
+      setStatusMessage(`Creating ${command.projectName} from external template...`);
+
+      try {
+        setAgentLiveStatus({
+          detail:
+            "Fetching the IEEEtran journal skeleton from the official CTAN mirror redirect.",
+          title: "Searching official sources",
+          tone: "running"
+        });
+        const result = await desktopApi.lifecycle.createFromExternalTemplate({
+          projectName: command.projectName,
+          templateId: command.templateId
+        });
+
+        if (result === undefined) {
+          const assistantEvent = buildAgentMessageEvent({
+            content: "Project creation was cancelled. No project was created.",
+            role: "assistant",
+            sessionId
+          });
+          setAgentEvents((events) =>
+            mergeAgentThreadEvents([...events, assistantEvent])
+          );
+          setAgentLiveStatus({
+            detail: "No destination folder was selected.",
+            title: "Project creation cancelled",
+            tone: "warning"
+          });
+          setStatusMessage("Project creation cancelled.");
+          return;
+        }
+
+        setAgentLiveStatus({
+          detail:
+            "Opening the new project and selecting the generated IEEE-style main file.",
+          title: "Comparing with project",
+          tone: "running"
+        });
+        await applyProjectResult(result, result.project.mainFilePath);
+
+        const assistantEvent = buildAgentMessageEvent({
+          content: [
+            `Created **${result.project.displayName}** from the IEEE Systems Journal template workflow.`,
+            `Opened **${result.project.mainFilePath}** in the project explorer and wrote the fetched IEEEtran journal skeleton into it.`,
+            "Source used: https://mirrors.ctan.org/macros/latex/contrib/IEEEtran/bare_jrnl.tex"
+          ].join("\n\n"),
+          role: "assistant",
+          sessionId
+        });
+        setAgentEvents((events) => mergeAgentThreadEvents([...events, assistantEvent]));
+        setAgentLiveStatus({
+          detail:
+            "The new project is open with the external IEEE template in main.tex.",
+          title: "Final response",
+          tone: "success"
+        });
+        setStatusMessage(`Created ${result.project.displayName}`);
+      } catch (error) {
+        const errorMessage = getErrorMessage(error);
+        const assistantEvent = buildAgentMessageEvent({
+          content: `Could not create **${command.projectName}** from the external template: ${errorMessage}`,
+          role: "assistant",
+          sessionId
+        });
+        setAgentEvents((events) => mergeAgentThreadEvents([...events, assistantEvent]));
+        setAgentLiveStatus({
+          detail: errorMessage,
+          title: "Template project failed",
+          tone: "danger"
+        });
+        setStatusMessage("External template project creation failed.");
+      } finally {
+        setAgentRunning(false);
+      }
+    },
+    [applyProjectResult]
+  );
+
   const exportCurrentPdf = useCallback(() => {
     void runProjectOperation(async () => {
       if (currentProject === undefined || pdfArtifactData === null) {
@@ -1152,6 +1330,8 @@ export function App() {
       )
     );
     setAgentMode("suggest");
+    setAgentSelectedText(null);
+    setActiveAgentSelectionContext(null);
     setActiveBottomTab("Output");
     agentComposerRef.current?.focus();
   }, [buildResult, referenceAnalysis, submissionCheckResult]);
@@ -1159,6 +1339,8 @@ export function App() {
   const askAgentForFigureNumberingMismatch = useCallback(() => {
     setAgentPrompt(createNumberingMismatchAgentPrompt());
     setAgentMode("suggest");
+    setAgentSelectedText(null);
+    setActiveAgentSelectionContext(null);
     setActiveBottomTab("Output");
     agentComposerRef.current?.focus();
   }, []);
@@ -1847,6 +2029,7 @@ export function App() {
     (options?: {
       readonly prompt?: string;
       readonly selectedText?: string;
+      readonly selectionContext?: AgentSelectionContext;
       readonly diagnostic?: LatexDiagnostic;
       readonly activeFilePath?: string;
       readonly mode?: AgentMode;
@@ -1859,6 +2042,19 @@ export function App() {
 
         if (prompt.length === 0) {
           setStatusMessage("Enter an agent prompt first.");
+          return;
+        }
+
+        const externalTemplateCommand = parseExternalTemplateAgentCommand(
+          prompt,
+          agentEvents
+        );
+
+        if (externalTemplateCommand !== undefined) {
+          await runExternalTemplateAgentCommand(prompt, externalTemplateCommand);
+          if (options?.prompt === undefined) {
+            setAgentPrompt("");
+          }
           return;
         }
 
@@ -1905,15 +2101,26 @@ export function App() {
           return;
         }
 
-        const selectedText = options?.selectedText ?? agentSelectedText ?? undefined;
-        const effectiveAgentMode = options?.mode ?? agentMode;
-
         const continuationSessionId =
           agentSessionId !== null &&
           agentSessionProjectRoot === currentProject.rootPath &&
           agentSessionProviderId === agentProviderId
             ? agentSessionId
             : undefined;
+        const continuedSelectionContext =
+          continuationSessionId === undefined ||
+          options?.selectedText !== undefined ||
+          options?.diagnostic !== undefined ||
+          options?.activeFilePath !== undefined
+            ? undefined
+            : (activeAgentSelectionContext ?? undefined);
+        const selectionContext = options?.selectionContext ?? continuedSelectionContext;
+        const selectedText =
+          selectionContext?.selectedText ??
+          options?.selectedText ??
+          agentSelectedText ??
+          undefined;
+        const effectiveAgentMode = options?.mode ?? agentMode;
         const authStatus = agentAuthStatuses[agentProviderId];
         const providerLabel = getAgentProviderLabel(agentProviderId);
         const requestSessionId =
@@ -1939,11 +2146,10 @@ export function App() {
         }
 
         setAgentRunning(true);
-        setAgentLiveStatus({
-          detail: "Preparing scoped project context and safety policy.",
-          title: `${providerLabel} is starting`,
-          tone: "running"
-        });
+        setAgentLiveStatus(createStartingAgentLiveStatus(prompt, providerLabel));
+        if (selectionContext !== undefined) {
+          setActiveAgentSelectionContext(selectionContext);
+        }
         setAgentEvents((events) => [...events, buildUserEvent(prompt)]);
         if (options?.prompt === undefined) {
           setAgentPrompt("");
@@ -1965,6 +2171,7 @@ export function App() {
               ? {}
               : { activeFilePath: options.activeFilePath }),
             ...(selectedText === undefined ? {} : { selectedText }),
+            ...(selectionContext === undefined ? {} : { selectionContext }),
             ...(currentProject.mainFilePath === undefined
               ? {}
               : { mainFilePath: currentProject.mainFilePath }),
@@ -2068,12 +2275,19 @@ export function App() {
             }
           }
 
+          const approvalToolName = getRequestedApprovalToolName(result.events);
           setStatusMessage(
             result.status === "failed"
               ? `${providerLabel} could not complete the task.`
-              : result.status === "awaiting-approval"
-                ? `${providerLabel} is waiting for patch approval.`
-                : `${providerLabel} completed.`
+              : result.status === "awaiting-approval" &&
+                  approvalToolName === "network-fetch"
+                ? `${providerLabel} is waiting for web access approval.`
+                : result.status === "awaiting-approval" &&
+                    approvalToolName === "delete-entry"
+                  ? `${providerLabel} is waiting for delete approval.`
+                  : result.status === "awaiting-approval"
+                    ? `${providerLabel} is waiting for patch approval.`
+                    : `${providerLabel} completed.`
           );
           setAgentLiveStatus(
             result.status === "failed"
@@ -2083,18 +2297,17 @@ export function App() {
                   tone: "danger"
                 }
               : result.status === "awaiting-approval"
-                ? {
-                    detail:
-                      "Review the patch in History, then allow or deny the requested action.",
-                    title: "Waiting for patch review",
-                    tone: "warning"
-                  }
+                ? createAwaitingApprovalLiveStatus(approvalToolName)
                 : {
                     detail:
                       proposedChangeSet === undefined
                         ? "The response is ready in the transcript."
                         : "A reviewable patch is ready in History.",
-                    title: `${providerLabel} completed`,
+                    title:
+                      isExternalResearchPrompt(prompt) &&
+                      proposedChangeSet === undefined
+                        ? "Final response"
+                        : `${providerLabel} completed`,
                     tone: "success"
                   }
           );
@@ -2142,6 +2355,7 @@ export function App() {
     [
       activeFile,
       agentAuthStatuses,
+      agentEvents,
       agentMode,
       agentPrompt,
       agentProviderId,
@@ -2149,11 +2363,13 @@ export function App() {
       agentSessionProjectRoot,
       agentSessionProviderId,
       agentSelectedText,
+      activeAgentSelectionContext,
       currentProject,
       pdfArtifactData,
       pdfStale,
       refreshHistory,
       runProjectOperation,
+      runExternalTemplateAgentCommand,
       runNoProjectAgentCommand,
       selectedCompiler
     ]
@@ -2163,6 +2379,7 @@ export function App() {
     (diagnostic: LatexDiagnostic) => {
       setAgentMode("apply-with-review");
       setAgentSelectedText(null);
+      setActiveAgentSelectionContext(null);
       startAgentTask({
         prompt: createDiagnosticAgentPrompt(diagnostic, buildResult),
         diagnostic,
@@ -2247,10 +2464,14 @@ export function App() {
     (action?: SelectionAgentAction, options?: { readonly silent: boolean }) => {
       const editor = editorRef.current;
       const selection = editor?.getSelection();
-      const selectedText =
-        editor?.getModel() !== null && selection !== undefined && selection !== null
-          ? editor?.getModel()?.getValueInRange(selection)
-          : undefined;
+      const selectionContext =
+        editor !== null &&
+        editor !== undefined &&
+        selection !== null &&
+        selection !== undefined
+          ? createAgentSelectionContext(editor, selection)
+          : null;
+      const selectedText = selectionContext?.selectedText;
       const hasSelection = selectedText !== undefined && selectedText.trim().length > 0;
       const nextAction = action ?? (agentMode === "suggest" ? "explain" : "rewrite");
 
@@ -2289,6 +2510,7 @@ export function App() {
         left: promptPosition.left,
         open: true,
         prompt: "",
+        selectionContext,
         selectedText,
         top: promptPosition.top
       });
@@ -2298,6 +2520,27 @@ export function App() {
     },
     [agentMode, closeInlineSelectionPrompt, getInlineSelectionPromptPosition]
   );
+
+  const clearSelectionPromptAutoOpenTimer = useCallback(() => {
+    if (selectionPromptOpenTimeoutRef.current !== null) {
+      window.clearTimeout(selectionPromptOpenTimeoutRef.current);
+      selectionPromptOpenTimeoutRef.current = null;
+    }
+  }, []);
+
+  const scheduleSelectionPromptAutoOpen = useCallback(() => {
+    clearSelectionPromptAutoOpenTimer();
+    selectionPromptOpenTimeoutRef.current = window.setTimeout(() => {
+      selectionPromptOpenTimeoutRef.current = null;
+
+      if (editorSelectionPointerDownRef.current) {
+        editorSelectionPendingAfterPointerUpRef.current = true;
+        return;
+      }
+
+      openInlineSelectionPrompt(undefined, { silent: true });
+    }, INLINE_SELECTION_PROMPT_AUTO_OPEN_DELAY_MS);
+  }, [clearSelectionPromptAutoOpenTimer, openInlineSelectionPrompt]);
 
   const updateInlineSelectionPromptPosition = useCallback(() => {
     const promptPosition = getInlineSelectionPromptPosition();
@@ -2378,62 +2621,93 @@ export function App() {
     };
   }, [inlineSelectionPrompt.open, queueInlineSelectionPromptPositionUpdate]);
 
-  const handleSelectionPromptAction = useCallback(
-    (nextAction: SelectionAgentAction) => {
-      setInlineSelectionPrompt((promptState) =>
-        promptState.open
-          ? {
-              ...promptState,
-              action: nextAction
-            }
-          : promptState
-      );
+  const runInlineSelectionPrompt = useCallback(
+    (actionOverride?: SelectionAgentAction) => {
+      const action = actionOverride ?? inlineSelectionPrompt.action;
+      const prompt =
+        inlineSelectionPrompt.prompt.trim() || getSelectionAgentDefaultPrompt(action);
+      const selectedText =
+        inlineSelectionPrompt.selectionContext?.selectedText ??
+        inlineSelectionPrompt.selectedText;
+
+      if (selectedText.trim().length === 0) {
+        setStatusMessage(
+          "Select text in the editor before sending a selection request."
+        );
+        return;
+      }
+
+      if (prompt.length === 0) {
+        setStatusMessage("Enter an agent prompt first.");
+        return;
+      }
+
+      const effectiveAgentMode = action === "explain" ? "suggest" : agentMode;
+
+      setInlineSelectionPrompt((promptState) => ({
+        ...promptState,
+        action,
+        open: false
+      }));
+      startAgentTask({
+        mode: effectiveAgentMode,
+        prompt,
+        selectedText,
+        ...(inlineSelectionPrompt.selectionContext === null
+          ? {}
+          : { selectionContext: inlineSelectionPrompt.selectionContext })
+      });
     },
-    []
+    [
+      inlineSelectionPrompt.action,
+      inlineSelectionPrompt.prompt,
+      inlineSelectionPrompt.selectionContext,
+      inlineSelectionPrompt.selectedText,
+      agentMode,
+      startAgentTask
+    ]
   );
 
-  const runInlineSelectionPrompt = useCallback(() => {
-    const prompt = inlineSelectionPrompt.prompt.trim();
-    const selectedText = inlineSelectionPrompt.selectedText;
-
-    if (selectedText.trim().length === 0) {
-      setStatusMessage("Select text in the editor before sending a selection request.");
-      return;
-    }
-
-    if (prompt.length === 0) {
-      setStatusMessage("Enter an agent prompt first.");
-      return;
-    }
-
-    const effectiveAgentMode =
-      inlineSelectionPrompt.action === "explain" ? "suggest" : "apply-with-review";
-
-    setInlineSelectionPrompt((promptState) => ({
-      ...promptState,
-      open: false
-    }));
-    startAgentTask({
-      mode: effectiveAgentMode,
-      prompt,
-      selectedText
-    });
-  }, [
-    inlineSelectionPrompt.action,
-    inlineSelectionPrompt.prompt,
-    inlineSelectionPrompt.selectedText,
-    startAgentTask
-  ]);
+  const submitSelectionPromptAction = useCallback(
+    (nextAction: SelectionAgentAction) => {
+      runInlineSelectionPrompt(nextAction);
+    },
+    [runInlineSelectionPrompt]
+  );
 
   const respondAgentApproval = useCallback(
-    (sessionId: string, approvalId: string, decision: "allowed" | "denied") => {
+    (
+      sessionId: string,
+      approvalId: string,
+      toolName: AgentToolName,
+      decision: "allowed" | "denied"
+    ) => {
       void runProjectOperation(async () => {
         setAgentLiveStatus({
           detail:
-            decision === "allowed"
-              ? "Applying the reviewed patch and waiting for compile verification."
-              : "Recording the denial without changing project files.",
-          title: decision === "allowed" ? "Approval accepted" : "Approval denied",
+            toolName === "network-fetch"
+              ? decision === "allowed"
+                ? "Checking whether the approved web request can run in this local-first build."
+                : "Continuing without external sources; no network request will be made."
+              : toolName === "delete-entry"
+                ? decision === "allowed"
+                  ? "Deleting the approved project entry and refreshing the file tree."
+                  : "Recording the denial without deleting project files."
+                : decision === "allowed"
+                  ? "Applying the reviewed patch and waiting for compile verification."
+                  : "Recording the denial without changing project files.",
+          title:
+            toolName === "network-fetch"
+              ? decision === "allowed"
+                ? "Web access approved"
+                : "Web access denied"
+              : toolName === "delete-entry"
+                ? decision === "allowed"
+                  ? "Delete approved"
+                  : "Delete denied"
+                : decision === "allowed"
+                  ? "Approval accepted"
+                  : "Approval denied",
           tone: decision === "allowed" ? "running" : "warning"
         });
         const result = await desktopApi.agent.respondApproval({
@@ -2542,18 +2816,68 @@ export function App() {
           }
         }
 
+        if (
+          decision === "allowed" &&
+          currentProject !== undefined &&
+          (result.deleteEntries?.length ?? 0) > 0
+        ) {
+          const refreshedProject = await desktopApi.project.refresh(
+            currentProject.rootPath
+          );
+          setProjectResult(refreshedProject);
+          setProjectState({ recentProjects: refreshedProject.recentProjects });
+          const deletedPaths = new Set(
+            result.deleteEntries?.map((entry) => entry.path)
+          );
+          setOpenFiles((files) => files.filter((file) => !deletedPaths.has(file.path)));
+          setActiveFilePath((path) =>
+            path !== null && deletedPaths.has(path) ? null : path
+          );
+          setSelectedProjectEntryPath((path) =>
+            path !== null && deletedPaths.has(path) ? null : path
+          );
+        }
+
         await refreshHistory();
+        const resultApprovalToolName = getResolvedApprovalToolName(result.events);
         setStatusMessage(
-          decision === "allowed"
-            ? "Agent patch applied and verified."
-            : "Agent approval denied."
+          resultApprovalToolName === "network-fetch"
+            ? decision === "allowed"
+              ? "Web access approval handled."
+              : "Web access denied."
+            : resultApprovalToolName === "delete-entry"
+              ? decision === "allowed"
+                ? "Agent delete completed."
+                : "Agent delete denied."
+              : decision === "allowed"
+                ? "Agent patch applied and verified."
+                : "Agent approval denied."
         );
         setAgentLiveStatus({
           detail:
-            decision === "allowed"
-              ? "Patch handling finished; check History for verification details."
-              : "No files were changed.",
-          title: decision === "allowed" ? "Patch review complete" : "Patch denied",
+            resultApprovalToolName === "network-fetch"
+              ? decision === "allowed"
+                ? "This build cannot fetch external web sources yet. Paste the source material for a local-only follow-up."
+                : "No external request was made. Paste source material if you want a local-only follow-up."
+              : resultApprovalToolName === "delete-entry"
+                ? decision === "allowed"
+                  ? "The approved project entry was deleted and the file tree was refreshed."
+                  : "No project files were deleted."
+                : decision === "allowed"
+                  ? "Patch handling finished; check History for verification details."
+                  : "No files were changed.",
+          title:
+            resultApprovalToolName === "network-fetch"
+              ? decision === "allowed"
+                ? "Network fetch unavailable"
+                : "Network request skipped"
+              : resultApprovalToolName === "delete-entry"
+                ? decision === "allowed"
+                  ? "Delete complete"
+                  : "Delete denied"
+                : decision === "allowed"
+                  ? "Patch review complete"
+                  : "Patch denied",
           tone: decision === "allowed" ? "success" : "warning"
         });
       });
@@ -2688,14 +3012,6 @@ export function App() {
     },
     [currentProject, runProjectOperation]
   );
-
-  const setActiveFileAsMain = useCallback(() => {
-    if (activeFile === null) {
-      return;
-    }
-
-    setProjectMainFile(activeFile.path);
-  }, [activeFile, setProjectMainFile]);
 
   const setTreeFileAsMain = useCallback(
     (path: string) => {
@@ -2949,6 +3265,7 @@ export function App() {
     (filePath: string, hunkContents: string) => {
       setAgentMode("suggest");
       setAgentSelectedText(hunkContents);
+      setActiveAgentSelectionContext(null);
       startAgentTask({
         mode: "suggest",
         activeFilePath: filePath,
@@ -3216,6 +3533,7 @@ export function App() {
       );
       setAgentMode("apply-with-review");
       setAgentSelectedText(null);
+      setActiveAgentSelectionContext(null);
       setActiveBottomTab("References");
       agentComposerRef.current?.focus();
     },
@@ -3226,6 +3544,7 @@ export function App() {
     setAgentMode("suggest");
     setAgentPrompt(createReferenceEntryAgentPrompt(entry));
     setAgentSelectedText(null);
+    setActiveAgentSelectionContext(null);
     setActiveBottomTab("References");
     setReferenceMessage(`Attached ${entry.key} to the agent prompt`);
     agentComposerRef.current?.focus();
@@ -3258,6 +3577,7 @@ export function App() {
     );
     setAgentMode("suggest");
     setAgentSelectedText(null);
+    setActiveAgentSelectionContext(null);
     setActiveBottomTab("References");
     agentComposerRef.current?.focus();
   }, [referenceAnalysis.entries]);
@@ -3506,34 +3826,7 @@ export function App() {
       return clampPaneSizes(nextLayout);
     }
 
-    const clampedLayout = clampPaneSizes(nextLayout);
-    const minEditorWidth = 320;
-    const rowGutterWidth = 12;
-    const availableForSecondaryPanes = Math.max(
-      0,
-      contentWidth - rowGutterWidth - minEditorWidth
-    );
-    const minPdfWidth = paneConstraints.pdfWidth.min;
-    const minAgentWidth = paneConstraints.agentWidth.min;
-
-    const pdfWidth = Math.min(
-      clampedLayout.pdfWidth,
-      Math.max(minPdfWidth, availableForSecondaryPanes - clampedLayout.agentWidth)
-    );
-    const agentWidth = Math.min(
-      clampedLayout.agentWidth,
-      Math.max(minAgentWidth, availableForSecondaryPanes - pdfWidth)
-    );
-    const finalPdfWidth = Math.min(
-      pdfWidth,
-      Math.max(minPdfWidth, availableForSecondaryPanes - agentWidth)
-    );
-
-    return clampPaneSizes({
-      ...clampedLayout,
-      pdfWidth: finalPdfWidth,
-      agentWidth
-    });
+    return constrainWorkbenchLayoutToContentWidth(nextLayout, contentWidth);
   }, []);
 
   useLayoutEffect(() => {
@@ -3767,12 +4060,14 @@ export function App() {
         )}
         {activeSidebarTab === "templates" && (
           <TemplateSidebar
+            projectName={templateProjectName}
             projectTemplates={projectTemplates}
             selectedTemplateId={selectedTemplateId}
             onCreateFromTemplate={createProjectFromSelectedTemplate}
             onImportSourceZip={importSourceZip}
             onOpenProject={openProject}
-            onTemplateChange={setSelectedTemplateId}
+            onProjectNameChange={setTemplateProjectName}
+            onTemplateChange={changeSelectedTemplate}
           />
         )}
         <PaneResizer
@@ -3791,8 +4086,9 @@ export function App() {
             <SelectionPromptPopover
               action={inlineSelectionPrompt.action}
               left={inlineSelectionPrompt.left}
+              mode={agentMode}
               promptRef={inlineSelectionPromptRef}
-              onActionChange={handleSelectionPromptAction}
+              onActionSubmit={submitSelectionPromptAction}
               onClose={closeInlineSelectionPrompt}
               onPromptChange={(prompt) =>
                 setInlineSelectionPrompt((promptState) =>
@@ -3824,25 +4120,71 @@ export function App() {
               mainFilePath={currentProject?.mainFilePath}
               openFiles={openFiles}
               onActiveFileChange={setActiveFilePath}
-              onAskAgent={openInlineSelectionPrompt}
               onCloseFile={closeFile}
               onContentsChange={updateActiveFileContents}
               onFind={() => focusMonacoFind(editorRef.current)}
-              onFormat={() => formatMonacoDocument(editorRef.current)}
               onMount={(editor) => {
                 editorRef.current = editor;
+                editorResizeObserverRef.current?.disconnect();
+                editorResizeObserverRef.current = new ResizeObserver(() => {
+                  scheduleEditorLayout();
+                });
+                editorResizeObserverRef.current.observe(getMonacoLayoutElement(editor));
+                scheduleEditorLayout();
                 installE2EEditorHooks(editor);
                 selectionChangeSubscriptionRef.current?.dispose();
+                editorSelectionPointerListenersRef.current?.dispose();
+                editorSelectionPointerDownRef.current = false;
+                editorSelectionPendingAfterPointerUpRef.current = false;
+
+                const editorNode = editor.getDomNode();
+                if (editorNode !== null) {
+                  const onEditorPointerDown = () => {
+                    editorSelectionPointerDownRef.current = true;
+                    editorSelectionPendingAfterPointerUpRef.current = false;
+                    clearSelectionPromptAutoOpenTimer();
+                  };
+                  const onEditorPointerUp = () => {
+                    const shouldOpenAfterPointerUp =
+                      editorSelectionPendingAfterPointerUpRef.current;
+                    editorSelectionPointerDownRef.current = false;
+                    editorSelectionPendingAfterPointerUpRef.current = false;
+
+                    if (shouldOpenAfterPointerUp) {
+                      scheduleSelectionPromptAutoOpen();
+                    }
+                  };
+
+                  editorNode.addEventListener("pointerdown", onEditorPointerDown);
+                  window.addEventListener("pointerup", onEditorPointerUp, true);
+                  window.addEventListener("pointercancel", onEditorPointerUp, true);
+                  editorSelectionPointerListenersRef.current = {
+                    dispose: () => {
+                      editorNode.removeEventListener(
+                        "pointerdown",
+                        onEditorPointerDown
+                      );
+                      window.removeEventListener("pointerup", onEditorPointerUp, true);
+                      window.removeEventListener(
+                        "pointercancel",
+                        onEditorPointerUp,
+                        true
+                      );
+                    }
+                  };
+                } else {
+                  editorSelectionPointerListenersRef.current = null;
+                }
+
                 selectionChangeSubscriptionRef.current =
                   editor.onDidChangeCursorSelection(() => {
-                    if (selectionPromptOpenTimeoutRef.current !== null) {
-                      window.clearTimeout(selectionPromptOpenTimeoutRef.current);
+                    if (editorSelectionPointerDownRef.current) {
+                      editorSelectionPendingAfterPointerUpRef.current = true;
+                      clearSelectionPromptAutoOpenTimer();
+                      return;
                     }
 
-                    selectionPromptOpenTimeoutRef.current = window.setTimeout(() => {
-                      openInlineSelectionPrompt(undefined, { silent: true });
-                      selectionPromptOpenTimeoutRef.current = null;
-                    }, 140);
+                    scheduleSelectionPromptAutoOpen();
                   });
                 editor.addAction({
                   id: "latex-agent.ask-selection",
@@ -3854,12 +4196,10 @@ export function App() {
                   }
                 });
               }}
-              onReplace={() => focusMonacoReplace(editorRef.current)}
               onRunBuild={runBuild}
               onSourceToPdf={jumpSourceToPdf}
               onSave={saveActiveFile}
               onSaveAll={saveAllFiles}
-              onSetMainFile={setActiveFileAsMain}
               onStopBuild={stopBuild}
               selectedCompiler={selectedCompiler}
               syncTexMessage={syncTexMessage}
@@ -3879,6 +4219,7 @@ export function App() {
               canvasRefs={pdfCanvasRefs}
               pageCount={pdfPageCount}
               pageNumber={pdfPageNumber}
+              projectRoot={currentProject?.rootPath}
               searchQuery={pdfSearchQuery}
               scale={pdfScale}
               stale={pdfStale}
@@ -3917,8 +4258,8 @@ export function App() {
               prompt={agentPrompt}
               running={agentRunning}
               selectedText={agentSelectedText}
-              onAllowApproval={(sessionId, approvalId) =>
-                respondAgentApproval(sessionId, approvalId, "allowed")
+              onAllowApproval={(sessionId, approvalId, toolName) =>
+                respondAgentApproval(sessionId, approvalId, toolName, "allowed")
               }
               onCancel={() => {
                 if (agentSessionId !== null) {
@@ -3936,8 +4277,8 @@ export function App() {
               onPromptChange={setAgentPrompt}
               onProviderChange={updateAgentProviderId}
               onSelectionAction={openInlineSelectionPrompt}
-              onDenyApproval={(sessionId, approvalId) =>
-                respondAgentApproval(sessionId, approvalId, "denied")
+              onDenyApproval={(sessionId, approvalId, toolName) =>
+                respondAgentApproval(sessionId, approvalId, toolName, "denied")
               }
               onStart={() => startAgentTask()}
             />
@@ -4055,6 +4396,9 @@ export function App() {
         onClearLocalHistory={clearLocalHistory}
         onClose={() => setSettingsOpen(false)}
         onKeybindingQueryChange={setKeybindingQuery}
+        onOpenProviderSetupTerminal={(providerId, action) => {
+          void openProviderSetupTerminal(providerId, action);
+        }}
         onRefreshPrivacySummary={() => {
           void refreshPrivacySummary();
         }}
@@ -4127,18 +4471,22 @@ function SidebarPanel({
 }
 
 function TemplateSidebar({
+  projectName,
   projectTemplates,
   selectedTemplateId,
   onCreateFromTemplate,
   onImportSourceZip,
   onOpenProject,
+  onProjectNameChange,
   onTemplateChange
 }: {
+  readonly projectName: string;
   readonly projectTemplates: readonly ProjectTemplate[];
   readonly selectedTemplateId: ProjectTemplateId;
   readonly onCreateFromTemplate: () => void;
   readonly onImportSourceZip: () => void;
   readonly onOpenProject: () => void;
+  readonly onProjectNameChange: (projectName: string) => void;
   readonly onTemplateChange: (templateId: ProjectTemplateId) => void;
 }) {
   const selectedTemplate = projectTemplates.find(
@@ -4169,7 +4517,21 @@ function TemplateSidebar({
         <p className="template-picker__description">
           {selectedTemplate?.description ?? "Choose a built-in template."}
         </p>
-        <button className="primary-button" type="button" onClick={onCreateFromTemplate}>
+        <label className="template-picker__field">
+          <span className="eyebrow">Project name</span>
+          <input
+            aria-label="Template project name"
+            value={projectName}
+            spellCheck={false}
+            onChange={(event) => onProjectNameChange(event.target.value)}
+          />
+        </label>
+        <button
+          className="primary-button"
+          type="button"
+          disabled={projectName.trim().length === 0}
+          onClick={onCreateFromTemplate}
+        >
           <Plus aria-hidden="true" size={15} />
           Create Project
         </button>
@@ -4554,18 +4916,14 @@ function EditorPane({
   mainFilePath,
   onCompilerChange,
   onActiveFileChange,
-  onAskAgent,
   onCloseFile,
   onContentsChange,
   onFind,
-  onFormat,
   onMount,
-  onReplace,
   onRunBuild,
   onSourceToPdf,
   onSave,
   onSaveAll,
-  onSetMainFile,
   onStopBuild,
   openFiles,
   selectedCompiler,
@@ -4581,28 +4939,19 @@ function EditorPane({
   readonly mainFilePath: string | undefined;
   readonly onCompilerChange: (compiler: LatexCompiler) => void;
   readonly onActiveFileChange: (path: string) => void;
-  readonly onAskAgent: () => void;
   readonly onCloseFile: (path: string) => void;
   readonly onContentsChange: (contents: string) => void;
   readonly onFind: () => void;
-  readonly onFormat: () => void;
   readonly onMount: (editor: MonacoStandaloneEditor) => void;
-  readonly onReplace: () => void;
   readonly onRunBuild: () => void;
   readonly onSourceToPdf: () => void;
   readonly onSave: () => void;
   readonly onSaveAll: () => void;
-  readonly onSetMainFile: () => void;
   readonly onStopBuild: () => void;
   readonly openFiles: readonly EditorFileState[];
   readonly selectedCompiler: LatexCompiler;
   readonly syncTexMessage: string;
 }) {
-  const canSetMainFile =
-    activeFile !== null &&
-    activeFile.path.endsWith(".tex") &&
-    activeFile.path !== mainFilePath;
-
   return (
     <section className="editor-pane" aria-label="Source editor">
       <div className="tab-strip" role="tablist" aria-label="Open files">
@@ -4700,34 +5049,6 @@ function EditorPane({
         >
           <Search aria-hidden="true" size={15} />
         </IconButton>
-        <IconButton
-          label="Replace in file"
-          disabled={activeFile === null}
-          onClick={onReplace}
-        >
-          <Pencil aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton
-          label="Format file"
-          disabled={activeFile === null}
-          onClick={onFormat}
-        >
-          <ChevronRight aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton
-          label="Set active file as main"
-          disabled={!canSetMainFile}
-          onClick={onSetMainFile}
-        >
-          <FileText aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton
-          label="Ask agent"
-          disabled={activeFile === null}
-          onClick={onAskAgent}
-        >
-          <Sparkles aria-hidden="true" size={15} />
-        </IconButton>
         <span className="editor-status-group">
           {buildRunning ? <span className="editor-state">Compiling...</span> : null}
           {activeFile?.stale === true && (
@@ -4775,8 +5096,9 @@ function EditorPane({
 function SelectionPromptPopover({
   action,
   left,
+  mode,
   promptRef,
-  onActionChange,
+  onActionSubmit,
   onClose,
   onPromptChange,
   onSubmit,
@@ -4786,8 +5108,9 @@ function SelectionPromptPopover({
 }: {
   readonly action: SelectionAgentAction;
   readonly left: number;
+  readonly mode: AgentMode;
   readonly promptRef: RefObject<HTMLTextAreaElement | null>;
-  readonly onActionChange: (action: SelectionAgentAction) => void;
+  readonly onActionSubmit: (action: SelectionAgentAction) => void;
   readonly onClose: () => void;
   readonly onPromptChange: (prompt: string) => void;
   readonly onSubmit: () => void;
@@ -4841,35 +5164,35 @@ function SelectionPromptPopover({
           <button
             className="text-button"
             type="button"
-            onClick={() => onActionChange("explain")}
+            onClick={() => onActionSubmit("explain")}
           >
             Explain
           </button>
           <button
             className="text-button"
             type="button"
-            onClick={() => onActionChange("rewrite")}
+            onClick={() => onActionSubmit("rewrite")}
           >
             Rewrite
           </button>
           <button
             className="text-button"
             type="button"
-            onClick={() => onActionChange("expand-notes")}
+            onClick={() => onActionSubmit("expand-notes")}
           >
             Expand notes
           </button>
           <button
             className="text-button"
             type="button"
-            onClick={() => onActionChange("improve-academic-tone")}
+            onClick={() => onActionSubmit("improve-academic-tone")}
           >
             Improve tone
           </button>
           <button
             className="text-button"
             type="button"
-            onClick={() => onActionChange("shorten-abstract")}
+            onClick={() => onActionSubmit("shorten-abstract")}
           >
             Shorten abstract
           </button>
@@ -4887,256 +5210,11 @@ function SelectionPromptPopover({
           }}
           placeholder="Ask the agent to rewrite or inspect this selection..."
         />
-        <div className="selection-popover-send">
-          <button className="text-button" type="button" onClick={onSubmit}>
-            Send
-          </button>
-          <span className="selection-popover-mode">
-            Mode: {action === "explain" ? "suggest" : "apply"}
-          </span>
-        </div>
+        <span className="selection-popover-mode">
+          Mode: {formatAgentModeLabel(action === "explain" ? "suggest" : mode)}
+        </span>
       </section>
     </div>
-  );
-}
-
-function PdfPane({
-  artifact,
-  buildRunning,
-  canvasRefs,
-  onCanvasClick,
-  onDownload,
-  onFitWidth,
-  onNextPage,
-  onPreviousPage,
-  onRunSearch,
-  onSearchQueryChange,
-  onSearchNext,
-  onSearchPrevious,
-  onSourceToPdf,
-  onZoomIn,
-  onZoomOut,
-  pageCount,
-  pageNumber,
-  searchActiveIndex,
-  searchMatchCount,
-  searchQuery,
-  scale,
-  stale,
-  staleReason,
-  syncTexTarget
-}: {
-  readonly artifact: PdfArtifactData | null;
-  readonly buildRunning: boolean;
-  readonly canvasRefs: RefObject<Map<number, HTMLCanvasElement>>;
-  readonly onCanvasClick: (page: number, x: number, y: number) => void;
-  readonly onDownload: () => void;
-  readonly onFitWidth: () => void;
-  readonly onNextPage: () => void;
-  readonly onPreviousPage: () => void;
-  readonly onRunSearch: () => void;
-  readonly onSearchQueryChange: (query: string) => void;
-  readonly onSearchNext: () => void;
-  readonly onSearchPrevious: () => void;
-  readonly onSourceToPdf: () => void;
-  readonly onZoomIn: () => void;
-  readonly onZoomOut: () => void;
-  readonly pageCount: number;
-  readonly pageNumber: number;
-  readonly searchActiveIndex: number;
-  readonly searchMatchCount: number;
-  readonly searchQuery: string;
-  readonly scale: number;
-  readonly stale: boolean;
-  readonly staleReason: PdfStaleReason | null;
-  readonly syncTexTarget: {
-    readonly page: number;
-    readonly x?: number;
-    readonly y?: number;
-  } | null;
-}) {
-  const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
-  const pageNumbers = useMemo(
-    () =>
-      Array.from({ length: pageCount }, (_value, index) => {
-        return index + 1;
-      }),
-    [pageCount]
-  );
-
-  useEffect(() => {
-    pageRefs.current.get(pageNumber)?.scrollIntoView({
-      block: "start",
-      behavior: "smooth"
-    });
-  }, [pageNumber]);
-
-  const registerPageRef = useCallback(
-    (page: number) => (node: HTMLDivElement | null) => {
-      if (node === null) {
-        pageRefs.current.delete(page);
-        return;
-      }
-
-      pageRefs.current.set(page, node);
-    },
-    []
-  );
-  const registerCanvasRef = useCallback(
-    (page: number) => (node: HTMLCanvasElement | null) => {
-      if (node === null) {
-        canvasRefs.current?.delete(page);
-        return;
-      }
-
-      canvasRefs.current?.set(page, node);
-    },
-    [canvasRefs]
-  );
-
-  return (
-    <section className="pdf-pane" aria-label="PDF preview">
-      <div className="pane-title">
-        <PanelRight aria-hidden="true" size={16} />
-        <span>PDF Preview</span>
-        {stale && (
-          <span className="pdf-state">{formatPdfStaleReason(staleReason)}</span>
-        )}
-      </div>
-      <div className="pdf-toolbar" aria-label="PDF toolbar">
-        <button
-          className="icon-button"
-          type="button"
-          aria-label="Previous page"
-          title="Previous page"
-          disabled={pageNumber <= 1}
-          onClick={onPreviousPage}
-        >
-          <ChevronRight className="flip-icon" size={15} />
-        </button>
-        <span className="pdf-page-indicator">
-          {pageCount === 0 ? "0 / 0" : `${pageNumber} / ${pageCount}`}
-        </span>
-        <button
-          className="icon-button"
-          type="button"
-          aria-label="Next page"
-          title="Next page"
-          disabled={pageNumber >= pageCount}
-          onClick={onNextPage}
-        >
-          <ChevronRight size={15} />
-        </button>
-        <IconButton label="Zoom out" onClick={onZoomOut}>
-          <span className="toolbar-icon-text" aria-hidden="true">
-            -
-          </span>
-        </IconButton>
-        <span className="zoom-label">{Math.round(scale * 100)}%</span>
-        <IconButton label="Zoom in" onClick={onZoomIn}>
-          <span className="toolbar-icon-text" aria-hidden="true">
-            +
-          </span>
-        </IconButton>
-        <IconButton label="Fit PDF width" onClick={onFitWidth}>
-          <span className="toolbar-icon-text compact" aria-hidden="true">
-            Fit
-          </span>
-        </IconButton>
-        <input
-          className="pdf-search-input"
-          aria-label="Search PDF"
-          value={searchQuery}
-          placeholder="Search PDF"
-          onChange={(event) => onSearchQueryChange(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              onRunSearch();
-            }
-          }}
-        />
-        <IconButton
-          label="Search PDF"
-          disabled={artifact === null}
-          onClick={onRunSearch}
-        >
-          <Search aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton
-          label="Previous PDF match"
-          disabled={artifact === null || searchMatchCount === 0}
-          onClick={onSearchPrevious}
-        >
-          <ChevronRight className="flip-icon" aria-hidden="true" size={15} />
-        </IconButton>
-        <span className="pdf-search-count" aria-label="PDF search result count">
-          {searchMatchCount === 0
-            ? "0 / 0"
-            : `${searchActiveIndex + 1} / ${searchMatchCount}`}
-        </span>
-        <IconButton
-          label="Next PDF match"
-          disabled={artifact === null || searchMatchCount === 0}
-          onClick={onSearchNext}
-        >
-          <ChevronRight aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton
-          label="Source to PDF"
-          disabled={artifact === null}
-          onClick={onSourceToPdf}
-        >
-          <ChevronRight aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton label="Save PDF" disabled={artifact === null} onClick={onDownload}>
-          <Save aria-hidden="true" size={15} />
-        </IconButton>
-      </div>
-      <div className="pdf-canvas">
-        {artifact === null ? (
-          <div className="pdf-empty">
-            <PanelRight aria-hidden="true" size={24} />
-            <p>{buildRunning ? "Compiling..." : "Compile to preview the PDF."}</p>
-          </div>
-        ) : (
-          <div className="pdf-document">
-            {pageNumbers.map((page) => (
-              <div
-                className="pdf-page-wrap"
-                key={page}
-                ref={registerPageRef(page)}
-                aria-label={`PDF page ${page}`}
-              >
-                <canvas
-                  ref={registerCanvasRef(page)}
-                  className="pdf-page-canvas"
-                  onClick={(event) => {
-                    const rect = event.currentTarget.getBoundingClientRect();
-                    onCanvasClick(
-                      page,
-                      (event.clientX - rect.left) / scale,
-                      (event.clientY - rect.top) / scale
-                    );
-                  }}
-                />
-                {syncTexTarget?.page === page &&
-                  syncTexTarget.x !== undefined &&
-                  syncTexTarget.y !== undefined && (
-                    <span
-                      className="synctex-marker"
-                      style={{
-                        left: `${syncTexTarget.x * scale}px`,
-                        top: `${syncTexTarget.y * scale}px`
-                      }}
-                      aria-hidden="true"
-                    />
-                  )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </section>
   );
 }
 
@@ -5164,10 +5242,18 @@ function AgentPane({
   readonly events: readonly AgentEvent[];
   readonly liveStatus: AgentLiveStatus | null;
   readonly mode: AgentMode;
-  readonly onAllowApproval: (sessionId: string, approvalId: string) => void;
+  readonly onAllowApproval: (
+    sessionId: string,
+    approvalId: string,
+    toolName: AgentToolName
+  ) => void;
   readonly onCancel: () => void;
   readonly onClearHistory: () => void;
-  readonly onDenyApproval: (sessionId: string, approvalId: string) => void;
+  readonly onDenyApproval: (
+    sessionId: string,
+    approvalId: string,
+    toolName: AgentToolName
+  ) => void;
   readonly onModeChange: (mode: AgentMode) => void;
   readonly onPromptChange: (prompt: string) => void;
   readonly onProviderChange: (providerId: AgentProviderId) => void;
@@ -5194,7 +5280,6 @@ function AgentPane({
   }, [composerRef, prompt]);
 
   const displayEvents = prepareAgentDisplayEvents(events);
-  const messageEvents = displayEvents.filter(isAgentMessageEvent);
   const visibleLiveStatus =
     liveStatus ??
     ({
@@ -5214,18 +5299,11 @@ function AgentPane({
             ? "danger"
             : "warning"
     } satisfies AgentLiveStatus);
-  const transientAgentMessage = createTransientAgentMessage({
-    events,
-    liveStatus: visibleLiveStatus,
-    messageEvents,
-    running
-  });
-  const conversationEvents =
-    transientAgentMessage === undefined
-      ? displayEvents
-      : mergeAgentThreadEvents([...displayEvents, transientAgentMessage]);
-  const threadItems = createAgentThreadItems(conversationEvents);
-  const conversationVersion = threadItems
+  const threadItems = createAgentThreadItems(displayEvents);
+  const visibleThreadItems = createVisibleAgentThreadItems(threadItems, running);
+  const activeRunItemKey =
+    running === false ? null : getLatestAssistantRunItemKey(visibleThreadItems);
+  const conversationVersion = visibleThreadItems
     .map((item) =>
       item.type === "user"
         ? `${item.event.id}:${item.event.createdAt}:${item.event.content}`
@@ -5267,7 +5345,7 @@ function AgentPane({
             <X size={15} />
           </IconButton>
           <IconButton
-            disabled={threadItems.length === 0 || running}
+            disabled={visibleThreadItems.length === 0 || running}
             label="Clear agent history"
             onClick={onClearHistory}
           >
@@ -5296,11 +5374,12 @@ function AgentPane({
             value={mode}
             onChange={(event) => onModeChange(event.target.value as AgentMode)}
           >
-            <option value="apply-with-review">Apply with review</option>
-            <option value="suggest">Suggest edits</option>
-            <option value="autonomous-local">Autonomous local</option>
+            <option value="suggest">Ask only</option>
+            <option value="apply-with-review">Review changes first</option>
+            <option value="autonomous-local">Auto-apply local changes</option>
           </select>
         </label>
+        <p className="agent-mode-help">{getAgentModeDescription(mode)}</p>
       </div>
 
       {selectedText !== null && (
@@ -5341,7 +5420,7 @@ function AgentPane({
       )}
 
       <div className="agent-thread">
-        {threadItems.length === 0 ? (
+        {visibleThreadItems.length === 0 ? (
           <div className="agent-empty-state">
             <span className="agent-empty-icon" aria-hidden="true">
               <MessageSquareText size={18} />
@@ -5353,20 +5432,30 @@ function AgentPane({
           </div>
         ) : (
           <div className="agent-conversation" aria-label="Agent conversation">
-            {threadItems.map((item) =>
-              item.type === "user" ? (
-                <AgentUserMessage event={item.event} key={item.event.id} />
+            {visibleThreadItems.map((item, index) => {
+              const itemKey = getAgentThreadItemKey(item);
+
+              return item.type === "user" ? (
+                <AgentUserMessage event={item.event} key={itemKey} />
               ) : (
                 <AgentRunCard
                   events={item.events}
-                  key={`${item.sessionId}-${item.createdAt}`}
+                  elapsedSeconds={elapsedSeconds}
+                  isActive={itemKey === activeRunItemKey}
+                  key={itemKey}
+                  liveStatus={visibleLiveStatus}
                   providerId={providerId}
-                  sessionId={item.sessionId}
+                  requestPrompt={getAgentRunRequestPrompt(visibleThreadItems, index)}
+                  workflowEvents={getAgentRunWorkflowEvents(
+                    events,
+                    visibleThreadItems,
+                    index
+                  )}
                   onAllowApproval={onAllowApproval}
                   onDenyApproval={onDenyApproval}
                 />
-              )
-            )}
+              );
+            })}
             <div ref={threadEndRef} aria-hidden="true" />
           </div>
         )}
@@ -5441,26 +5530,53 @@ function AgentUserMessage({
 }
 
 function AgentRunCard({
+  elapsedSeconds,
   events,
+  isActive,
+  liveStatus,
   onAllowApproval,
   onDenyApproval,
   providerId,
-  sessionId
+  requestPrompt,
+  workflowEvents
 }: {
+  readonly elapsedSeconds: number;
   readonly events: readonly AgentEvent[];
-  readonly onAllowApproval: (sessionId: string, approvalId: string) => void;
-  readonly onDenyApproval: (sessionId: string, approvalId: string) => void;
+  readonly isActive: boolean;
+  readonly liveStatus: AgentLiveStatus;
+  readonly onAllowApproval: (
+    sessionId: string,
+    approvalId: string,
+    toolName: AgentToolName
+  ) => void;
+  readonly onDenyApproval: (
+    sessionId: string,
+    approvalId: string,
+    toolName: AgentToolName
+  ) => void;
   readonly providerId: AgentProviderId;
-  readonly sessionId: string;
+  readonly requestPrompt: string;
+  readonly workflowEvents: readonly Exclude<AgentEvent, { readonly type: "message" }>[];
 }) {
   const assistantMessages = events.filter(
     (event): event is AgentEvent & { readonly type: "message" } =>
       event.type === "message" && event.role !== "user"
   );
-  const workflowEvents = events.filter(isAgentWorkflowEvent);
-  const firstEvent = events[0];
-  const latestEvent = events.at(-1);
-  const tone = getAgentRunTone(events);
+  const cardEvents = [...events, ...workflowEvents];
+  const visibleWorkflowEvents = getVisibleAgentWorkflowEvents({
+    hasAssistantResponse: assistantMessages.length > 0,
+    isActive,
+    workflowEvents
+  });
+  const latestEvent = getLatestAgentEvent(cardEvents);
+  const tone = getAgentRunTone(cardEvents);
+  const effectiveLiveStatus = createAgentRunLiveStatus({
+    elapsedSeconds,
+    events: cardEvents,
+    fallback: liveStatus,
+    requestPrompt
+  });
+  const shouldShowLiveStatus = isActive || hasOpenApproval(cardEvents);
 
   return (
     <article className={`agent-run-card ${tone}`}>
@@ -5476,31 +5592,40 @@ function AgentRunCard({
         </span>
       </header>
 
-      <div className="agent-run-response">
-        {assistantMessages.length === 0 ? (
-          <AgentRichText
-            content={`${getAgentProviderLabel(providerId)} is working on this request.`}
-          />
-        ) : (
-          assistantMessages.map((event, index) => {
-            const isLatestMessage = index === assistantMessages.length - 1;
+      {shouldShowLiveStatus ? (
+        <AgentRunLiveStatus
+          elapsedSeconds={elapsedSeconds}
+          liveStatus={effectiveLiveStatus}
+        />
+      ) : null}
 
-            return (
-              <div className="agent-run-message" key={event.id}>
-                {isLatestMessage ? (
-                  <RevealedAgentRichText content={event.content} />
-                ) : (
-                  <AgentRichText content={event.content} />
-                )}
-              </div>
-            );
-          })
-        )}
-      </div>
+      {(assistantMessages.length > 0 || !isActive) && (
+        <div className="agent-run-response">
+          {assistantMessages.length === 0 ? (
+            <AgentRichText
+              content={`${getAgentProviderLabel(providerId)} is working on this request.`}
+            />
+          ) : (
+            assistantMessages.map((event, index) => {
+              const isLatestMessage = index === assistantMessages.length - 1;
 
-      {workflowEvents.length > 0 && (
+              return (
+                <div className="agent-run-message" key={event.id}>
+                  {isLatestMessage ? (
+                    <RevealedAgentRichText content={event.content} />
+                  ) : (
+                    <AgentRichText content={event.content} />
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
+
+      {visibleWorkflowEvents.length > 0 && (
         <div className="agent-run-steps" aria-label="Agent run metadata">
-          {workflowEvents.map((event) => (
+          {visibleWorkflowEvents.map((event) => (
             <AgentRunStep
               event={event}
               key={event.id}
@@ -5510,15 +5635,30 @@ function AgentRunCard({
           ))}
         </div>
       )}
-
-      <footer className="agent-run-footer">
-        <span>Run {sessionId.slice(0, 8)}</span>
-        <span>{getAgentProviderRunLabel(providerId)}</span>
-        {firstEvent !== undefined && (
-          <span>Started {formatAgentEventTimestamp(firstEvent.createdAt)}</span>
-        )}
-      </footer>
     </article>
+  );
+}
+
+function AgentRunLiveStatus({
+  elapsedSeconds,
+  liveStatus
+}: {
+  readonly elapsedSeconds: number;
+  readonly liveStatus: AgentLiveStatus;
+}) {
+  return (
+    <div className={`agent-run-live ${liveStatus.tone}`} aria-live="polite">
+      <div>
+        <span className="agent-typing-dots" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </span>
+        <strong>{liveStatus.title}</strong>
+      </div>
+      <span>{formatElapsedTime(elapsedSeconds)}</span>
+      <p>{liveStatus.detail}</p>
+    </div>
   );
 }
 
@@ -5528,8 +5668,16 @@ function AgentRunStep({
   onDenyApproval
 }: {
   readonly event: Exclude<AgentEvent, { readonly type: "message" }>;
-  readonly onAllowApproval: (sessionId: string, approvalId: string) => void;
-  readonly onDenyApproval: (sessionId: string, approvalId: string) => void;
+  readonly onAllowApproval: (
+    sessionId: string,
+    approvalId: string,
+    toolName: AgentToolName
+  ) => void;
+  readonly onDenyApproval: (
+    sessionId: string,
+    approvalId: string,
+    toolName: AgentToolName
+  ) => void;
 }) {
   const tone = getAgentEventTone(event);
 
@@ -5548,7 +5696,9 @@ function AgentRunStep({
               className="text-button"
               type="button"
               disabled={event.status !== "requested"}
-              onClick={() => onAllowApproval(event.sessionId, event.approvalId)}
+              onClick={() =>
+                onAllowApproval(event.sessionId, event.approvalId, event.toolName)
+              }
             >
               <Check aria-hidden="true" size={15} />
               Allow
@@ -5557,7 +5707,9 @@ function AgentRunStep({
               className="text-button"
               type="button"
               disabled={event.status !== "requested"}
-              onClick={() => onDenyApproval(event.sessionId, event.approvalId)}
+              onClick={() =>
+                onDenyApproval(event.sessionId, event.approvalId, event.toolName)
+              }
             >
               <X aria-hidden="true" size={15} />
               Deny
@@ -5588,6 +5740,19 @@ function AgentRichText({ content }: { readonly content: string }) {
   return (
     <div className="agent-rich-text">
       {blocks.map((block, blockIndex) => {
+        if (block.type === "code-block") {
+          return (
+            <figure className="agent-rich-code-block" key={`block-${blockIndex}`}>
+              {block.language === null ? null : (
+                <figcaption>{block.language}</figcaption>
+              )}
+              <pre>
+                <code>{block.code}</code>
+              </pre>
+            </figure>
+          );
+        }
+
         if (block.type === "table") {
           return (
             <div className="agent-rich-table-wrap" key={`block-${blockIndex}`}>
@@ -6860,6 +7025,7 @@ function SettingsDialog({
   onClearLocalHistory,
   onClose,
   onKeybindingQueryChange,
+  onOpenProviderSetupTerminal,
   onRefreshPrivacySummary,
   onRefreshAgentAuthStatuses,
   onSetAgentMode,
@@ -6879,6 +7045,10 @@ function SettingsDialog({
   readonly onClearLocalHistory: () => void;
   readonly onClose: () => void;
   readonly onKeybindingQueryChange: (query: string) => void;
+  readonly onOpenProviderSetupTerminal: (
+    providerId: AgentProviderId,
+    action: AgentProviderSetupAction
+  ) => void;
   readonly onRefreshPrivacySummary: () => void;
   readonly onRefreshAgentAuthStatuses: () => void;
   readonly onSetAgentMode: (mode: AgentMode) => void;
@@ -6938,6 +7108,7 @@ function SettingsDialog({
             tab={activeTab}
             onClearLocalHistory={onClearLocalHistory}
             onKeybindingQueryChange={onKeybindingQueryChange}
+            onOpenProviderSetupTerminal={onOpenProviderSetupTerminal}
             onRefreshPrivacySummary={onRefreshPrivacySummary}
             onRefreshAgentAuthStatuses={onRefreshAgentAuthStatuses}
             onSetAgentMode={onSetAgentMode}
@@ -6958,6 +7129,7 @@ function SettingsTabPanel({
   keybindingQuery,
   onClearLocalHistory,
   onKeybindingQueryChange,
+  onOpenProviderSetupTerminal,
   onRefreshPrivacySummary,
   onRefreshAgentAuthStatuses,
   onSetAgentMode,
@@ -6974,6 +7146,10 @@ function SettingsTabPanel({
   readonly keybindingQuery: string;
   readonly onClearLocalHistory: () => void;
   readonly onKeybindingQueryChange: (query: string) => void;
+  readonly onOpenProviderSetupTerminal: (
+    providerId: AgentProviderId,
+    action: AgentProviderSetupAction
+  ) => void;
   readonly onRefreshPrivacySummary: () => void;
   readonly onRefreshAgentAuthStatuses: () => void;
   readonly onSetAgentMode: (mode: AgentMode) => void;
@@ -7111,8 +7287,9 @@ function SettingsTabPanel({
       {tab === "AI Providers" && (
         <>
           <p className="settings-note">
-            Provider readiness is checked through local CLI login state. This app does
-            not request or store provider API keys.
+            Connect an AI provider once on this computer. ZeroLeaf opens the official
+            setup command in Terminal, then the provider opens your browser for login.
+            This app does not request or store provider API keys.
           </p>
           {agentProviderIds.map((providerId) => (
             <ProviderSettingsRow
@@ -7121,6 +7298,8 @@ function SettingsTabPanel({
                 (credential) => credential.providerId === providerId
               )}
               key={providerId}
+              onOpenProviderSetupTerminal={onOpenProviderSetupTerminal}
+              onRefreshAgentAuthStatuses={onRefreshAgentAuthStatuses}
               providerId={providerId}
             />
           ))}
@@ -7149,12 +7328,19 @@ function SettingsTabPanel({
             label="Default mode"
             value={agentMode}
             options={[
-              ["suggest", "Suggest"],
-              ["apply-with-review", "Apply with review"],
-              ["autonomous-local", "Autonomous local"]
+              ["suggest", "Ask only"],
+              ["apply-with-review", "Review changes first"],
+              ["autonomous-local", "Auto-apply local changes"]
             ]}
             onChange={(value) => onSetAgentMode(value as AgentMode)}
           />
+          <p className="settings-note mode-note">
+            {getAgentModeDescription(agentMode)}
+          </p>
+          <p className="settings-note">
+            Auto-apply local changes is advanced. It can edit files and run local
+            compile inside the open project without stopping for review.
+          </p>
           <Toggle
             checked={settings.agentPermissions.compileAfterPatch}
             label="Compile after patch"
@@ -7345,18 +7531,45 @@ function SettingsTabPanel({
 function ProviderSettingsRow({
   authStatus,
   credentialStatus,
+  onOpenProviderSetupTerminal,
+  onRefreshAgentAuthStatuses,
   providerId
 }: {
   readonly authStatus: AgentAuthStatus;
   readonly credentialStatus: AppSettings["credentials"][number] | undefined;
+  readonly onOpenProviderSetupTerminal: (
+    providerId: AgentProviderId,
+    action: AgentProviderSetupAction
+  ) => void;
+  readonly onRefreshAgentAuthStatuses: () => void;
   readonly providerId: AgentProviderId;
 }) {
+  if (providerId === "mock") {
+    return (
+      <section
+        className="provider-settings-row"
+        aria-label={getAgentProviderLabel(providerId)}
+      >
+        <div>
+          <strong>{getAgentProviderLabel(providerId)}</strong>
+          <p>{getAgentProviderNote(providerId)}</p>
+        </div>
+        <span className={`provider-status-pill ${authStatus.state}`}>
+          {formatAgentAuthState(authStatus.state)}
+        </span>
+        {authStatus.message !== undefined && <p>{authStatus.message}</p>}
+      </section>
+    );
+  }
+
+  const setupSteps = getProviderSetupSteps(authStatus, providerId);
+
   return (
     <section
       className="provider-settings-row"
       aria-label={getAgentProviderLabel(providerId)}
     >
-      <div>
+      <div className="provider-settings-heading">
         <strong>{getAgentProviderLabel(providerId)}</strong>
         <p>{getAgentProviderNote(providerId)}</p>
       </div>
@@ -7365,8 +7578,95 @@ function ProviderSettingsRow({
       </span>
       {authStatus.message !== undefined && <p>{authStatus.message}</p>}
       {credentialStatus !== undefined && <p>{credentialStatus.message}</p>}
+      <ol className="provider-setup-steps">
+        {setupSteps.map((step) => (
+          <li className={step.state} key={step.id}>
+            <span className="provider-step-index" aria-hidden="true">
+              {step.index}
+            </span>
+            <div>
+              <strong>{step.title}</strong>
+              <p>{step.detail}</p>
+              {step.action !== undefined && (
+                <button
+                  className="text-button settings-action"
+                  type="button"
+                  disabled={step.state === "complete"}
+                  onClick={() =>
+                    onOpenProviderSetupTerminal(providerId, step.action ?? "install")
+                  }
+                >
+                  <Terminal aria-hidden="true" size={15} />
+                  {step.actionLabel}
+                </button>
+              )}
+              {step.id === "refresh" && (
+                <button
+                  className="text-button settings-action"
+                  type="button"
+                  onClick={onRefreshAgentAuthStatuses}
+                >
+                  <RefreshCw aria-hidden="true" size={15} />
+                  Refresh status
+                </button>
+              )}
+            </div>
+          </li>
+        ))}
+      </ol>
     </section>
   );
+}
+
+function getProviderSetupSteps(
+  authStatus: AgentAuthStatus,
+  providerId: Exclude<AgentProviderId, "mock">
+): readonly {
+  readonly id: "install" | "login" | "refresh";
+  readonly index: number;
+  readonly title: string;
+  readonly detail: string;
+  readonly state: "complete" | "current" | "pending";
+  readonly action?: AgentProviderSetupAction;
+  readonly actionLabel?: string;
+}[] {
+  const installed =
+    authStatus.state === "connected" || authStatus.state === "needs-auth";
+  const connected = authStatus.state === "connected";
+  const providerName = getAgentProviderLabel(providerId);
+  const loginDetail =
+    providerId === "openai-codex"
+      ? "Sign in with ChatGPT in the browser to use an eligible Plus, Pro, Business, Edu, or Enterprise subscription."
+      : "Sign in with the Claude account that includes Claude Code access, such as Pro, Max, Team, Enterprise, or Console.";
+
+  return [
+    {
+      id: "install",
+      index: 1,
+      title: `Install ${providerName}`,
+      detail: "Open Terminal and run the official installer for this provider.",
+      state: installed ? "complete" : "current",
+      action: "install",
+      actionLabel: installed ? "Installed" : "Install"
+    },
+    {
+      id: "login",
+      index: 2,
+      title: "Log in with your subscription",
+      detail: loginDetail,
+      state: connected ? "complete" : installed ? "current" : "pending",
+      action: "login",
+      actionLabel: connected ? "Connected" : "Log in"
+    },
+    {
+      id: "refresh",
+      index: 3,
+      title: "Confirm connection",
+      detail:
+        "Refresh after the browser login finishes so ZeroLeaf can use this provider.",
+      state: connected ? "complete" : "pending"
+    }
+  ];
 }
 
 function Field({ label, value }: { readonly label: string; readonly value: string }) {
@@ -7500,34 +7800,6 @@ function PaneResizer({
       onKeyDown={onKeyDown}
       onPointerDown={onPointerDown}
     />
-  );
-}
-
-function IconButton({
-  children,
-  disabled = false,
-  label,
-  onClick,
-  pressed = false
-}: {
-  readonly children: React.ReactNode;
-  readonly disabled?: boolean;
-  readonly label: string;
-  readonly onClick?: () => void;
-  readonly pressed?: boolean;
-}) {
-  return (
-    <button
-      className="icon-button"
-      type="button"
-      aria-label={label}
-      aria-pressed={pressed}
-      disabled={disabled}
-      title={label}
-      onClick={onClick}
-    >
-      {children}
-    </button>
   );
 }
 
@@ -7668,12 +7940,26 @@ function focusMonacoFind(editor: MonacoStandaloneEditor | null) {
   void editor?.getAction("actions.find")?.run();
 }
 
-function focusMonacoReplace(editor: MonacoStandaloneEditor | null) {
-  void editor?.getAction("editor.action.startFindReplaceAction")?.run();
+function getMonacoLayoutElement(editor: MonacoStandaloneEditor) {
+  const container = editor.getContainerDomNode();
+
+  return container.parentElement ?? container;
 }
 
-function formatMonacoDocument(editor: MonacoStandaloneEditor | null) {
-  void editor?.getAction("editor.action.formatDocument")?.run();
+function layoutMonacoEditorToContainer(editor: MonacoStandaloneEditor | null) {
+  if (editor === null) {
+    return;
+  }
+
+  const rect = getMonacoLayoutElement(editor).getBoundingClientRect();
+  const width = Math.floor(rect.width);
+  const height = Math.floor(rect.height);
+
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+
+  editor.layout({ width, height });
 }
 
 function installE2EEditorHooks(editor: MonacoStandaloneEditor) {
@@ -7805,6 +8091,42 @@ function readStoredAgentProvider(fallback: AgentProviderId): AgentProviderId {
       : fallback;
   } catch {
     return fallback;
+  }
+}
+
+function createAgentSelectionContext(
+  editor: MonacoStandaloneEditor,
+  selection: MonacoApi.Selection
+): AgentSelectionContext | null {
+  const model = editor.getModel();
+
+  if (model === null || selection.isEmpty()) {
+    return null;
+  }
+
+  return createSelectionContextFromText({
+    contents: model.getValue(),
+    selection: {
+      startLineNumber: selection.startLineNumber,
+      startColumn: selection.startColumn,
+      endLineNumber: selection.endLineNumber,
+      endColumn: selection.endColumn
+    }
+  });
+}
+
+function getSelectionAgentDefaultPrompt(action: SelectionAgentAction): string {
+  switch (action) {
+    case "explain":
+      return "Explain the selected text using the containing paragraph as context.";
+    case "expand-notes":
+      return "Expand the selected rough notes into polished academic prose.";
+    case "improve-academic-tone":
+      return "Improve the academic tone of the selected text.";
+    case "shorten-abstract":
+      return "Shorten the selected abstract while preserving required contribution statements.";
+    case "rewrite":
+      return "Rewrite the selected text while preserving the meaning and LaTeX structure.";
   }
 }
 
@@ -7942,13 +8264,25 @@ function formatAgentAuthState(state: AgentAuthStatus["state"]): string {
 function formatAgentModeLabel(mode: AgentMode): string {
   switch (mode) {
     case "apply-with-review":
-      return "Apply with review";
+      return "Review changes first";
     case "suggest":
-      return "Suggest edits";
+      return "Ask only";
     case "read-only":
-      return "Read-only";
+      return "Ask only";
     case "autonomous-local":
-      return "Autonomous local";
+      return "Auto-apply local changes";
+  }
+}
+
+function getAgentModeDescription(mode: AgentMode): string {
+  switch (mode) {
+    case "suggest":
+    case "read-only":
+      return "The agent can answer questions and prepare suggested edits, but it will not change files.";
+    case "apply-with-review":
+      return "The agent can prepare changes, then waits for you to review and approve before files are changed.";
+    case "autonomous-local":
+      return "The agent can edit files and run local compile inside the open project without stopping for review.";
   }
 }
 
@@ -8017,6 +8351,70 @@ function parseNoProjectAgentCommand(prompt: string): NoProjectAgentCommand | und
   };
 }
 
+function parseExternalTemplateAgentCommand(
+  prompt: string,
+  events: readonly AgentEvent[]
+): ExternalTemplateAgentCommand | undefined {
+  const normalizedPrompt = prompt.trim();
+
+  if (normalizedPrompt.length === 0) {
+    return undefined;
+  }
+
+  const lowerPrompt = normalizedPrompt.toLowerCase();
+  const isCreateProjectIntent =
+    /\b(create|start|make|set up|setup)\b/u.test(lowerPrompt) &&
+    /\b(project|paper|manuscript)\b/u.test(lowerPrompt);
+
+  if (!isCreateProjectIntent) {
+    return undefined;
+  }
+
+  const recentContext = getRecentAgentAssistantContext(events);
+  const isIeeeTemplateRequest =
+    (/\bieee\b/u.test(lowerPrompt) &&
+      /\b(template|systems journal)\b/u.test(lowerPrompt)) ||
+    (/\b(that|this|the)\s+template\b/u.test(lowerPrompt) &&
+      /\bieee\b/u.test(recentContext) &&
+      /\b(template|systems journal)\b/u.test(recentContext));
+
+  if (!isIeeeTemplateRequest) {
+    return undefined;
+  }
+
+  return {
+    kind: "create-external-template-project",
+    projectName: inferExternalTemplateProjectName(normalizedPrompt),
+    templateId: "ieee-systems-journal"
+  };
+}
+
+function getRecentAgentAssistantContext(events: readonly AgentEvent[]): string {
+  return events
+    .filter(
+      (event): event is AgentEvent & { readonly type: "message" } =>
+        event.type === "message" && event.role === "assistant"
+    )
+    .slice(-4)
+    .map((event) => event.content)
+    .join("\n")
+    .toLowerCase();
+}
+
+function inferExternalTemplateProjectName(prompt: string): string {
+  const matchedName = [
+    /\bname(?:d)?\s+(?:it\s+)?["']?([^"'\n\r]+?)["']?\s*$/iu,
+    /\bcalled\s+["']?([^"'\n\r]+?)["']?\s*$/iu,
+    /\btitled\s+["']?([^"'\n\r]+?)["']?\s*$/iu
+  ]
+    .map((pattern) => prompt.match(pattern)?.[1])
+    .find((candidate): candidate is string => candidate !== undefined);
+
+  return sanitizeNoProjectAgentProjectName(
+    matchedName ?? "ieee-systems-journal-template"
+  );
+}
+
 function sanitizeNoProjectAgentProjectName(projectName: string): string {
   return projectName
     .trim()
@@ -8043,6 +8441,19 @@ function inferProjectTemplateId(prompt: string): ProjectTemplateId {
   }
 
   return "article";
+}
+
+function getDefaultProjectNameForTemplate(
+  projectTemplates: readonly ProjectTemplate[],
+  templateId: ProjectTemplateId
+): string {
+  const templateName =
+    projectTemplates.find((template) => template.id === templateId)?.name ?? templateId;
+
+  return templateName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-|-$/gu, "");
 }
 
 function buildAgentMessageEvent({
@@ -8107,8 +8518,9 @@ function createAgentCompletionSummary(
   }
 
   const changesets = getAgentResultChangeSets(result);
+  const deletedEntries = result.deleteEntries ?? [];
   const movedEntries = result.moveEntries ?? [];
-  const changedFiles = formatChangedFileList(changesets, movedEntries);
+  const changedFiles = formatChangedFileList(changesets, deletedEntries, movedEntries);
   const didCompile = result.buildResult !== undefined;
   const buildSummary =
     result.buildResult === undefined
@@ -8118,6 +8530,10 @@ function createAgentCompletionSummary(
         )}.`;
 
   if (result.status === "awaiting-approval") {
+    if (deletedEntries.length > 0) {
+      return `I prepared ${deletedEntries.length} project ${deletedEntries.length === 1 ? "deletion" : "deletions"}${changedFiles}. No files were changed yet.`;
+    }
+
     if (changesets.length > 0) {
       const patchWord = changesets.length === 1 ? "patch" : "patches";
       return `I prepared ${changesets.length} reviewable ${patchWord}${changedFiles}. No files were changed yet.`;
@@ -8146,24 +8562,21 @@ function createAgentCompletionSummary(
     return `I moved ${movedEntries.length} project ${movedEntries.length === 1 ? "entry" : "entries"}${changedFiles}.`;
   }
 
+  if (deletedEntries.length > 0) {
+    const compilePhrase = didCompile ? " and ran compile verification" : "";
+    return [
+      `I deleted ${deletedEntries.length} project ${deletedEntries.length === 1 ? "entry" : "entries"}${changedFiles}${compilePhrase}.`,
+      buildSummary
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join(" ");
+  }
+
   if (didCompile) {
     return `I compiled the project. ${buildSummary ?? ""} No files were changed.`;
   }
 
-  const usedTools = new Set(
-    result.events
-      .filter(
-        (event): event is AgentEvent & { readonly type: "tool-call" } =>
-          event.type === "tool-call" && event.status === "succeeded"
-      )
-      .map((event) => event.toolName)
-  );
-
-  if (usedTools.has("read-file") || usedTools.has("search-project")) {
-    return "I inspected the scoped project context and answered without changing files.";
-  }
-
-  return "I completed the request without changing project files.";
+  return undefined;
 }
 
 function getAgentResultChangeSets(
@@ -8178,10 +8591,12 @@ function getAgentResultChangeSets(
 
 function formatChangedFileList(
   changesets: readonly HistoryChangeSet[],
+  deletedEntries: readonly { readonly path: string }[],
   movedEntries: readonly { readonly fromPath: string; readonly toPath: string }[]
 ): string {
   const paths = [
     ...changesets.map((changeset) => changeset.filePath),
+    ...deletedEntries.map((entry) => entry.path),
     ...movedEntries.flatMap((entry) => [entry.fromPath, entry.toPath])
   ];
   const uniquePaths = [...new Set(paths)];
@@ -8203,72 +8618,6 @@ function formatChangedFileList(
 
 function formatDiagnosticCount(count: number): string {
   return `${count} diagnostic${count === 1 ? "" : "s"}`;
-}
-
-function createTransientAgentMessage({
-  events,
-  liveStatus,
-  messageEvents,
-  running
-}: {
-  readonly events: readonly AgentEvent[];
-  readonly liveStatus: AgentLiveStatus;
-  readonly messageEvents: readonly (AgentEvent & { readonly type: "message" })[];
-  readonly running: boolean;
-}): AgentEvent | undefined {
-  const latestDisplayUserMessageIndex = findLastAgentEventIndex(
-    messageEvents,
-    (event) => event.type === "message" && event.role === "user"
-  );
-
-  if (latestDisplayUserMessageIndex === -1) {
-    return undefined;
-  }
-
-  const hasAssistantResponseAfterLatestUser = messageEvents
-    .slice(latestDisplayUserMessageIndex + 1)
-    .some((event) => event.type === "message" && event.role === "assistant");
-
-  if (hasAssistantResponseAfterLatestUser) {
-    return undefined;
-  }
-
-  const shouldShowProgress =
-    running || liveStatus.tone === "warning" || liveStatus.tone === "danger";
-
-  if (!shouldShowProgress) {
-    return undefined;
-  }
-
-  const latestUserMessage = messageEvents[latestDisplayUserMessageIndex];
-
-  if (latestUserMessage === undefined) {
-    return undefined;
-  }
-
-  const latestRawUserMessageIndex = findLastAgentEventIndex(
-    events,
-    (event) =>
-      event.type === "message" &&
-      event.role === "user" &&
-      event.content === latestUserMessage.content
-  );
-  const eventsAfterLatestUser =
-    latestRawUserMessageIndex === -1
-      ? events
-      : events.slice(latestRawUserMessageIndex + 1);
-  const latestEvent = getLatestAgentProgressEvent(eventsAfterLatestUser);
-  const progressContent = formatAgentProgressPreviewContent(latestEvent, liveStatus);
-  const progressIdSeed = latestEvent?.id ?? `${liveStatus.title}-${liveStatus.detail}`;
-
-  return {
-    content: progressContent,
-    createdAt: latestEvent?.createdAt ?? latestUserMessage.createdAt,
-    id: `${latestUserMessage.sessionId}-agent-progress-message-${progressIdSeed}`,
-    role: "assistant",
-    sessionId: latestEvent?.sessionId ?? latestUserMessage.sessionId,
-    type: "message"
-  };
 }
 
 function createAgentThreadItems(
@@ -8303,16 +8652,223 @@ function createAgentThreadItems(
   return items;
 }
 
+function createVisibleAgentThreadItems(
+  items: readonly AgentThreadItem[],
+  running: boolean
+): readonly AgentThreadItem[] {
+  if (!running) {
+    return items;
+  }
+
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+
+    if (item?.type !== "user") {
+      continue;
+    }
+
+    if (items[index + 1]?.type === "assistant-run") {
+      return items;
+    }
+
+    return [
+      ...items.slice(0, index + 1),
+      {
+        type: "assistant-run",
+        sessionId: item.event.sessionId,
+        createdAt: item.event.createdAt,
+        events: []
+      },
+      ...items.slice(index + 1)
+    ];
+  }
+
+  return items;
+}
+
+function getAgentThreadItemKey(item: AgentThreadItem): string {
+  if (item.type === "user") {
+    return `user:${item.event.id}`;
+  }
+
+  const firstEvent = item.events[0];
+  return `assistant-run:${item.sessionId}:${item.createdAt}:${firstEvent?.id ?? "pending"}`;
+}
+
+function getLatestAssistantRunItemKey(
+  items: readonly AgentThreadItem[]
+): string | null {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+
+    if (item?.type === "assistant-run") {
+      return getAgentThreadItemKey(item);
+    }
+  }
+
+  return null;
+}
+
+function getAgentRunRequestPrompt(
+  items: readonly AgentThreadItem[],
+  assistantRunIndex: number
+): string {
+  for (let index = assistantRunIndex - 1; index >= 0; index -= 1) {
+    const item = items[index];
+
+    if (item?.type === "user") {
+      return item.event.content;
+    }
+  }
+
+  return "";
+}
+
+function getAgentRunWorkflowEvents(
+  events: readonly AgentEvent[],
+  items: readonly AgentThreadItem[],
+  assistantRunIndex: number
+): readonly Exclude<AgentEvent, { readonly type: "message" }>[] {
+  const item = items[assistantRunIndex];
+  if (item?.type !== "assistant-run") {
+    return [];
+  }
+
+  const previousUser = findPreviousUserThreadItem(items, assistantRunIndex);
+  const nextUser = findNextUserThreadItem(items, assistantRunIndex);
+  const startTime = Date.parse(previousUser?.event.createdAt ?? item.createdAt);
+  const endTime =
+    nextUser === undefined
+      ? Number.POSITIVE_INFINITY
+      : Date.parse(nextUser.event.createdAt);
+
+  return compactAgentWorkflowEvents(
+    events.filter(
+      (event): event is Exclude<AgentEvent, { readonly type: "message" }> =>
+        event.sessionId === item.sessionId &&
+        isAgentWorkflowEvent(event) &&
+        !isHiddenAgentWorkflowEvent(event) &&
+        isAgentEventInRunWindow(event, startTime, endTime)
+    )
+  );
+}
+
+function findPreviousUserThreadItem(
+  items: readonly AgentThreadItem[],
+  startIndex: number
+): (AgentThreadItem & { readonly type: "user" }) | undefined {
+  for (let index = startIndex - 1; index >= 0; index -= 1) {
+    const item = items[index];
+
+    if (item?.type === "user") {
+      return item;
+    }
+  }
+
+  return undefined;
+}
+
+function findNextUserThreadItem(
+  items: readonly AgentThreadItem[],
+  startIndex: number
+): (AgentThreadItem & { readonly type: "user" }) | undefined {
+  for (let index = startIndex + 1; index < items.length; index += 1) {
+    const item = items[index];
+
+    if (item?.type === "user") {
+      return item;
+    }
+  }
+
+  return undefined;
+}
+
+function isAgentEventInRunWindow(
+  event: AgentEvent,
+  startTime: number,
+  endTime: number
+): boolean {
+  const eventTime = Date.parse(event.createdAt);
+
+  if (!Number.isFinite(eventTime)) {
+    return true;
+  }
+
+  return eventTime >= startTime && eventTime < endTime;
+}
+
+function isHiddenAgentWorkflowEvent(
+  event: Exclude<AgentEvent, { readonly type: "message" }>
+): boolean {
+  return event.type === "tool-call";
+}
+
+function compactAgentWorkflowEvents(
+  events: readonly Exclude<AgentEvent, { readonly type: "message" }>[]
+): readonly Exclude<AgentEvent, { readonly type: "message" }>[] {
+  const compacted: Exclude<AgentEvent, { readonly type: "message" }>[] = [];
+  const eventIndexByKey = new Map<string, number>();
+
+  for (const event of events) {
+    const key = getAgentWorkflowCompactionKey(event);
+    const existingIndex = eventIndexByKey.get(key);
+
+    if (existingIndex === undefined) {
+      eventIndexByKey.set(key, compacted.length);
+      compacted.push(event);
+    } else {
+      compacted[existingIndex] = event;
+    }
+  }
+
+  return compacted.slice(-8);
+}
+
+function getAgentWorkflowCompactionKey(
+  event: Exclude<AgentEvent, { readonly type: "message" }>
+): string {
+  if (event.type === "tool-call") {
+    return `${event.type}:${event.toolName}:${normalizeAgentWorkflowSummary(event.summary)}`;
+  }
+
+  if (event.type === "verification") {
+    return `${event.type}:${event.buildJobId ?? "compile"}`;
+  }
+
+  if (event.type === "patch") {
+    return `${event.type}:${event.changesetId}:${event.filePath}`;
+  }
+
+  if (event.type === "approval") {
+    return `${event.type}:${event.approvalId}`;
+  }
+
+  return `${event.type}:${event.message}`;
+}
+
+function normalizeAgentWorkflowSummary(summary: string): string {
+  return summary
+    .replace(/^Read\s+.+$/u, "Read project file")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function getLatestAgentEvent(events: readonly AgentEvent[]): AgentEvent | undefined {
+  return events.reduce<AgentEvent | undefined>((latestEvent, event) => {
+    if (latestEvent === undefined) {
+      return event;
+    }
+
+    return Date.parse(event.createdAt) >= Date.parse(latestEvent.createdAt)
+      ? event
+      : latestEvent;
+  }, undefined);
+}
+
 function isUserAgentMessage(
   event: AgentEvent
 ): event is AgentEvent & { readonly type: "message"; readonly role: "user" } {
   return event.type === "message" && event.role === "user";
-}
-
-function isAgentMessageEvent(
-  event: AgentEvent
-): event is AgentEvent & { readonly type: "message" } {
-  return event.type === "message";
 }
 
 function isAgentWorkflowEvent(
@@ -8422,75 +8978,42 @@ function getAgentWorkflowEventSummary(
   return event.message;
 }
 
-function getLatestAgentProgressEvent(
-  events: readonly AgentEvent[]
-): AgentEvent | undefined {
-  const eventIndex = findLastAgentEventIndex(
-    events,
-    (event) =>
-      event.type === "tool-call" ||
-      event.type === "approval" ||
-      event.type === "verification" ||
-      event.type === "error"
-  );
-
-  return eventIndex === -1 ? undefined : events[eventIndex];
-}
-
-function formatAgentProgressPreviewContent(
-  event: AgentEvent | undefined,
-  liveStatus: AgentLiveStatus
-): string {
-  if (event === undefined) {
-    return normalizeAgentProgressSentence(liveStatus.detail || liveStatus.title);
+function getVisibleAgentWorkflowEvents({
+  hasAssistantResponse,
+  isActive,
+  workflowEvents
+}: {
+  readonly hasAssistantResponse: boolean;
+  readonly isActive: boolean;
+  readonly workflowEvents: readonly Exclude<AgentEvent, { readonly type: "message" }>[];
+}): readonly Exclude<AgentEvent, { readonly type: "message" }>[] {
+  if (isActive || !hasAssistantResponse) {
+    return workflowEvents;
   }
 
-  if (event.type === "tool-call") {
-    return normalizeAgentProgressSentence(event.summary);
+  return workflowEvents.filter(isAgentWorkflowEventStillActionable);
+}
+
+function isAgentWorkflowEventStillActionable(
+  event: Exclude<AgentEvent, { readonly type: "message" }>
+): boolean {
+  if (event.type === "approval") {
+    return event.status === "requested";
   }
 
   if (event.type === "verification") {
-    return normalizeAgentProgressSentence(event.summary);
-  }
-
-  if (event.type === "approval") {
-    return normalizeAgentProgressSentence(event.prompt);
-  }
-
-  if (event.type === "error") {
-    return normalizeAgentProgressSentence(event.message);
+    return event.status === "failed";
   }
 
   if (event.type === "patch") {
-    return normalizeAgentProgressSentence(event.summary);
+    return (
+      event.status === "failed" ||
+      event.status === "rejected" ||
+      event.status === "reverted"
+    );
   }
 
-  return normalizeAgentProgressSentence(liveStatus.detail || liveStatus.title);
-}
-
-function normalizeAgentProgressSentence(content: string): string {
-  const trimmedContent = content.trim();
-
-  if (trimmedContent.length === 0) {
-    return "Working on this request.";
-  }
-
-  return /[.!?]$/u.test(trimmedContent) ? trimmedContent : `${trimmedContent}.`;
-}
-
-function findLastAgentEventIndex(
-  events: readonly AgentEvent[],
-  predicate: (event: AgentEvent) => boolean
-): number {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-
-    if (event !== undefined && predicate(event)) {
-      return index;
-    }
-  }
-
-  return -1;
+  return event.type === "error";
 }
 
 function parseAgentRichTextBlocks(content: string): readonly AgentRichTextBlock[] {
@@ -8534,6 +9057,33 @@ function parseAgentRichTextBlocks(content: string): readonly AgentRichTextBlock[
     if (trimmedLine.length === 0) {
       flushParagraph();
       flushList();
+      continue;
+    }
+
+    const codeFence = parseMarkdownCodeFence(trimmedLine);
+    if (codeFence !== null) {
+      flushParagraph();
+      flushList();
+
+      const codeLines: string[] = [];
+      lineIndex += 1;
+
+      while (lineIndex < lines.length) {
+        const codeLine = lines[lineIndex] ?? "";
+
+        if (isMarkdownCodeFenceClose(codeLine.trim(), codeFence.fence)) {
+          break;
+        }
+
+        codeLines.push(codeLine);
+        lineIndex += 1;
+      }
+
+      blocks.push({
+        code: codeLines.join("\n"),
+        language: codeFence.language,
+        type: "code-block"
+      });
       continue;
     }
 
@@ -8604,6 +9154,45 @@ function parseAgentRichTextBlocks(content: string): readonly AgentRichTextBlock[
   }
 
   return blocks;
+}
+
+function parseMarkdownCodeFence(
+  line: string
+): { readonly fence: string; readonly language: string | null } | null {
+  const match = line.match(/^(`{3,}|~{3,})\s*([^`~]*)$/u);
+
+  if (match === null) {
+    return null;
+  }
+
+  const language = match[2]?.trim().toLowerCase() ?? "";
+
+  return {
+    fence: match[1] ?? "```",
+    language:
+      language.length === 0 ||
+      language === "text" ||
+      language === "txt" ||
+      language === "plain" ||
+      language === "plaintext"
+        ? null
+        : language
+  };
+}
+
+function isMarkdownCodeFenceClose(line: string, openingFence: string): boolean {
+  const fenceCharacter = openingFence[0];
+  const minimumLength = openingFence.length;
+
+  if (fenceCharacter === "`") {
+    return /^`+\s*$/u.test(line) && line.trim().length >= minimumLength;
+  }
+
+  if (fenceCharacter === "~") {
+    return /^~+\s*$/u.test(line) && line.trim().length >= minimumLength;
+  }
+
+  return false;
 }
 
 function isMarkdownTableRow(line: string): boolean {
@@ -8712,28 +9301,249 @@ function getAgentEventTone(event: AgentEvent): AgentEventTone {
   return "neutral";
 }
 
+function createStartingAgentLiveStatus(
+  prompt: string,
+  providerLabel: string
+): AgentLiveStatus {
+  if (isExternalResearchPrompt(prompt)) {
+    return {
+      detail:
+        "Checking the request, current project context, and whether external source access is required.",
+      title: "Understanding request",
+      tone: "running"
+    };
+  }
+
+  return {
+    detail: "Preparing scoped project context and safety policy.",
+    title: `${providerLabel} is starting`,
+    tone: "running"
+  };
+}
+
+function createAwaitingApprovalLiveStatus(
+  toolName: AgentToolName | undefined
+): AgentLiveStatus {
+  if (toolName === "network-fetch") {
+    return {
+      detail:
+        "Web access is required before the agent can search official sources or verify a current template.",
+      title: "Network approval required",
+      tone: "warning"
+    };
+  }
+
+  if (toolName === "delete-entry") {
+    return {
+      detail: "Review the requested project deletion before removing the entry.",
+      title: "Delete approval required",
+      tone: "warning"
+    };
+  }
+
+  return {
+    detail: "Review the patch in History, then allow or deny the requested action.",
+    title: "Waiting for patch review",
+    tone: "warning"
+  };
+}
+
+function createAgentRunLiveStatus({
+  elapsedSeconds,
+  events,
+  fallback,
+  requestPrompt
+}: {
+  readonly elapsedSeconds: number;
+  readonly events: readonly AgentEvent[];
+  readonly fallback: AgentLiveStatus;
+  readonly requestPrompt: string;
+}): AgentLiveStatus {
+  const requestedApproval = findOpenApprovalEvent(events);
+
+  if (requestedApproval !== undefined) {
+    return createAwaitingApprovalLiveStatus(requestedApproval.toolName);
+  }
+
+  const latestNetworkFetch = findLastAgentEvent(
+    events,
+    (event): event is AgentToolCallEvent =>
+      event.type === "tool-call" && event.toolName === "network-fetch"
+  );
+
+  if (latestNetworkFetch !== undefined) {
+    if (latestNetworkFetch.status === "running") {
+      return {
+        detail:
+          "Searching the approved web source, with priority on official publisher resources.",
+        title: "Searching official sources",
+        tone: "running"
+      };
+    }
+
+    if (latestNetworkFetch.status === "succeeded") {
+      return {
+        detail:
+          "Checking source authority, publication context, and template version before using it.",
+        title: "Verifying source",
+        tone: "running"
+      };
+    }
+
+    return {
+      detail: latestNetworkFetch.summary,
+      title: "Network fetch unavailable",
+      tone: "danger"
+    };
+  }
+
+  if (!isExternalResearchPrompt(requestPrompt)) {
+    return fallback;
+  }
+
+  const latestToolCall = findLastAgentEvent(
+    events,
+    (event): event is AgentToolCallEvent => event.type === "tool-call"
+  );
+
+  if (
+    latestToolCall?.toolName === "read-file" ||
+    latestToolCall === undefined ||
+    elapsedSeconds < 4
+  ) {
+    return {
+      detail:
+        "Checking the request, current project context, and whether external source access is required.",
+      title: "Understanding request",
+      tone: "running"
+    };
+  }
+
+  if (isTemplateResearchPrompt(requestPrompt) && elapsedSeconds < 16) {
+    return {
+      detail:
+        "Reviewing template requirements and expected files before comparing them with the project.",
+      title: "Inspecting template",
+      tone: "running"
+    };
+  }
+
+  if (isTemplateResearchPrompt(requestPrompt) && elapsedSeconds < 28) {
+    return {
+      detail:
+        "Comparing the expected template structure with the current manuscript setup.",
+      title: "Comparing with project",
+      tone: "running"
+    };
+  }
+
+  return {
+    detail:
+      "Preparing a source-aware answer and keeping project files unchanged unless a reviewable action is requested.",
+    title: "Preparing recommendation",
+    tone: "running"
+  };
+}
+
+function hasOpenApproval(events: readonly AgentEvent[]): boolean {
+  return findOpenApprovalEvent(events) !== undefined;
+}
+
+function findOpenApprovalEvent(
+  events: readonly AgentEvent[]
+): (AgentEvent & { readonly type: "approval" }) | undefined {
+  const approvalEventsById = new Map<
+    string,
+    AgentEvent & { readonly type: "approval" }
+  >();
+
+  for (const event of events) {
+    if (event.type === "approval") {
+      approvalEventsById.set(event.approvalId, event);
+    }
+  }
+
+  return [...approvalEventsById.values()]
+    .reverse()
+    .find((event) => event.status === "requested");
+}
+
+function getRequestedApprovalToolName(
+  events: readonly AgentEvent[]
+): AgentToolName | undefined {
+  return findOpenApprovalEvent(events)?.toolName;
+}
+
+function getResolvedApprovalToolName(
+  events: readonly AgentEvent[]
+): AgentToolName | undefined {
+  return findLastAgentEvent(
+    events,
+    (event): event is AgentEvent & { readonly type: "approval" } =>
+      event.type === "approval"
+  )?.toolName;
+}
+
+function findLastAgentEvent<TEvent extends AgentEvent>(
+  events: readonly AgentEvent[],
+  predicate: (event: AgentEvent) => event is TEvent
+): TEvent | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+
+    if (event !== undefined && predicate(event)) {
+      return event;
+    }
+  }
+
+  return undefined;
+}
+
+function isExternalResearchPrompt(prompt: string): boolean {
+  const normalized = prompt.toLowerCase();
+  return (
+    normalized.includes("web search") ||
+    normalized.includes("search web") ||
+    normalized.includes("search online") ||
+    normalized.includes("look it up online") ||
+    normalized.includes("look online") ||
+    normalized.includes("download from") ||
+    normalized.includes("web content") ||
+    /https?:\/\/[^\s`'"]+/iu.test(prompt) ||
+    /\b10\.\d{4,9}\/[^\s]+/iu.test(prompt) ||
+    isLikelyLatestExternalPrompt(normalized)
+  );
+}
+
+function isLikelyLatestExternalPrompt(normalizedPrompt: string): boolean {
+  return (
+    /\blatest\b/u.test(normalizedPrompt) &&
+    /\b(template|package|version|journal|publisher|guidelines?|instructions?|class file|cls|style file|bst|online|web)\b/u.test(
+      normalizedPrompt
+    )
+  );
+}
+
+function isTemplateResearchPrompt(prompt: string): boolean {
+  const normalized = prompt.toLowerCase();
+  return (
+    normalized.includes("template") ||
+    normalized.includes("class file") ||
+    normalized.includes("style file") ||
+    normalized.includes(".cls") ||
+    normalized.includes(".bst")
+  );
+}
+
 function createAgentLiveStatusFromEvent(
   event: AgentEvent
 ): AgentLiveStatus | undefined {
   if (event.type === "tool-call") {
-    return {
-      detail: event.summary,
-      title: `${formatAgentToolName(event.toolName)} ${event.status}`,
-      tone:
-        event.status === "failed" || event.status === "blocked"
-          ? "danger"
-          : event.status === "succeeded"
-            ? "running"
-            : "running"
-    };
+    return createAgentToolLiveStatus(event);
   }
 
   if (event.type === "approval" && event.status === "requested") {
-    return {
-      detail: event.prompt,
-      title: "Waiting for approval",
-      tone: "warning"
-    };
+    return createAwaitingApprovalLiveStatus(event.toolName);
   }
 
   if (event.type === "verification") {
@@ -8758,6 +9568,157 @@ function createAgentLiveStatusFromEvent(
   }
 
   return undefined;
+}
+
+function createAgentToolLiveStatus(event: AgentToolCallEvent): AgentLiveStatus {
+  const tone =
+    event.status === "failed" || event.status === "blocked" ? "danger" : "running";
+
+  if (event.toolName === "codex-exec" || event.toolName === "claude-code") {
+    return {
+      detail: formatAgentModelExecutionDetail(event.summary),
+      title: formatAgentModelExecutionTitle(event.summary, event.status),
+      tone
+    };
+  }
+
+  return {
+    detail: event.summary,
+    title: formatAgentToolLiveTitle(event.toolName, event.status),
+    tone
+  };
+}
+
+function formatAgentToolLiveTitle(
+  toolName: AgentToolName,
+  status: AgentToolCallEvent["status"]
+): string {
+  if (toolName === "read-file") {
+    return status === "running" ? "Reading project file" : "Project file read";
+  }
+
+  if (toolName === "search-project") {
+    return status === "running" ? "Searching project" : "Project search complete";
+  }
+
+  if (toolName === "capture-pdf-preview") {
+    if (status === "failed" || status === "blocked") {
+      return "PDF preview capture unavailable";
+    }
+
+    return status === "running" ? "Capturing PDF preview" : "PDF preview captured";
+  }
+
+  if (toolName === "run-compile") {
+    if (status === "failed" || status === "blocked") {
+      return "Compile failed";
+    }
+
+    return status === "running" ? "Compiling LaTeX" : "Compile finished";
+  }
+
+  if (toolName === "propose-patch") {
+    return status === "running" ? "Preparing patch" : "Patch ready";
+  }
+
+  if (toolName === "apply-patch") {
+    return status === "running" ? "Applying patch" : "Patch applied";
+  }
+
+  if (toolName === "move-entry") {
+    return status === "running" ? "Moving project entry" : "Project entry moved";
+  }
+
+  if (toolName === "delete-entry") {
+    return status === "running" ? "Deleting project entry" : "Project entry deleted";
+  }
+
+  if (toolName === "set-main-file") {
+    return status === "running" ? "Setting main file" : "Main file set";
+  }
+
+  if (toolName === "reject-patch") {
+    return status === "running" ? "Rejecting patch" : "Patch rejected";
+  }
+
+  if (toolName === "network-fetch") {
+    if (status === "failed" || status === "blocked") {
+      return "Network fetch unavailable";
+    }
+
+    return status === "running" ? "Searching official sources" : "Verifying source";
+  }
+
+  return `${formatAgentToolName(toolName)} ${formatAgentStatusLabel(status)}`;
+}
+
+function formatAgentModelExecutionTitle(
+  summary: string,
+  status: AgentToolCallEvent["status"]
+): string {
+  if (status === "failed" || status === "blocked") {
+    return "Analysis failed";
+  }
+
+  if (status === "succeeded") {
+    return "Analysis complete";
+  }
+
+  const normalizedSummary = summary.toLowerCase();
+
+  if (normalizedSummary.includes("compile failed")) {
+    return "Repairing compile error";
+  }
+
+  if (
+    normalizedSummary.includes("concrete change") ||
+    normalizedSummary.includes("tool action")
+  ) {
+    return "Planning project action";
+  }
+
+  if (
+    normalizedSummary.includes("overbroad") ||
+    normalizedSummary.includes("complete minimal patch")
+  ) {
+    return "Checking patch safety";
+  }
+
+  if (normalizedSummary.includes("retry")) {
+    return "Retrying analysis";
+  }
+
+  return "Analyzing project";
+}
+
+function formatAgentModelExecutionDetail(summary: string): string {
+  const elapsedText = /\(([^()]+ elapsed)\)/u.exec(summary)?.[1];
+
+  if (summary.toLowerCase().includes("compile failed")) {
+    return "The agent is reading the compile log and preparing a safe LaTeX repair.";
+  }
+
+  if (
+    summary.toLowerCase().includes("concrete change") ||
+    summary.toLowerCase().includes("tool action")
+  ) {
+    return "The agent is turning the analysis into a reviewable project action.";
+  }
+
+  if (
+    summary.toLowerCase().includes("overbroad") ||
+    summary.toLowerCase().includes("complete minimal patch")
+  ) {
+    return "The agent is asking for a smaller patch before changing project files.";
+  }
+
+  if (summary.toLowerCase().includes("retry")) {
+    return "The agent is retrying with a narrower project-scoped prompt.";
+  }
+
+  return elapsedText === undefined
+    ? "The agent is reading project context and planning the response."
+    : `The agent is reading project context and planning the response (${elapsedText}).`;
 }
 
 function prepareAgentDisplayEvents(
@@ -9049,19 +10010,6 @@ function findLineBoundaryBefore(value: string, index: number): number {
 function findLineBoundaryAfter(value: string, index: number): number {
   const boundary = value.indexOf("\n", index);
   return boundary === -1 ? value.length : boundary;
-}
-
-function formatPdfStaleReason(reason: PdfStaleReason | null): string {
-  switch (reason) {
-    case "unsaved":
-      return "Stale: unsaved source changes";
-    case "saved":
-      return "Stale: saved source newer than PDF";
-    case "external":
-      return "Stale: project changed outside editor";
-    case null:
-      return "Stale";
-  }
 }
 
 function formatSubmissionCheckResult(result: SubmissionCheckResult): string {

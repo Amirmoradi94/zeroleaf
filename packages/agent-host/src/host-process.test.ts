@@ -37,6 +37,20 @@ describe("agent host process session routing", () => {
     expect(source).toContain('session.approvalToolName ?? "apply-patch"');
   });
 
+  it("preflights external web research before provider execution", async () => {
+    const source = await readFile(
+      fileURLToPath(new URL("./host-process.ts", import.meta.url)),
+      "utf8"
+    );
+
+    expect(source).toContain("const networkApproval = createNetworkApprovalRequest");
+    expect(source).toContain('status: "awaiting-approval"');
+    expect(source).toContain('approvalToolName: "network-fetch"');
+    expect(source).toContain('normalized.includes("web search")');
+    expect(source).toContain("isLikelyLatestExternalResourceRequest");
+    expect(source).toContain("official IEEE template sources");
+  });
+
   it("rejects proposed changesets when approval is denied", async () => {
     const rejectedIds: string[] = [];
     const result = await completeDeniedApproval({

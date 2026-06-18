@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { ClaudeProvider } from "@latex-agent/provider-anthropic-claude";
 import { CodexCliProvider } from "@latex-agent/provider-openai-codex";
 import type {
+  AgentDeleteEntryOperation,
   AgentMoveEntryOperation,
   AgentApprovalResponseRequest,
   AgentEvent,
@@ -34,6 +35,7 @@ type HostSession = {
   readonly providerId: AgentProviderId;
   readonly changeset?: HistoryChangeSet;
   readonly changesets?: readonly HistoryChangeSet[];
+  readonly deleteEntries?: readonly AgentDeleteEntryOperation[];
   readonly moveEntries?: readonly AgentMoveEntryOperation[];
   readonly approvalId?: string;
   readonly approvalToolName?: AgentToolName;
@@ -120,6 +122,58 @@ async function startSession(
     ...request,
     sessionId
   };
+  const networkApproval = createNetworkApprovalRequest(request.prompt);
+  if (networkApproval !== undefined) {
+    const approvalId = randomUUID();
+    const result: AgentSessionResult = {
+      sessionId,
+      providerId: request.providerId,
+      status: "awaiting-approval",
+      events: [
+        {
+          id: randomUUID(),
+          sessionId,
+          createdAt: new Date().toISOString(),
+          type: "message",
+          role: "user",
+          content: request.prompt
+        },
+        {
+          id: randomUUID(),
+          sessionId,
+          createdAt: new Date().toISOString(),
+          type: "message",
+          role: "assistant",
+          content:
+            "This request needs external network access, which is approval-gated in the local-first desktop app. If you deny it, I will continue with a local-only alternative or ask you to paste the source material."
+        },
+        {
+          id: randomUUID(),
+          sessionId,
+          createdAt: new Date().toISOString(),
+          type: "approval",
+          approvalId,
+          toolName: "network-fetch",
+          risk: "high",
+          prompt: `Allow external network fetch for ${networkApproval.resource}?`,
+          status: "requested"
+        }
+      ]
+    };
+    sessions.set(sessionId, {
+      request: providerRequest,
+      providerId: request.providerId,
+      events: result.events,
+      approvalId,
+      approvalToolName: "network-fetch"
+    });
+    sendHostMessage({
+      type: "session.result",
+      requestId,
+      result
+    });
+    return;
+  }
   const result = await provider.startSession(
     providerRequest,
     createBrokerProxy(sessionId, request)
@@ -143,6 +197,11 @@ async function startSession(
       : requestedSession?.changesets === undefined
         ? {}
         : { changesets: requestedSession.changesets }),
+    ...(result.deleteEntries !== undefined
+      ? { deleteEntries: result.deleteEntries }
+      : requestedSession?.deleteEntries === undefined
+        ? {}
+        : { deleteEntries: requestedSession.deleteEntries }),
     ...(result.moveEntries !== undefined
       ? { moveEntries: result.moveEntries }
       : requestedSession?.moveEntries === undefined
@@ -247,12 +306,42 @@ async function respondApproval(
     return;
   }
 
-  if (session.changeset === undefined && (session.changesets?.length ?? 0) === 0) {
+  if (
+    session.changeset === undefined &&
+    (session.changesets?.length ?? 0) === 0 &&
+    (session.deleteEntries?.length ?? 0) === 0 &&
+    (session.moveEntries?.length ?? 0) === 0
+  ) {
     throw new Error("Approved session has no changeset to apply.");
   }
 
   const broker = createBrokerProxy(request.sessionId, session.request);
   const events: AgentEvent[] = [...baseEvents];
+  const deletedEntries: AgentDeleteEntryOperation[] = [];
+  for (const deleteEntry of session.deleteEntries ?? []) {
+    events.push(
+      createToolEvent(
+        request.sessionId,
+        "delete-entry",
+        "running",
+        `Deleting ${deleteEntry.path}`,
+        "high"
+      )
+    );
+    const deleted = await broker.deleteEntry?.(deleteEntry.path);
+    const deletedPath = deleted?.path ?? deleteEntry.path;
+    deletedEntries.push({ path: deletedPath });
+    events.push(
+      createToolEvent(
+        request.sessionId,
+        "delete-entry",
+        "succeeded",
+        `Deleted ${deletedPath}`,
+        "high"
+      )
+    );
+  }
+
   for (const moveEntry of session.moveEntries ?? []) {
     events.push(
       createToolEvent(
@@ -354,13 +443,15 @@ async function respondApproval(
     events,
     ...(appliedChangeSet === undefined ? {} : { changeset: appliedChangeSet }),
     ...(session.changesets === undefined ? {} : { changesets: appliedChangeSets }),
+    ...(deletedEntries.length === 0 ? {} : { deleteEntries: deletedEntries }),
     buildResult
   };
   sessions.set(request.sessionId, {
     ...session,
     events: [...session.events, ...events],
     ...(appliedChangeSet === undefined ? {} : { changeset: appliedChangeSet }),
-    ...(session.changesets === undefined ? {} : { changesets: appliedChangeSets })
+    ...(session.changesets === undefined ? {} : { changesets: appliedChangeSets }),
+    ...(deletedEntries.length === 0 ? {} : { deleteEntries: deletedEntries })
   });
   sendHostMessage({ type: "session.result", requestId, result });
 }
@@ -404,6 +495,13 @@ function createBrokerProxy(
     readFile: (path) => requestTool(sessionId, context, "read-file", { path }),
     searchProject: (query) =>
       requestTool(sessionId, context, "search-project", { query }),
+    capturePdfPreview: () =>
+      requestTool(sessionId, context, "capture-pdf-preview", { approved: false }),
+    deleteEntry: (path) =>
+      requestTool(sessionId, context, "delete-entry", {
+        path,
+        approved: true
+      }),
     moveEntry: (fromPath, toPath) =>
       requestTool(sessionId, context, "move-entry", {
         fromPath,
@@ -520,6 +618,60 @@ function createApprovalEvent(
     prompt: status === "allowed" ? "Approved by user." : "Denied by user.",
     status
   };
+}
+
+function createNetworkApprovalRequest(
+  prompt: string
+): { readonly resource: string } | undefined {
+  const normalized = prompt.toLowerCase();
+  const doi = /\b10\.\d{4,9}\/[^\s]+/iu.exec(prompt)?.[0];
+  const url = /https?:\/\/[^\s`'"]+/iu.exec(prompt)?.[0];
+
+  if (
+    doi === undefined &&
+    url === undefined &&
+    !normalized.includes("web search") &&
+    !normalized.includes("search web") &&
+    !normalized.includes("search online") &&
+    !normalized.includes("look it up online") &&
+    !normalized.includes("look online") &&
+    !normalized.includes("fetch doi") &&
+    !normalized.includes("doi metadata") &&
+    !normalized.includes("web content") &&
+    !normalized.includes("download from") &&
+    !isLikelyLatestExternalResourceRequest(normalized)
+  ) {
+    return undefined;
+  }
+
+  return {
+    resource: doi ?? url ?? inferNetworkResourceFromPrompt(normalized)
+  };
+}
+
+function isLikelyLatestExternalResourceRequest(normalizedPrompt: string): boolean {
+  return (
+    /\blatest\b/u.test(normalizedPrompt) &&
+    /\b(template|package|version|journal|publisher|guidelines?|instructions?|class file|cls|style file|bst|online|web)\b/u.test(
+      normalizedPrompt
+    )
+  );
+}
+
+function inferNetworkResourceFromPrompt(normalizedPrompt: string): string {
+  if (
+    normalizedPrompt.includes("ieee") &&
+    (normalizedPrompt.includes("template") ||
+      normalizedPrompt.includes("systems journal"))
+  ) {
+    return "official IEEE template sources";
+  }
+
+  if (normalizedPrompt.includes("template")) {
+    return "external template sources";
+  }
+
+  return "external web content";
 }
 
 function createVerificationEvent(

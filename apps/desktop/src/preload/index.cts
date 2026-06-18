@@ -60,7 +60,8 @@ const api: DesktopApi = {
     stop: (jobId) => invoke("build.stop", { jobId })
   },
   pdf: {
-    readArtifact: (request) => invoke("pdf.readArtifact", request)
+    readArtifact: (request) => invoke("pdf.readArtifact", request),
+    reportPreviewBounds: (request) => invoke("pdf.reportPreviewBounds", request)
   },
   synctex: {
     forward: (request) => invoke("synctex.forward", request),
@@ -91,6 +92,8 @@ const api: DesktopApi = {
     exportPdf: (request) => invoke("lifecycle.exportPdf", request),
     importSourceZip: () => invoke("lifecycle.importSourceZip", undefined),
     createFromTemplate: (request) => invoke("lifecycle.createFromTemplate", request),
+    createFromExternalTemplate: (request) =>
+      invoke("lifecycle.createFromExternalTemplate", request),
     checkSubmission: (request) => invoke("lifecycle.checkSubmission", request)
   },
   settings: {
@@ -101,6 +104,8 @@ const api: DesktopApi = {
   },
   agent: {
     getAuthStatus: (providerId) => invoke("agent.getAuthStatus", { providerId }),
+    openProviderSetupTerminal: (providerId, action) =>
+      invoke("agent.openProviderSetupTerminal", { providerId, action }),
     start: (request) => invoke("agent.start", request),
     respondApproval: (request) => invoke("agent.respondApproval", request),
     cancel: (sessionId) => invoke("agent.cancel", { sessionId }),

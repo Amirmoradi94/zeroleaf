@@ -26,6 +26,10 @@ export async function completeDeniedApproval({
   readonly broker: AgentToolBroker;
 }): Promise<AgentSessionResult> {
   const events: AgentEvent[] = [...baseEvents];
+  const approvalToolName = baseEvents.find(
+    (event): event is AgentEvent & { readonly type: "approval" } =>
+      event.type === "approval"
+  )?.toolName;
   const pendingChangeSets =
     session.changesets ?? (session.changeset === undefined ? [] : [session.changeset]);
   let rejectedChangeSet = session.changeset;
@@ -74,7 +78,9 @@ export async function completeDeniedApproval({
     createVerificationEvent(
       request.sessionId,
       "failed",
-      "Patch approval was denied; no files were changed."
+      approvalToolName === "delete-entry"
+        ? "Delete approval was denied; no files were removed."
+        : "Patch approval was denied; no files were changed."
     )
   );
 
