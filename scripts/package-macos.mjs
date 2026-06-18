@@ -1,4 +1,5 @@
-import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -15,20 +16,32 @@ const resourcesRoot = resolve(bundleResourcesRoot, "app");
 const launcherPath = resolve(contentsRoot, "MacOS/ZeroLeaf");
 const plistPath = resolve(contentsRoot, "Info.plist");
 
+function ditto(source, destination) {
+  const result = spawnSync("ditto", [source, destination], {
+    cwd: repoRoot,
+    encoding: "utf8"
+  });
+
+  if (result.status !== 0) {
+    throw new Error(
+      `ditto failed: ${result.stderr.trim() || result.stdout.trim() || "unknown error"}`
+    );
+  }
+}
+
 await rm(appRoot, { recursive: true, force: true });
 await mkdir(resolve(contentsRoot, "MacOS"), { recursive: true });
 await mkdir(resourcesRoot, { recursive: true });
-await cp(resolve(repoRoot, "apps/desktop/dist"), resolve(resourcesRoot, "dist"), {
-  recursive: true
-});
-await cp(resolve(repoRoot, "apps/desktop/assets"), resolve(resourcesRoot, "assets"), {
-  recursive: true
-});
-await cp(
+ditto(resolve(repoRoot, "apps/desktop/dist"), resolve(resourcesRoot, "dist"));
+ditto(resolve(repoRoot, "apps/desktop/assets"), resolve(resourcesRoot, "assets"));
+await copyFile(
   resolve(repoRoot, "apps/desktop/assets/zeroleaf-icon.icns"),
   resolve(bundleResourcesRoot, "zeroleaf-icon.icns")
 );
-await cp(resolve(repoRoot, "package.json"), resolve(resourcesRoot, "package.json"));
+await copyFile(
+  resolve(repoRoot, "package.json"),
+  resolve(resourcesRoot, "package.json")
+);
 
 await writeFile(
   launcherPath,

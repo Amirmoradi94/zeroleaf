@@ -9,7 +9,7 @@ reviewable fixes.
 
 ## Alpha Status
 
-Current version: `0.0.0-alpha.1`
+Current version: `0.0.0-alpha.2`
 
 Private-alpha handoff docs live in `docs/release/`.
 
