@@ -239,6 +239,10 @@ select:disabled {
   background: #eef3f2;
 }
 
+.activity-rail-spacer {
+  flex: 1 1 auto;
+}
+
 .project-sidebar,
 .editor-pane,
 .pdf-pane,

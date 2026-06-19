@@ -4056,14 +4056,15 @@ export function App() {
           >
             <Play size={17} />
           </IconButton>
-          <IconButton label="Open settings" onClick={() => setSettingsOpen(true)}>
-            <Settings size={17} />
-          </IconButton>
         </nav>
       </header>
 
       <div className="workspace" style={workspaceStyle}>
-        <ActivityRail activeTab={activeSidebarTab} onSelectTab={setActiveSidebarTab} />
+        <ActivityRail
+          activeTab={activeSidebarTab}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onSelectTab={setActiveSidebarTab}
+        />
         {activeSidebarTab === "files" && (
           <ProjectSidebar
             activeFilePath={activeFile?.path}
@@ -4468,9 +4469,11 @@ export function App() {
 
 function ActivityRail({
   activeTab,
+  onOpenSettings,
   onSelectTab
 }: {
   readonly activeTab: SidebarTab;
+  readonly onOpenSettings: () => void;
   readonly onSelectTab: (tab: SidebarTab) => void;
 }) {
   return (
@@ -4495,6 +4498,10 @@ function ActivityRail({
         onClick={() => onSelectTab("templates")}
       >
         <Plus size={18} />
+      </IconButton>
+      <div className="activity-rail-spacer" aria-hidden="true" />
+      <IconButton label="Open settings" onClick={onOpenSettings}>
+        <Settings size={18} />
       </IconButton>
     </aside>
   );

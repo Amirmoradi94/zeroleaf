@@ -1,7 +1,20 @@
 import { spawnSync } from "node:child_process";
-import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import {
+  chmod,
+  copyFile,
+  cp,
+  mkdir,
+  readdir,
+  readFile,
+  readlink,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -38,17 +51,35 @@ const localWorkspacePackages = [
   "ui"
 ];
 
-function ditto(source, destination) {
-  const result = spawnSync("ditto", ["--norsrc", source, destination], {
-    cwd: repoRoot,
-    env: { ...process.env, COPYFILE_DISABLE: "1" },
-    encoding: "utf8"
-  });
+async function copyTree(source, destination) {
+  await rm(destination, { recursive: true, force: true });
+  await mkdir(destination, { recursive: true });
+  await copyTreeContents(source, destination);
+}
 
-  if (result.status !== 0) {
-    throw new Error(
-      `ditto failed: ${result.stderr.trim() || result.stdout.trim() || "unknown error"}`
-    );
+async function copyTreeContents(source, destination) {
+  const entries = await readdir(source, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const sourcePath = resolve(source, entry.name);
+    const destinationPath = resolve(destination, entry.name);
+
+    if (entry.isDirectory()) {
+      await mkdir(destinationPath, { recursive: true });
+      await copyTreeContents(sourcePath, destinationPath);
+      continue;
+    }
+
+    if (entry.isSymbolicLink()) {
+      await symlink(await readlink(sourcePath), destinationPath);
+      continue;
+    }
+
+    if (entry.isFile()) {
+      const sourceStats = await stat(sourcePath);
+      await writeFile(destinationPath, await readFile(sourcePath));
+      await chmod(destinationPath, sourceStats.mode);
+    }
   }
 }
 
@@ -71,13 +102,20 @@ function plistSet(key, value) {
 }
 
 await rm(appRoot, { recursive: true, force: true });
-ditto(electronAppRoot, appRoot);
+await cp(electronAppRoot, appRoot, {
+  recursive: true,
+  force: true,
+  verbatimSymlinks: true
+});
 await rename(electronExecutablePath, appExecutablePath);
 
 await rm(resourcesRoot, { recursive: true, force: true });
 await mkdir(resourcesRoot, { recursive: true });
-ditto(resolve(repoRoot, "apps/desktop/dist"), resolve(resourcesRoot, "dist"));
-ditto(resolve(repoRoot, "apps/desktop/assets"), resolve(resourcesRoot, "assets"));
+await copyTree(resolve(repoRoot, "apps/desktop/dist"), resolve(resourcesRoot, "dist"));
+await copyTree(
+  resolve(repoRoot, "apps/desktop/assets"),
+  resolve(resourcesRoot, "assets")
+);
 await copyFile(
   resolve(repoRoot, "apps/desktop/assets/zeroleaf-icon.icns"),
   resolve(bundleResourcesRoot, "zeroleaf-icon.icns")
@@ -117,7 +155,7 @@ for (const packageName of localWorkspacePackages) {
     resolve(packageRoot, "package.json"),
     resolve(bundledPackageRoot, "package.json")
   );
-  ditto(resolve(packageRoot, "dist"), resolve(bundledPackageRoot, "dist"));
+  await copyTree(resolve(packageRoot, "dist"), resolve(bundledPackageRoot, "dist"));
 }
 
 plistSet("CFBundleDisplayName", "ZeroLeaf");
