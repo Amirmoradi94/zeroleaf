@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { formatAgentSelectionContextForPrompt } from "@latex-agent/ipc-contracts";
@@ -27,6 +28,13 @@ const defaultCodexExecTimeoutMs = 7_200_000;
 const defaultCodexProgressHeartbeatMs = 15_000;
 const maxCodexPlannerAttempts = 2;
 const maxCodexCompileRepairAttempts = 2;
+const codexPathEnvName = "LATEX_AGENT_CODEX_BIN";
+const commonProviderCliDirs = [
+  join(homedir(), ".local", "bin"),
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/Library/TeX/texbin"
+] as const;
 
 export type CodexCliToolBroker = {
   readonly emitEvent?: (event: AgentEvent) => void;
@@ -102,7 +110,7 @@ export class CodexCliProvider {
 
   constructor(options: CodexCliProviderOptions = {}) {
     this.codexBinary =
-      options.codexBinary ?? process.env["LATEX_AGENT_CODEX_BIN"] ?? "codex";
+      options.codexBinary ?? getConfiguredCliBinary(codexPathEnvName, "codex");
     this.progressHeartbeatMs =
       options.progressHeartbeatMs ?? defaultCodexProgressHeartbeatMs;
     this.timeoutMs = options.timeoutMs ?? defaultCodexExecTimeoutMs;
@@ -1400,6 +1408,32 @@ export class CodexCliProvider {
   }
 }
 
+function getConfiguredCliBinary(envName: string, binaryName: string): string {
+  const configuredBinary = process.env[envName]?.trim();
+  if (configuredBinary !== undefined && configuredBinary.length > 0) {
+    return configuredBinary;
+  }
+
+  const locatedBinary = commonProviderCliDirs
+    .map((directory) => join(directory, binaryName))
+    .find((candidate) => existsSync(candidate));
+
+  return locatedBinary ?? binaryName;
+}
+
+function createProviderCliEnv(): NodeJS.ProcessEnv {
+  const existingPath = process.env.PATH ?? "";
+  const pathEntries = existingPath.split(":").filter((entry) => entry.length > 0);
+  const nextPath = Array.from(new Set([...commonProviderCliDirs, ...pathEntries])).join(
+    ":"
+  );
+
+  return {
+    ...process.env,
+    PATH: nextPath
+  };
+}
+
 async function getCodexCliAuthStatus(codexBinary: string): Promise<CodexCliAuthStatus> {
   try {
     const { stdout, stderr } = await runCommand(
@@ -1482,7 +1516,7 @@ async function runCommand(
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     const child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: createProviderCliEnv(),
       detached: process.platform !== "win32"
     });
     let stdout = "";

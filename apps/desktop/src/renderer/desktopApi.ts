@@ -97,7 +97,16 @@ const fallbackApi: DesktopApi = {
         appVersion: "dev",
         platform: getBrowserPlatform(),
         isPackaged: false
-      })
+      }),
+    checkForUpdates: () =>
+      Promise.resolve({
+        checkedAt: new Date().toISOString(),
+        currentVersion: "dev",
+        state: "not-configured",
+        message: "Update checks are unavailable in browser fallback."
+      }),
+    openUpdateDownload: () =>
+      Promise.reject(new Error("Electron app update API unavailable."))
   },
   workbench: {
     loadLayout: () => Promise.resolve(readFallbackLayout()),

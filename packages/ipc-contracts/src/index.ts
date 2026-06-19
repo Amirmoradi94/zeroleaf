@@ -1,5 +1,7 @@
 export const ipcChannels = {
   appGetInfo: "app.getInfo",
+  appCheckForUpdates: "app.checkForUpdates",
+  appOpenUpdateDownload: "app.openUpdateDownload",
   workbenchLoadLayout: "workbench.loadLayout",
   workbenchSaveLayout: "workbench.saveLayout",
   editorLoadProjectState: "editor.loadProjectState",
@@ -61,6 +63,20 @@ export type AppInfo = {
   readonly appVersion: string;
   readonly platform: NodeJS.Platform;
   readonly isPackaged: boolean;
+};
+
+export type AppUpdatePreferences = {
+  readonly checkOnStartup: boolean;
+};
+
+export type AppUpdateCheckResult = {
+  readonly checkedAt: string;
+  readonly currentVersion: string;
+  readonly state: "available" | "current" | "not-configured" | "error";
+  readonly message: string;
+  readonly latestVersion?: string;
+  readonly downloadUrl?: string;
+  readonly releaseNotesUrl?: string;
 };
 
 export type WorkbenchLayout = {
@@ -1946,6 +1962,7 @@ export type AppSettings = {
   readonly compiler: CompilerPreferences;
   readonly agentPermissions: AgentPermissionPreferences;
   readonly appearance: AppearancePreferences;
+  readonly updates: AppUpdatePreferences;
   readonly privacy: PrivacyPreferences;
   readonly credentials: readonly CredentialStorageStatus[];
 };
@@ -1976,6 +1993,9 @@ export const defaultAppSettings: AppSettings = {
     density: "comfortable",
     accent: "teal",
     highContrastLight: false
+  },
+  updates: {
+    checkOnStartup: true
   },
   privacy: {
     storeAgentTranscripts: true,
@@ -2015,6 +2035,8 @@ export type PrivacySummary = {
 
 export type IpcRequestMap = {
   readonly [ipcChannels.appGetInfo]: undefined;
+  readonly [ipcChannels.appCheckForUpdates]: undefined;
+  readonly [ipcChannels.appOpenUpdateDownload]: { readonly url: string };
   readonly [ipcChannels.workbenchLoadLayout]: undefined;
   readonly [ipcChannels.workbenchSaveLayout]: WorkbenchLayout;
   readonly [ipcChannels.editorLoadProjectState]: { readonly projectRoot: string };
@@ -2144,6 +2166,8 @@ export type IpcRequestMap = {
 
 export type IpcResponseMap = {
   readonly [ipcChannels.appGetInfo]: AppInfo;
+  readonly [ipcChannels.appCheckForUpdates]: AppUpdateCheckResult;
+  readonly [ipcChannels.appOpenUpdateDownload]: { readonly opened: true };
   readonly [ipcChannels.workbenchLoadLayout]: WorkbenchLayout;
   readonly [ipcChannels.workbenchSaveLayout]: WorkbenchLayout;
   readonly [ipcChannels.editorLoadProjectState]: EditorProjectState;
@@ -2216,6 +2240,8 @@ export type IpcInvoke = <TChannel extends IpcChannel>(
 export type DesktopApi = {
   readonly app: {
     readonly getInfo: () => Promise<AppInfo>;
+    readonly checkForUpdates: () => Promise<AppUpdateCheckResult>;
+    readonly openUpdateDownload: (url: string) => Promise<{ readonly opened: true }>;
   };
   readonly workbench: {
     readonly loadLayout: () => Promise<WorkbenchLayout>;

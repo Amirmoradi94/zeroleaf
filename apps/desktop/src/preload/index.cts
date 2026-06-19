@@ -17,7 +17,9 @@ function invoke<TChannel extends IpcChannel>(
 
 const api: DesktopApi = {
   app: {
-    getInfo: () => invoke("app.getInfo", undefined)
+    getInfo: () => invoke("app.getInfo", undefined),
+    checkForUpdates: () => invoke("app.checkForUpdates", undefined),
+    openUpdateDownload: (url) => invoke("app.openUpdateDownload", { url })
   },
   workbench: {
     loadLayout: () => invoke("workbench.loadLayout", undefined),

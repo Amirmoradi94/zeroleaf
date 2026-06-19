@@ -33,6 +33,7 @@ import type {
   AgentToolName,
   AppInfo,
   AppSettings,
+  AppUpdateCheckResult,
   BibliographyEntry,
   BuildResult,
   AuditEvent,
@@ -64,6 +65,7 @@ import {
   Clock,
   Command as CommandIcon,
   Copy,
+  Download,
   FileText,
   FolderPlus,
   FolderOpen,
@@ -141,6 +143,7 @@ const settingsTabs = [
   "AI Providers",
   "Agent Permissions",
   "Appearance",
+  "Updates",
   "Keybindings",
   "Privacy"
 ] as const;
@@ -338,6 +341,9 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("Editor");
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings);
+  const [updateCheckResult, setUpdateCheckResult] =
+    useState<AppUpdateCheckResult | null>(null);
+  const [updateCheckRunning, setUpdateCheckRunning] = useState(false);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("files");
   const [bottomPanelOpen, setBottomPanelOpen] = useState(false);
   const [privacySummary, setPrivacySummary] = useState<PrivacySummary | null>(null);
@@ -494,6 +500,41 @@ export function App() {
     );
   }, []);
 
+  const checkForAppUpdates = useCallback(async () => {
+    setUpdateCheckRunning(true);
+    try {
+      const result = await desktopApi.app.checkForUpdates();
+      setUpdateCheckResult(result);
+      if (result.state === "available") {
+        setStatusMessage(`ZeroLeaf ${result.latestVersion} is available.`);
+      } else if (result.state === "error") {
+        setStatusMessage(result.message);
+      }
+      return result;
+    } catch (error) {
+      const result: AppUpdateCheckResult = {
+        checkedAt: new Date().toISOString(),
+        currentVersion: "unknown",
+        state: "error",
+        message: getErrorMessage(error)
+      };
+      setUpdateCheckResult(result);
+      setStatusMessage(result.message);
+      return result;
+    } finally {
+      setUpdateCheckRunning(false);
+    }
+  }, []);
+
+  const openUpdateDownload = useCallback(async (url: string) => {
+    try {
+      await desktopApi.app.openUpdateDownload(url);
+      setStatusMessage("Opened ZeroLeaf update download in your browser.");
+    } catch (error) {
+      setStatusMessage(getErrorMessage(error));
+    }
+  }, []);
+
   const openProviderSetupTerminal = useCallback(
     async (providerId: AgentProviderId, action: AgentProviderSetupAction) => {
       try {
@@ -537,12 +578,15 @@ export function App() {
         readStoredAgentProvider(settings.agentPermissions.defaultProviderId)
       );
       setAgentMode(settings.agentPermissions.defaultMode);
+      if (settings.updates.checkOnStartup) {
+        void checkForAppUpdates();
+      }
     });
     void desktopApi.lifecycle.listTemplates().then(setProjectTemplates);
     void desktopApi.settings.getPrivacySummary().then(setPrivacySummary);
     void refreshToolchainStatus();
     void refreshAgentAuthStatuses();
-  }, [refreshAgentAuthStatuses, refreshToolchainStatus]);
+  }, [checkForAppUpdates, refreshAgentAuthStatuses, refreshToolchainStatus]);
 
   useEffect(() => {
     return desktopApi.agent.onEvent((event) => {
@@ -4399,6 +4443,12 @@ export function App() {
         onOpenProviderSetupTerminal={(providerId, action) => {
           void openProviderSetupTerminal(providerId, action);
         }}
+        onOpenUpdateDownload={(url) => {
+          void openUpdateDownload(url);
+        }}
+        onCheckForUpdates={() => {
+          void checkForAppUpdates();
+        }}
         onRefreshPrivacySummary={() => {
           void refreshPrivacySummary();
         }}
@@ -4409,6 +4459,8 @@ export function App() {
         onSetAgentMode={updateAgentMode}
         onSetAgentProviderId={updateAgentProviderId}
         onSetCompiler={updateSelectedCompiler}
+        updateCheckResult={updateCheckResult}
+        updateCheckRunning={updateCheckRunning}
       />
     </div>
   );
@@ -7023,9 +7075,11 @@ function SettingsDialog({
   keybindingQuery,
   onActiveTabChange,
   onClearLocalHistory,
+  onCheckForUpdates,
   onClose,
   onKeybindingQueryChange,
   onOpenProviderSetupTerminal,
+  onOpenUpdateDownload,
   onRefreshPrivacySummary,
   onRefreshAgentAuthStatuses,
   onSetAgentMode,
@@ -7033,6 +7087,8 @@ function SettingsDialog({
   onSetCompiler,
   onSettingsChange,
   privacySummary,
+  updateCheckResult,
+  updateCheckRunning,
   open
 }: {
   readonly activeTab: SettingsTab;
@@ -7043,12 +7099,14 @@ function SettingsDialog({
   readonly keybindingQuery: string;
   readonly onActiveTabChange: (tab: SettingsTab) => void;
   readonly onClearLocalHistory: () => void;
+  readonly onCheckForUpdates: () => void;
   readonly onClose: () => void;
   readonly onKeybindingQueryChange: (query: string) => void;
   readonly onOpenProviderSetupTerminal: (
     providerId: AgentProviderId,
     action: AgentProviderSetupAction
   ) => void;
+  readonly onOpenUpdateDownload: (url: string) => void;
   readonly onRefreshPrivacySummary: () => void;
   readonly onRefreshAgentAuthStatuses: () => void;
   readonly onSetAgentMode: (mode: AgentMode) => void;
@@ -7056,6 +7114,8 @@ function SettingsDialog({
   readonly onSetCompiler: (compiler: LatexCompiler) => void;
   readonly onSettingsChange: (updater: (settings: AppSettings) => AppSettings) => void;
   readonly privacySummary: PrivacySummary | null;
+  readonly updateCheckResult: AppUpdateCheckResult | null;
+  readonly updateCheckRunning: boolean;
   readonly open: boolean;
 }) {
   if (!open) {
@@ -7107,14 +7167,18 @@ function SettingsDialog({
             settings={appSettings}
             tab={activeTab}
             onClearLocalHistory={onClearLocalHistory}
+            onCheckForUpdates={onCheckForUpdates}
             onKeybindingQueryChange={onKeybindingQueryChange}
             onOpenProviderSetupTerminal={onOpenProviderSetupTerminal}
+            onOpenUpdateDownload={onOpenUpdateDownload}
             onRefreshPrivacySummary={onRefreshPrivacySummary}
             onRefreshAgentAuthStatuses={onRefreshAgentAuthStatuses}
             onSetAgentMode={onSetAgentMode}
             onSetAgentProviderId={onSetAgentProviderId}
             onSetCompiler={onSetCompiler}
             onSettingsChange={onSettingsChange}
+            updateCheckResult={updateCheckResult}
+            updateCheckRunning={updateCheckRunning}
           />
         </div>
       </section>
@@ -7128,8 +7192,10 @@ function SettingsTabPanel({
   agentProviderId,
   keybindingQuery,
   onClearLocalHistory,
+  onCheckForUpdates,
   onKeybindingQueryChange,
   onOpenProviderSetupTerminal,
+  onOpenUpdateDownload,
   onRefreshPrivacySummary,
   onRefreshAgentAuthStatuses,
   onSetAgentMode,
@@ -7138,18 +7204,22 @@ function SettingsTabPanel({
   onSettingsChange,
   privacySummary,
   settings,
-  tab
+  tab,
+  updateCheckResult,
+  updateCheckRunning
 }: {
   readonly agentAuthStatuses: AgentAuthStatusByProvider;
   readonly agentMode: AgentMode;
   readonly agentProviderId: AgentProviderId;
   readonly keybindingQuery: string;
   readonly onClearLocalHistory: () => void;
+  readonly onCheckForUpdates: () => void;
   readonly onKeybindingQueryChange: (query: string) => void;
   readonly onOpenProviderSetupTerminal: (
     providerId: AgentProviderId,
     action: AgentProviderSetupAction
   ) => void;
+  readonly onOpenUpdateDownload: (url: string) => void;
   readonly onRefreshPrivacySummary: () => void;
   readonly onRefreshAgentAuthStatuses: () => void;
   readonly onSetAgentMode: (mode: AgentMode) => void;
@@ -7159,6 +7229,8 @@ function SettingsTabPanel({
   readonly privacySummary: PrivacySummary | null;
   readonly settings: AppSettings;
   readonly tab: SettingsTab;
+  readonly updateCheckResult: AppUpdateCheckResult | null;
+  readonly updateCheckRunning: boolean;
 }) {
   const filteredKeybindings = commandDefinitions.filter((command) => {
     const query = keybindingQuery.trim().toLowerCase();
@@ -7171,6 +7243,11 @@ function SettingsTabPanel({
       .toLowerCase()
       .includes(query);
   });
+  const updateDownloadUrl =
+    updateCheckResult?.state === "available"
+      ? updateCheckResult.downloadUrl
+      : undefined;
+  const updateReleaseNotesUrl = updateCheckResult?.releaseNotesUrl;
 
   return (
     <div className="settings-panel" role="tabpanel">
@@ -7449,6 +7526,83 @@ function SettingsTabPanel({
           />
         </>
       )}
+      {tab === "Updates" && (
+        <>
+          <Toggle
+            checked={settings.updates.checkOnStartup}
+            label="Check at startup"
+            onChange={(checkOnStartup) =>
+              onSettingsChange((current) => ({
+                ...current,
+                updates: { ...current.updates, checkOnStartup }
+              }))
+            }
+          />
+          <section className="update-status-panel" aria-label="Update status">
+            <div className="update-status-heading">
+              <div>
+                <strong>{formatUpdateStatusTitle(updateCheckResult)}</strong>
+                <p>{updateCheckResult?.message ?? "No update check has run yet."}</p>
+              </div>
+              <span
+                className={`update-status-pill ${updateCheckResult?.state ?? "idle"}`}
+              >
+                {formatUpdateState(updateCheckResult?.state)}
+              </span>
+            </div>
+            <div className="update-version-grid">
+              <Field
+                label="Current version"
+                value={updateCheckResult?.currentVersion ?? "Unknown"}
+              />
+              <Field
+                label="Latest version"
+                value={updateCheckResult?.latestVersion ?? "Unknown"}
+              />
+              <Field
+                label="Last checked"
+                value={formatUpdateCheckedAt(updateCheckResult)}
+              />
+            </div>
+          </section>
+          <div className="settings-action-row">
+            <button
+              className="text-button settings-action"
+              type="button"
+              disabled={updateCheckRunning}
+              onClick={onCheckForUpdates}
+            >
+              <RefreshCw aria-hidden="true" size={15} />
+              {updateCheckRunning ? "Checking" : "Check for updates"}
+            </button>
+            {updateDownloadUrl !== undefined && (
+              <button
+                className="text-button settings-action"
+                type="button"
+                onClick={() => onOpenUpdateDownload(updateDownloadUrl)}
+              >
+                <Download aria-hidden="true" size={15} />
+                Download update
+              </button>
+            )}
+            {updateReleaseNotesUrl !== undefined && (
+              <button
+                className="text-button settings-action"
+                type="button"
+                onClick={() => onOpenUpdateDownload(updateReleaseNotesUrl)}
+              >
+                <FileText aria-hidden="true" size={15} />
+                Release notes
+              </button>
+            )}
+          </div>
+          <p className="settings-note">
+            Release builds read a configured release feed. Project files and settings
+            are stored outside the app bundle, so replacing the app does not remove
+            local work.
+          </p>
+        </>
+      )}
       {tab === "Keybindings" && (
         <>
           <TextField
@@ -7616,6 +7770,47 @@ function ProviderSettingsRow({
       </ol>
     </section>
   );
+}
+
+function formatUpdateStatusTitle(result: AppUpdateCheckResult | null): string {
+  switch (result?.state) {
+    case "available":
+      return "Update available";
+    case "current":
+      return "Up to date";
+    case "not-configured":
+      return "Update checks not configured";
+    case "error":
+      return "Update check failed";
+    default:
+      return "Update status";
+  }
+}
+
+function formatUpdateState(state: AppUpdateCheckResult["state"] | undefined): string {
+  switch (state) {
+    case "available":
+      return "Available";
+    case "current":
+      return "Current";
+    case "not-configured":
+      return "Setup needed";
+    case "error":
+      return "Error";
+    default:
+      return "Idle";
+  }
+}
+
+function formatUpdateCheckedAt(result: AppUpdateCheckResult | null): string {
+  if (result === null) {
+    return "Never";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short"
+  }).format(new Date(result.checkedAt));
 }
 
 function getProviderSetupSteps(

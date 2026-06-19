@@ -65,6 +65,7 @@ import {
   type AgentProviderSetupAction,
   type AgentEvent,
   type AppSettings,
+  type AppUpdateCheckResult,
   type EditorProjectState,
   type ExternalProjectTemplateId,
   type IpcChannel,
@@ -184,6 +185,10 @@ function normalizeAppSettings(value: unknown): AppSettings {
     typeof candidate.privacy === "object" && candidate.privacy !== null
       ? (candidate.privacy as Partial<AppSettings["privacy"]>)
       : {};
+  const updates =
+    typeof candidate.updates === "object" && candidate.updates !== null
+      ? (candidate.updates as Partial<AppSettings["updates"]>)
+      : {};
 
   return {
     editor: {
@@ -258,6 +263,12 @@ function normalizeAppSettings(value: unknown): AppSettings {
         typeof appearance.highContrastLight === "boolean"
           ? appearance.highContrastLight
           : defaultAppSettings.appearance.highContrastLight
+    },
+    updates: {
+      checkOnStartup:
+        typeof updates.checkOnStartup === "boolean"
+          ? updates.checkOnStartup
+          : defaultAppSettings.updates.checkOnStartup
     },
     privacy: {
       storeAgentTranscripts:
@@ -526,6 +537,246 @@ function handleIpc<TChannel extends IpcChannel>(
   });
 }
 
+async function checkForAppUpdates(): Promise<AppUpdateCheckResult> {
+  const checkedAt = new Date().toISOString();
+  const currentVersion = app.getVersion();
+  const manifestUrl = parseHttpUrl(await getConfiguredUpdateManifestUrl());
+
+  if (manifestUrl === undefined) {
+    return {
+      checkedAt,
+      currentVersion,
+      state: "not-configured",
+      message:
+        "Update checks are not configured. Set ZEROLEAF_UPDATE_MANIFEST_URL for release builds."
+    };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+
+    try {
+      const response = await fetch(manifestUrl, {
+        cache: "no-store",
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        throw new Error(`Update manifest returned HTTP ${response.status}.`);
+      }
+
+      const manifest = parseUpdateManifest(await response.json());
+      const updateAvailable =
+        compareAppVersions(manifest.latestVersion, currentVersion) > 0;
+
+      return {
+        checkedAt,
+        currentVersion,
+        state: updateAvailable ? "available" : "current",
+        message: updateAvailable
+          ? (manifest.message ?? `Version ${manifest.latestVersion} is available.`)
+          : `ZeroLeaf ${currentVersion} is up to date.`,
+        latestVersion: manifest.latestVersion,
+        downloadUrl: manifest.downloadUrl,
+        ...(manifest.releaseNotesUrl === undefined
+          ? {}
+          : { releaseNotesUrl: manifest.releaseNotesUrl })
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (error) {
+    return {
+      checkedAt,
+      currentVersion,
+      state: "error",
+      message: `Update check failed: ${getErrorMessage(error)}`
+    };
+  }
+}
+
+async function getConfiguredUpdateManifestUrl(): Promise<string | undefined> {
+  const environmentUrl = process.env["ZEROLEAF_UPDATE_MANIFEST_URL"]?.trim();
+  if (environmentUrl !== undefined && environmentUrl.length > 0) {
+    return environmentUrl;
+  }
+
+  try {
+    const packageContents = await readFile(
+      join(app.getAppPath(), "package.json"),
+      "utf8"
+    );
+    const packageJson = JSON.parse(packageContents) as {
+      readonly zeroLeaf?: {
+        readonly updateManifestUrl?: unknown;
+      };
+    };
+    const bundledUrl = packageJson.zeroLeaf?.updateManifestUrl;
+
+    return typeof bundledUrl === "string" && bundledUrl.trim().length > 0
+      ? bundledUrl.trim()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseUpdateManifest(value: unknown): {
+  readonly latestVersion: string;
+  readonly downloadUrl: string;
+  readonly releaseNotesUrl?: string;
+  readonly message?: string;
+} {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("Update manifest was not a JSON object.");
+  }
+
+  const candidate = value as {
+    readonly latestVersion?: unknown;
+    readonly downloadUrl?: unknown;
+    readonly releaseNotesUrl?: unknown;
+    readonly message?: unknown;
+  };
+  const latestVersion =
+    typeof candidate.latestVersion === "string" ? candidate.latestVersion.trim() : "";
+  const downloadUrl =
+    typeof candidate.downloadUrl === "string" ? candidate.downloadUrl.trim() : "";
+  const releaseNotesUrl =
+    typeof candidate.releaseNotesUrl === "string"
+      ? candidate.releaseNotesUrl.trim()
+      : "";
+  const message =
+    typeof candidate.message === "string" && candidate.message.trim().length > 0
+      ? candidate.message.trim()
+      : undefined;
+
+  if (latestVersion.length === 0) {
+    throw new Error("Update manifest is missing latestVersion.");
+  }
+
+  if (parseHttpUrl(downloadUrl) === undefined) {
+    throw new Error("Update manifest is missing a valid downloadUrl.");
+  }
+
+  if (releaseNotesUrl.length > 0 && parseHttpUrl(releaseNotesUrl) === undefined) {
+    throw new Error("Update manifest has an invalid releaseNotesUrl.");
+  }
+
+  return {
+    latestVersion,
+    downloadUrl,
+    ...(releaseNotesUrl.length === 0 ? {} : { releaseNotesUrl }),
+    ...(message === undefined ? {} : { message })
+  };
+}
+
+function parseHttpUrl(value: string | undefined): URL | undefined {
+  if (value === undefined || value.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function compareAppVersions(left: string, right: string): number {
+  const leftVersion = parseAppVersion(left);
+  const rightVersion = parseAppVersion(right);
+
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (leftVersion.core[index] ?? 0) - (rightVersion.core[index] ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+
+  if (leftVersion.preRelease === rightVersion.preRelease) {
+    return 0;
+  }
+
+  if (leftVersion.preRelease === undefined) {
+    return 1;
+  }
+
+  if (rightVersion.preRelease === undefined) {
+    return -1;
+  }
+
+  return compareVersionIdentifiers(leftVersion.preRelease, rightVersion.preRelease);
+}
+
+function parseAppVersion(version: string): {
+  readonly core: readonly [number, number, number];
+  readonly preRelease?: readonly string[];
+} {
+  const normalized = version.trim().replace(/^v/iu, "");
+  const [coreVersion = "", preReleaseAndBuild] = normalized.split("-", 2);
+  const coreParts = coreVersion.split(".").map((part) => Number.parseInt(part, 10));
+  const preRelease = preReleaseAndBuild?.split("+", 1)[0]?.split(".");
+
+  return {
+    core: [
+      getVersionCorePart(coreParts, 0),
+      getVersionCorePart(coreParts, 1),
+      getVersionCorePart(coreParts, 2)
+    ],
+    ...(preRelease === undefined || preRelease.length === 0 ? {} : { preRelease })
+  };
+}
+
+function getVersionCorePart(parts: readonly number[], index: number): number {
+  const part = parts[index];
+  return part === undefined || !Number.isFinite(part) ? 0 : part;
+}
+
+function compareVersionIdentifiers(
+  leftIdentifiers: readonly string[],
+  rightIdentifiers: readonly string[]
+): number {
+  const length = Math.max(leftIdentifiers.length, rightIdentifiers.length);
+
+  for (let index = 0; index < length; index += 1) {
+    const left = leftIdentifiers[index];
+    const right = rightIdentifiers[index];
+
+    if (left === undefined) {
+      return -1;
+    }
+
+    if (right === undefined) {
+      return 1;
+    }
+
+    if (left === right) {
+      continue;
+    }
+
+    const leftNumber = /^\d+$/u.test(left) ? Number.parseInt(left, 10) : undefined;
+    const rightNumber = /^\d+$/u.test(right) ? Number.parseInt(right, 10) : undefined;
+
+    if (leftNumber !== undefined && rightNumber !== undefined) {
+      return leftNumber - rightNumber;
+    }
+
+    if (leftNumber !== undefined) {
+      return -1;
+    }
+
+    if (rightNumber !== undefined) {
+      return 1;
+    }
+
+    return left.localeCompare(right);
+  }
+
+  return 0;
+}
+
 function registerIpcHandlers() {
   handleIpc(ipcChannels.appGetInfo, () => ({
     appName,
@@ -533,6 +784,18 @@ function registerIpcHandlers() {
     platform: process.platform,
     isPackaged: app.isPackaged
   }));
+
+  handleIpc(ipcChannels.appCheckForUpdates, () => checkForAppUpdates());
+
+  handleIpc(ipcChannels.appOpenUpdateDownload, async (_event, request) => {
+    const downloadUrl = parseHttpUrl(request.url);
+    if (downloadUrl === undefined) {
+      throw new Error("Update download URL must be an http or https URL.");
+    }
+
+    await shell.openExternal(downloadUrl.toString());
+    return { opened: true };
+  });
 
   handleIpc(ipcChannels.workbenchLoadLayout, () => readWorkbenchLayout());
   handleIpc(ipcChannels.workbenchSaveLayout, (_event, layout) =>

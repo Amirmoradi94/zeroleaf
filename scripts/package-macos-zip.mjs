@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -11,7 +12,10 @@ const packageJson = JSON.parse(
 const version =
   typeof packageJson.version === "string" ? packageJson.version : "0.0.0-alpha";
 const releaseRoot = resolve(repoRoot, "release/mac");
-const appPath = resolve(releaseRoot, "ZeroLeaf.app");
+const appPath = resolve(
+  process.env.ZEROLEAF_PACKAGE_APP_ROOT ??
+    resolve(tmpdir(), "zeroleaf-release/ZeroLeaf.app")
+);
 const zipPath = resolve(releaseRoot, `ZeroLeaf-${version}-mac.zip`);
 
 await mkdir(releaseRoot, { recursive: true });

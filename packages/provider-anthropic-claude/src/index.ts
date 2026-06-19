@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import { formatAgentSelectionContextForPrompt } from "@latex-agent/ipc-contracts";
 import type {
@@ -16,6 +19,13 @@ import type {
 } from "@latex-agent/ipc-contracts";
 
 export const anthropicClaudeProviderId = "anthropic-claude" as const;
+const claudePathEnvName = "LATEX_AGENT_CLAUDE_BIN";
+const commonProviderCliDirs = [
+  join(homedir(), ".local", "bin"),
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/Library/TeX/texbin"
+] as const;
 
 export type ClaudeCodeToolBroker = {
   readonly readFile: (path: string) => Promise<ProjectFileSnapshot>;
@@ -77,7 +87,7 @@ export class ClaudeProvider {
 
   constructor(options: ClaudeProviderOptions = {}) {
     this.claudeBinary =
-      options.claudeBinary ?? process.env["LATEX_AGENT_CLAUDE_BIN"] ?? "claude";
+      options.claudeBinary ?? getConfiguredCliBinary(claudePathEnvName, "claude");
     this.model =
       options.model ?? process.env["LATEX_AGENT_CLAUDE_MODEL"] ?? defaultClaudeModel;
     this.timeoutMs = options.timeoutMs ?? 180_000;
@@ -283,6 +293,32 @@ export class ClaudeProvider {
   }
 }
 
+function getConfiguredCliBinary(envName: string, binaryName: string): string {
+  const configuredBinary = process.env[envName]?.trim();
+  if (configuredBinary !== undefined && configuredBinary.length > 0) {
+    return configuredBinary;
+  }
+
+  const locatedBinary = commonProviderCliDirs
+    .map((directory) => join(directory, binaryName))
+    .find((candidate) => existsSync(candidate));
+
+  return locatedBinary ?? binaryName;
+}
+
+function createProviderCliEnv(): NodeJS.ProcessEnv {
+  const existingPath = process.env.PATH ?? "";
+  const pathEntries = existingPath.split(":").filter((entry) => entry.length > 0);
+  const nextPath = Array.from(new Set([...commonProviderCliDirs, ...pathEntries])).join(
+    ":"
+  );
+
+  return {
+    ...process.env,
+    PATH: nextPath
+  };
+}
+
 async function getClaudeCliAuthStatus(
   claudeBinary: string
 ): Promise<ClaudeCodeAuthStatus> {
@@ -353,7 +389,7 @@ async function runCommand(
     const child = spawn(command, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env
+      env: createProviderCliEnv()
     });
     let stdout = "";
     let stderr = "";
