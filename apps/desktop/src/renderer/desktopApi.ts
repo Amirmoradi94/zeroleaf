@@ -106,7 +106,9 @@ const fallbackApi: DesktopApi = {
         message: "Update checks are unavailable in browser fallback."
       }),
     openUpdateDownload: () =>
-      Promise.reject(new Error("Electron app update API unavailable."))
+      Promise.reject(new Error("Electron app update API unavailable.")),
+    installUpdate: () =>
+      Promise.reject(new Error("Electron app update install API unavailable."))
   },
   workbench: {
     loadLayout: () => Promise.resolve(readFallbackLayout()),

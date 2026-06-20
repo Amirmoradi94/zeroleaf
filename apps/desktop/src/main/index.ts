@@ -1,7 +1,8 @@
 import { watch, type FSWatcher } from "node:fs";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -914,6 +915,159 @@ function parseHttpUrl(value: string | undefined): URL | undefined {
   }
 }
 
+async function installAppUpdateFromDmg(downloadUrlValue: string): Promise<{
+  readonly scheduled: true;
+  readonly installerPath: string;
+  readonly targetAppPath: string;
+  readonly message: string;
+}> {
+  if (process.platform !== "darwin") {
+    throw new Error("Automatic update installation is only available on macOS.");
+  }
+
+  const downloadUrl = parseHttpUrl(downloadUrlValue);
+  if (downloadUrl === undefined) {
+    throw new Error("Update download URL must be an http or https URL.");
+  }
+
+  if (!downloadUrl.pathname.toLowerCase().endsWith(".dmg")) {
+    throw new Error("Automatic update installation expects a macOS DMG download.");
+  }
+
+  const updateRoot = await mkdtemp(join(tmpdir(), "zeroleaf-update-"));
+  const dmgName = basename(downloadUrl.pathname) || "ZeroLeaf-update.dmg";
+  const dmgPath = join(updateRoot, dmgName);
+  const installerPath = join(updateRoot, "install-zeroleaf-update.sh");
+  const targetAppPath = getCurrentAppBundlePath() ?? "/Applications/ZeroLeaf.app";
+
+  await downloadUpdateAsset(downloadUrl, dmgPath);
+  await writeFile(
+    installerPath,
+    createMacDmgInstallerScript({
+      appName,
+      dmgPath,
+      targetAppPath,
+      currentPid: process.pid
+    }),
+    { encoding: "utf8", mode: 0o700 }
+  );
+  await chmod(installerPath, 0o700);
+  await spawnDetached("/bin/bash", [installerPath]);
+
+  setTimeout(() => {
+    activeProjectWatcher?.close();
+    projectChangeDebouncer?.dispose();
+    agentHostClient.stop();
+    app.quit();
+  }, 500);
+
+  return {
+    scheduled: true,
+    installerPath,
+    targetAppPath,
+    message: `ZeroLeaf will quit, install the update into ${targetAppPath}, and relaunch.`
+  };
+}
+
+async function downloadUpdateAsset(downloadUrl: URL, destinationPath: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120_000);
+
+  try {
+    const response = await fetch(downloadUrl, {
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        accept: "application/x-apple-diskimage,application/octet-stream,*/*",
+        "user-agent": `${appName}/0.0 (+https://local-first-latex-editor.invalid)`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Update download failed with HTTP ${response.status}.`);
+    }
+
+    if (response.body === null) {
+      throw new Error("Update download returned an empty response.");
+    }
+
+    await writeFile(destinationPath, new Uint8Array(await response.arrayBuffer()));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function getCurrentAppBundlePath(): string | undefined {
+  const marker = ".app/Contents/MacOS";
+  const markerIndex = process.execPath.indexOf(marker);
+
+  return markerIndex === -1
+    ? undefined
+    : process.execPath.slice(0, markerIndex + ".app".length);
+}
+
+function createMacDmgInstallerScript({
+  appName: installAppName,
+  dmgPath,
+  targetAppPath,
+  currentPid
+}: {
+  readonly appName: string;
+  readonly dmgPath: string;
+  readonly targetAppPath: string;
+  readonly currentPid: number;
+}): string {
+  const targetDirectory = dirname(targetAppPath);
+
+  return `#!/bin/bash
+set -euo pipefail
+
+APP_PID=${currentPid}
+DMG_PATH=${shellQuote(dmgPath)}
+TARGET_APP=${shellQuote(targetAppPath)}
+TARGET_DIR=${shellQuote(targetDirectory)}
+APP_NAME=${shellQuote(installAppName)}
+LOG_PATH="\${TMPDIR:-/tmp}/zeroleaf-update-install.log"
+
+exec >> "$LOG_PATH" 2>&1
+echo "Starting $APP_NAME update install at $(date)"
+
+for _ in {1..120}; do
+  if ! kill -0 "$APP_PID" 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+MOUNT_DIR="$(mktemp -d "\${TMPDIR:-/tmp}/zeroleaf-update-mount.XXXXXX")"
+cleanup() {
+  hdiutil detach "$MOUNT_DIR" -quiet || true
+  rmdir "$MOUNT_DIR" || true
+}
+trap cleanup EXIT
+
+hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
+SOURCE_APP="$MOUNT_DIR/$APP_NAME.app"
+if [ ! -d "$SOURCE_APP" ]; then
+  SOURCE_APP="$(find "$MOUNT_DIR" -maxdepth 2 -name "*.app" -type d | head -n 1)"
+fi
+if [ -z "$SOURCE_APP" ] || [ ! -d "$SOURCE_APP" ]; then
+  echo "No app bundle found in update DMG."
+  exit 1
+fi
+
+mkdir -p "$TARGET_DIR"
+rm -rf "$TARGET_APP"
+ditto "$SOURCE_APP" "$TARGET_APP"
+open "$TARGET_APP"
+echo "Finished $APP_NAME update install at $(date)"
+`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/gu, "'\\''")}'`;
+}
+
 function compareAppVersions(left: string, right: string): number {
   const leftVersion = parseAppVersion(left);
   const rightVersion = parseAppVersion(right);
@@ -1026,6 +1180,10 @@ function registerIpcHandlers() {
     await shell.openExternal(downloadUrl.toString());
     return { opened: true };
   });
+
+  handleIpc(ipcChannels.appInstallUpdate, async (_event, request) =>
+    installAppUpdateFromDmg(request.url)
+  );
 
   handleIpc(ipcChannels.workbenchLoadLayout, () => readWorkbenchLayout());
   handleIpc(ipcChannels.workbenchSaveLayout, (_event, layout) =>

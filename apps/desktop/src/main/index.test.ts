@@ -105,4 +105,18 @@ describe("desktop main process project watcher", () => {
       "Fetched template did not look like a valid IEEEtran source."
     );
   });
+
+  it("installs macOS DMG updates after downloading them", async () => {
+    const source = await readFile(
+      fileURLToPath(new URL("./index.ts", import.meta.url)),
+      "utf8"
+    );
+
+    expect(source).toContain("installAppUpdateFromDmg");
+    expect(source).toContain("downloadUpdateAsset(downloadUrl, dmgPath)");
+    expect(source).toContain("hdiutil attach");
+    expect(source).toContain('ditto "$SOURCE_APP" "$TARGET_APP"');
+    expect(source).toContain("app.quit()");
+    expect(source).toContain("ipcChannels.appInstallUpdate");
+  });
 });

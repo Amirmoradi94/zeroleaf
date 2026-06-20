@@ -19,7 +19,8 @@ const api: DesktopApi = {
   app: {
     getInfo: () => invoke("app.getInfo", undefined),
     checkForUpdates: () => invoke("app.checkForUpdates", undefined),
-    openUpdateDownload: (url) => invoke("app.openUpdateDownload", { url })
+    openUpdateDownload: (url) => invoke("app.openUpdateDownload", { url }),
+    installUpdate: (url) => invoke("app.installUpdate", { url })
   },
   workbench: {
     loadLayout: () => invoke("workbench.loadLayout", undefined),

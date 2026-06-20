@@ -344,6 +344,7 @@ export function App() {
   const [updateCheckResult, setUpdateCheckResult] =
     useState<AppUpdateCheckResult | null>(null);
   const [updateCheckRunning, setUpdateCheckRunning] = useState(false);
+  const [updateInstallRunning, setUpdateInstallRunning] = useState(false);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("files");
   const [bottomPanelOpen, setBottomPanelOpen] = useState(false);
   const [privacySummary, setPrivacySummary] = useState<PrivacySummary | null>(null);
@@ -534,13 +535,33 @@ export function App() {
     []
   );
 
+  const installUpdate = useCallback(async (url: string) => {
+    setUpdateInstallRunning(true);
+    setStatusMessage("Downloading and installing the ZeroLeaf update...");
+    try {
+      const result = await desktopApi.app.installUpdate(url);
+      setStatusMessage(result.message);
+      return result;
+    } catch (error) {
+      setStatusMessage(getErrorMessage(error));
+      throw error;
+    } finally {
+      setUpdateInstallRunning(false);
+    }
+  }, []);
+
   const checkForAppUpdates = useCallback(async () => {
     setUpdateCheckRunning(true);
     try {
       const result = await desktopApi.app.checkForUpdates();
       setUpdateCheckResult(result);
       if (result.state === "available") {
-        setStatusMessage(`ZeroLeaf ${result.latestVersion} is available.`);
+        setStatusMessage(
+          `ZeroLeaf ${result.latestVersion} is available. Installing...`
+        );
+        if (result.downloadUrl !== undefined) {
+          void installUpdate(result.downloadUrl);
+        }
       } else if (result.state === "error") {
         setStatusMessage(result.message);
       }
@@ -558,7 +579,7 @@ export function App() {
     } finally {
       setUpdateCheckRunning(false);
     }
-  }, []);
+  }, [installUpdate]);
 
   const openUpdateDownload = useCallback(async (url: string) => {
     try {
@@ -4482,6 +4503,9 @@ export function App() {
         onOpenUpdateDownload={(url) => {
           void openUpdateDownload(url);
         }}
+        onInstallUpdate={(url) => {
+          void installUpdate(url);
+        }}
         onCheckForUpdates={() => {
           void checkForAppUpdates();
         }}
@@ -4497,6 +4521,7 @@ export function App() {
         onSetCompiler={updateSelectedCompiler}
         updateCheckResult={updateCheckResult}
         updateCheckRunning={updateCheckRunning}
+        updateInstallRunning={updateInstallRunning}
       />
     </div>
   );
@@ -7120,6 +7145,7 @@ function SettingsDialog({
   onClearLocalHistory,
   onCheckForUpdates,
   onClose,
+  onInstallUpdate,
   onKeybindingQueryChange,
   onOpenProviderSetupTerminal,
   onOpenUpdateDownload,
@@ -7132,6 +7158,7 @@ function SettingsDialog({
   privacySummary,
   updateCheckResult,
   updateCheckRunning,
+  updateInstallRunning,
   open
 }: {
   readonly activeTab: SettingsTab;
@@ -7145,6 +7172,7 @@ function SettingsDialog({
   readonly onClearLocalHistory: () => void;
   readonly onCheckForUpdates: () => void;
   readonly onClose: () => void;
+  readonly onInstallUpdate: (url: string) => void;
   readonly onKeybindingQueryChange: (query: string) => void;
   readonly onOpenProviderSetupTerminal: (
     providerId: AgentProviderId,
@@ -7160,6 +7188,7 @@ function SettingsDialog({
   readonly privacySummary: PrivacySummary | null;
   readonly updateCheckResult: AppUpdateCheckResult | null;
   readonly updateCheckRunning: boolean;
+  readonly updateInstallRunning: boolean;
   readonly open: boolean;
 }) {
   if (!open) {
@@ -7213,6 +7242,7 @@ function SettingsDialog({
             tab={activeTab}
             onClearLocalHistory={onClearLocalHistory}
             onCheckForUpdates={onCheckForUpdates}
+            onInstallUpdate={onInstallUpdate}
             onKeybindingQueryChange={onKeybindingQueryChange}
             onOpenProviderSetupTerminal={onOpenProviderSetupTerminal}
             onOpenUpdateDownload={onOpenUpdateDownload}
@@ -7224,6 +7254,7 @@ function SettingsDialog({
             onSettingsChange={onSettingsChange}
             updateCheckResult={updateCheckResult}
             updateCheckRunning={updateCheckRunning}
+            updateInstallRunning={updateInstallRunning}
           />
         </div>
       </section>
@@ -7239,6 +7270,7 @@ function SettingsTabPanel({
   keybindingQuery,
   onClearLocalHistory,
   onCheckForUpdates,
+  onInstallUpdate,
   onKeybindingQueryChange,
   onOpenProviderSetupTerminal,
   onOpenUpdateDownload,
@@ -7252,7 +7284,8 @@ function SettingsTabPanel({
   settings,
   tab,
   updateCheckResult,
-  updateCheckRunning
+  updateCheckRunning,
+  updateInstallRunning
 }: {
   readonly agentAuthRefreshRunning: boolean;
   readonly agentAuthStatuses: AgentAuthStatusByProvider;
@@ -7261,6 +7294,7 @@ function SettingsTabPanel({
   readonly keybindingQuery: string;
   readonly onClearLocalHistory: () => void;
   readonly onCheckForUpdates: () => void;
+  readonly onInstallUpdate: (url: string) => void;
   readonly onKeybindingQueryChange: (query: string) => void;
   readonly onOpenProviderSetupTerminal: (
     providerId: AgentProviderId,
@@ -7278,6 +7312,7 @@ function SettingsTabPanel({
   readonly tab: SettingsTab;
   readonly updateCheckResult: AppUpdateCheckResult | null;
   readonly updateCheckRunning: boolean;
+  readonly updateInstallRunning: boolean;
 }) {
   const filteredKeybindings = commandDefinitions.filter((command) => {
     const query = keybindingQuery.trim().toLowerCase();
@@ -7620,7 +7655,7 @@ function SettingsTabPanel({
             <button
               className="text-button settings-action"
               type="button"
-              disabled={updateCheckRunning}
+              disabled={updateCheckRunning || updateInstallRunning}
               onClick={onCheckForUpdates}
             >
               <RefreshCw aria-hidden="true" size={15} />
@@ -7630,10 +7665,11 @@ function SettingsTabPanel({
               <button
                 className="text-button settings-action"
                 type="button"
-                onClick={() => onOpenUpdateDownload(updateDownloadUrl)}
+                disabled={updateInstallRunning}
+                onClick={() => onInstallUpdate(updateDownloadUrl)}
               >
                 <Download aria-hidden="true" size={15} />
-                Download update
+                {updateInstallRunning ? "Installing" : "Install update"}
               </button>
             )}
             {updateReleaseNotesUrl !== undefined && (
@@ -7648,9 +7684,10 @@ function SettingsTabPanel({
             )}
           </div>
           <p className="settings-note">
-            Release builds read a configured release feed. Project files and settings
-            are stored outside the app bundle, so replacing the app does not remove
-            local work.
+            Release builds read a configured release feed. When a newer macOS DMG is
+            found, ZeroLeaf downloads it, quits, installs the replacement app bundle,
+            and relaunches. Project files and settings are stored outside the app
+            bundle.
           </p>
         </>
       )}

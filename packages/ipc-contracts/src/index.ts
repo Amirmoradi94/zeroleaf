@@ -2,6 +2,7 @@ export const ipcChannels = {
   appGetInfo: "app.getInfo",
   appCheckForUpdates: "app.checkForUpdates",
   appOpenUpdateDownload: "app.openUpdateDownload",
+  appInstallUpdate: "app.installUpdate",
   workbenchLoadLayout: "workbench.loadLayout",
   workbenchSaveLayout: "workbench.saveLayout",
   editorLoadProjectState: "editor.loadProjectState",
@@ -77,6 +78,13 @@ export type AppUpdateCheckResult = {
   readonly latestVersion?: string;
   readonly downloadUrl?: string;
   readonly releaseNotesUrl?: string;
+};
+
+export type AppUpdateInstallResult = {
+  readonly scheduled: true;
+  readonly installerPath: string;
+  readonly targetAppPath: string;
+  readonly message: string;
 };
 
 export type WorkbenchLayout = {
@@ -2054,6 +2062,7 @@ export type IpcRequestMap = {
   readonly [ipcChannels.appGetInfo]: undefined;
   readonly [ipcChannels.appCheckForUpdates]: undefined;
   readonly [ipcChannels.appOpenUpdateDownload]: { readonly url: string };
+  readonly [ipcChannels.appInstallUpdate]: { readonly url: string };
   readonly [ipcChannels.workbenchLoadLayout]: undefined;
   readonly [ipcChannels.workbenchSaveLayout]: WorkbenchLayout;
   readonly [ipcChannels.editorLoadProjectState]: { readonly projectRoot: string };
@@ -2185,6 +2194,7 @@ export type IpcResponseMap = {
   readonly [ipcChannels.appGetInfo]: AppInfo;
   readonly [ipcChannels.appCheckForUpdates]: AppUpdateCheckResult;
   readonly [ipcChannels.appOpenUpdateDownload]: { readonly opened: true };
+  readonly [ipcChannels.appInstallUpdate]: AppUpdateInstallResult;
   readonly [ipcChannels.workbenchLoadLayout]: WorkbenchLayout;
   readonly [ipcChannels.workbenchSaveLayout]: WorkbenchLayout;
   readonly [ipcChannels.editorLoadProjectState]: EditorProjectState;
@@ -2259,6 +2269,7 @@ export type DesktopApi = {
     readonly getInfo: () => Promise<AppInfo>;
     readonly checkForUpdates: () => Promise<AppUpdateCheckResult>;
     readonly openUpdateDownload: (url: string) => Promise<{ readonly opened: true }>;
+    readonly installUpdate: (url: string) => Promise<AppUpdateInstallResult>;
   };
   readonly workbench: {
     readonly loadLayout: () => Promise<WorkbenchLayout>;
