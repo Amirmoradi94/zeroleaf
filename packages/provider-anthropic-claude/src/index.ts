@@ -138,32 +138,10 @@ export class ClaudeProvider {
       )
     ];
     const targetPath = request.activeFilePath ?? request.mainFilePath;
-
-    if (targetPath === undefined) {
-      events.push(
-        createErrorEvent(sessionId, "Open a project file before starting Claude.")
-      );
-      return {
-        sessionId,
-        providerId: this.id,
-        status: "failed",
-        events
-      };
-    }
-
-    events.push(
-      createToolEvent(sessionId, "read-file", "running", `Reading ${targetPath}`, "low")
-    );
-    const snapshot = await broker.readFile(targetPath);
-    events.push(
-      createToolEvent(
-        sessionId,
-        "read-file",
-        "succeeded",
-        `Read ${snapshot.path}`,
-        "low"
-      )
-    );
+    const snapshot =
+      targetPath === undefined
+        ? createEmptyProjectSnapshot()
+        : await readInitialSnapshot({ broker, events, sessionId, targetPath });
 
     events.push(
       createToolEvent(
@@ -224,10 +202,11 @@ export class ClaudeProvider {
       };
     }
 
-    const patchSnapshot =
-      claudeResponse.targetFilePath === snapshot.path
-        ? snapshot
-        : await broker.readFile(claudeResponse.targetFilePath);
+    const patchSnapshot = await readPatchSnapshot(
+      claudeResponse.targetFilePath,
+      snapshot,
+      broker
+    );
 
     if (claudeResponse.afterContents === patchSnapshot.contents) {
       events.push(
@@ -546,6 +525,9 @@ function createClaudePrompt(
       ? 'The current ZeroLeaf mode is read-only, so action must be "answer". You may describe suggested edits in message, but do not return a patch action.'
       : "ZeroLeaf will convert patch actions into a reviewable local changeset before any file is changed.",
     "Preserve all unrelated text and formatting when returning a patch.",
+    snapshot.path === newFileSnapshotPath
+      ? 'No active TeX file is open. If the user asks to create a .tex file, return action "patch", choose a clear project-relative targetFilePath ending in .tex, set afterContents to the complete new file contents, and use an empty original file.'
+      : "",
     request.selectedText === undefined
       ? ""
       : "The user selected text inside a containing paragraph. Use the paragraph as context. Change only that exact selected span unless the user explicitly asks for a broader paragraph rewrite; preserve all unrelated paragraphs, LaTeX commands, labels, references, and citations unless the user explicitly asks to change one.",
@@ -575,6 +557,60 @@ function createClaudePrompt(
   ]
     .filter((line) => line.length > 0)
     .join("\n");
+}
+
+const newFileSnapshotPath = "__new_file__.tex";
+
+function createEmptyProjectSnapshot(): ProjectFileSnapshot {
+  return {
+    path: newFileSnapshotPath,
+    contents: "",
+    mtimeMs: Date.now()
+  };
+}
+
+async function readInitialSnapshot({
+  broker,
+  events,
+  sessionId,
+  targetPath
+}: {
+  readonly broker: ClaudeCodeToolBroker;
+  readonly events: AgentEvent[];
+  readonly sessionId: string;
+  readonly targetPath: string;
+}): Promise<ProjectFileSnapshot> {
+  events.push(
+    createToolEvent(sessionId, "read-file", "running", `Reading ${targetPath}`, "low")
+  );
+  const snapshot = await broker.readFile(targetPath);
+  events.push(
+    createToolEvent(sessionId, "read-file", "succeeded", `Read ${snapshot.path}`, "low")
+  );
+
+  return snapshot;
+}
+
+async function readPatchSnapshot(
+  targetFilePath: string,
+  fallbackSnapshot: ProjectFileSnapshot,
+  broker: Pick<ClaudeCodeToolBroker, "readFile">
+): Promise<ProjectFileSnapshot> {
+  const normalizedTarget = targetFilePath.trim();
+
+  if (normalizedTarget.length === 0 || normalizedTarget === fallbackSnapshot.path) {
+    return fallbackSnapshot;
+  }
+
+  try {
+    return await broker.readFile(normalizedTarget);
+  } catch {
+    return {
+      path: normalizedTarget,
+      contents: "",
+      mtimeMs: Date.now()
+    };
+  }
 }
 
 function formatApprovedNetworkContext(request: AgentStartRequest): string {
@@ -691,17 +727,6 @@ function createVerificationEvent(
     type: "verification",
     status,
     summary
-  };
-}
-
-function createErrorEvent(sessionId: string, message: string): AgentEvent {
-  return {
-    id: randomUUID(),
-    sessionId,
-    createdAt: new Date().toISOString(),
-    type: "error",
-    message,
-    recoverable: true
   };
 }
 

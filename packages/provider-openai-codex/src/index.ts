@@ -160,36 +160,10 @@ export class CodexCliProvider {
       )
     ];
     const targetPath = request.activeFilePath ?? request.mainFilePath;
-
-    if (targetPath === undefined) {
-      events.push(
-        createErrorEvent(sessionId, "Open a project file before starting Codex.")
-      );
-      return {
-        sessionId,
-        providerId: this.id,
-        status: "failed",
-        events
-      };
-    }
-
-    pushAgentEvents(
-      events,
-      broker,
-      createToolEvent(sessionId, "read-file", "running", `Reading ${targetPath}`, "low")
-    );
-    const snapshot = await broker.readFile(targetPath);
-    pushAgentEvents(
-      events,
-      broker,
-      createToolEvent(
-        sessionId,
-        "read-file",
-        "succeeded",
-        `Read ${snapshot.path}`,
-        "low"
-      )
-    );
+    const snapshot =
+      targetPath === undefined
+        ? createEmptyProjectSnapshot()
+        : await readInitialSnapshot({ broker, events, sessionId, targetPath });
 
     pushAgentEvents(
       events,
@@ -693,10 +667,11 @@ export class CodexCliProvider {
       };
     }
 
-    let patchSnapshot =
-      codexResponse.targetFilePath === snapshot.path
-        ? snapshot
-        : await broker.readFile(codexResponse.targetFilePath);
+    let patchSnapshot = await readPatchSnapshot(
+      codexResponse.targetFilePath,
+      snapshot,
+      broker
+    );
 
     if (isLikelyOverbroadPatch(patchSnapshot.contents, codexResponse.afterContents)) {
       pushAgentEvents(
@@ -740,10 +715,11 @@ export class CodexCliProvider {
         };
       }
 
-      patchSnapshot =
-        codexResponse.targetFilePath === snapshot.path
-          ? snapshot
-          : await broker.readFile(codexResponse.targetFilePath);
+      patchSnapshot = await readPatchSnapshot(
+        codexResponse.targetFilePath,
+        snapshot,
+        broker
+      );
 
       if (isLikelyOverbroadPatch(patchSnapshot.contents, codexResponse.afterContents)) {
         pushAgentEvents(
@@ -1669,6 +1645,9 @@ function createCodexPrompt(
       : 'For edit, change, rewrite, replace, insert, delete, fix, repair, compile, recompile, build, PDF generation, compile-error, failing-build, visual PDF review, and diagnostic tasks, return the concrete action whenever safe: "patch" for source edits, "delete-entry" for deleting project files or folders, "move-entry" for moving or renaming files, "set-main-file" for changing the project main TeX file, "capture-pdf-preview" for rendered preview evidence, and "run-compile" for builds. Do not stop at explaining the edit or app action.',
     "Preserve all unrelated text and formatting when returning a patch.",
     "For patches, afterContents must be the complete target file after the edit, not a snippet, diff, abbreviated file, or only the changed section. Never omit unchanged content.",
+    snapshot.path === newFileSnapshotPath
+      ? 'No active TeX file is open. If the user asks to create a .tex file, return action "patch", choose a clear project-relative targetFilePath ending in .tex, set afterContents to the complete new file contents, and use an empty original file.'
+      : "",
     request.selectedText === undefined
       ? ""
       : "The user selected text inside a containing paragraph. Use the paragraph as context. Change only that exact selected span unless the user explicitly asks for a broader paragraph rewrite; preserve all unrelated paragraphs, LaTeX commands, labels, references, and citations unless the user explicitly asks to change one.",
@@ -1698,6 +1677,64 @@ function createCodexPrompt(
   ]
     .filter((line) => line.length > 0)
     .join("\n");
+}
+
+const newFileSnapshotPath = "__new_file__.tex";
+
+function createEmptyProjectSnapshot(): ProjectFileSnapshot {
+  return {
+    path: newFileSnapshotPath,
+    contents: "",
+    mtimeMs: Date.now()
+  };
+}
+
+async function readInitialSnapshot({
+  broker,
+  events,
+  sessionId,
+  targetPath
+}: {
+  readonly broker: CodexCliToolBroker;
+  readonly events: AgentEvent[];
+  readonly sessionId: string;
+  readonly targetPath: string;
+}): Promise<ProjectFileSnapshot> {
+  pushAgentEvents(
+    events,
+    broker,
+    createToolEvent(sessionId, "read-file", "running", `Reading ${targetPath}`, "low")
+  );
+  const snapshot = await broker.readFile(targetPath);
+  pushAgentEvents(
+    events,
+    broker,
+    createToolEvent(sessionId, "read-file", "succeeded", `Read ${snapshot.path}`, "low")
+  );
+
+  return snapshot;
+}
+
+async function readPatchSnapshot(
+  targetFilePath: string,
+  fallbackSnapshot: ProjectFileSnapshot,
+  broker: Pick<CodexCliToolBroker, "readFile">
+): Promise<ProjectFileSnapshot> {
+  const normalizedTarget = targetFilePath.trim();
+
+  if (normalizedTarget.length === 0 || normalizedTarget === fallbackSnapshot.path) {
+    return fallbackSnapshot;
+  }
+
+  try {
+    return await broker.readFile(normalizedTarget);
+  } catch {
+    return {
+      path: normalizedTarget,
+      contents: "",
+      mtimeMs: Date.now()
+    };
+  }
 }
 
 function createInitialCodexPrompt(
@@ -2435,17 +2472,6 @@ function formatCompileMessage(buildResult: BuildResult): string {
     `Diagnostics: ${buildResult.diagnostics.length}.`,
     diagnosticSummary
   ].join("\n\n");
-}
-
-function createErrorEvent(sessionId: string, message: string): AgentEvent {
-  return {
-    id: randomUUID(),
-    sessionId,
-    createdAt: new Date().toISOString(),
-    type: "error",
-    message,
-    recoverable: true
-  };
 }
 
 function getRequestedSessionId(request: AgentStartRequest): string | undefined {

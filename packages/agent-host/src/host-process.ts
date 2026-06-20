@@ -129,54 +129,100 @@ async function startSession(
       ? undefined
       : createNetworkApprovalRequest(request.prompt);
   if (networkApproval !== undefined) {
-    const approvalId = randomUUID();
-    const result: AgentSessionResult = {
-      sessionId,
-      providerId: request.providerId,
-      status: "awaiting-approval",
-      events: [
-        {
-          id: randomUUID(),
-          sessionId,
-          createdAt: new Date().toISOString(),
-          type: "message",
-          role: "user",
-          content: request.prompt
-        },
-        {
-          id: randomUUID(),
-          sessionId,
-          createdAt: new Date().toISOString(),
-          type: "message",
-          role: "assistant",
-          content:
-            "This request needs external network access, which is approval-gated in the local-first desktop app. If you deny it, I will continue with a local-only alternative or ask you to paste the source material."
-        },
-        {
-          id: randomUUID(),
-          sessionId,
-          createdAt: new Date().toISOString(),
-          type: "approval",
-          approvalId,
-          toolName: "network-fetch",
-          risk: "high",
-          prompt: `Allow external network fetch for ${networkApproval.resource}?`,
-          status: "requested"
-        }
-      ]
+    const broker = createBrokerProxy(sessionId, providerRequest);
+    const networkEvents: AgentEvent[] = [
+      createToolEvent(
+        sessionId,
+        "network-fetch",
+        "running",
+        `Fetching ${networkApproval.resource}`,
+        "high"
+      )
+    ];
+    const networkContext = await broker.networkFetch!(
+      networkApproval.resource,
+      request.prompt
+    );
+    networkEvents.push(
+      createToolEvent(
+        sessionId,
+        "network-fetch",
+        networkContext.fetched ? "succeeded" : "failed",
+        networkContext.fetched
+          ? `Fetched web context for ${networkContext.resource}`
+          : `Network fetch failed: ${networkContext.reason}`,
+        "high"
+      )
+    );
+
+    if (!networkContext.fetched) {
+      const result: AgentSessionResult = {
+        sessionId,
+        providerId: request.providerId,
+        status: "completed",
+        events: [
+          ...networkEvents,
+          {
+            id: randomUUID(),
+            sessionId,
+            createdAt: new Date().toISOString(),
+            type: "message",
+            role: "assistant",
+            content:
+              "I could not fetch the external source. Paste the DOI metadata, BibTeX, or relevant web text and I can continue locally."
+          },
+          createVerificationEvent(
+            sessionId,
+            "failed",
+            "External web fetch failed before provider execution."
+          )
+        ]
+      };
+      sessions.set(sessionId, {
+        request: providerRequest,
+        providerId: request.providerId,
+        events: result.events,
+        networkContext
+      });
+      sendHostMessage({ type: "session.result", requestId, result });
+      return;
+    }
+
+    const fetchedProviderRequest: HostProviderRequest = {
+      ...providerRequest,
+      networkContext
     };
-    sessions.set(sessionId, {
-      request: providerRequest,
-      providerId: request.providerId,
-      events: result.events,
-      approvalId,
-      approvalToolName: "network-fetch"
+    const providerResult = await provider.startSession(
+      fetchedProviderRequest,
+      createBrokerProxy(sessionId, fetchedProviderRequest)
+    );
+    const result: AgentSessionResult = {
+      ...providerResult,
+      events: [...networkEvents, ...providerResult.events]
+    };
+    const approvalEvent = providerResult.events.find(
+      (event) => event.type === "approval" && event.status === "requested"
+    );
+    const previousEvents = canContinueSession ? requestedSession.events : [];
+    sessions.set(result.sessionId, {
+      request: fetchedProviderRequest,
+      providerId: result.providerId,
+      events: [...previousEvents, ...result.events],
+      ...(result.changeset !== undefined ? { changeset: result.changeset } : {}),
+      ...(result.changesets !== undefined ? { changesets: result.changesets } : {}),
+      ...(result.deleteEntries !== undefined
+        ? { deleteEntries: result.deleteEntries }
+        : {}),
+      ...(result.moveEntries !== undefined ? { moveEntries: result.moveEntries } : {}),
+      networkContext,
+      ...(approvalEvent?.type === "approval"
+        ? {
+            approvalId: approvalEvent.approvalId,
+            approvalToolName: approvalEvent.toolName
+          }
+        : {})
     });
-    sendHostMessage({
-      type: "session.result",
-      requestId,
-      result
-    });
+    sendHostMessage({ type: "session.result", requestId, result });
     return;
   }
   const result = await provider.startSession(

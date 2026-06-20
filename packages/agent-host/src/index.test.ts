@@ -265,24 +265,45 @@ describe("MockAgentProvider", () => {
     ).toBe(true);
   });
 
-  it("requests approval before any network fetch prompt and offers local-only fallback on denial", async () => {
+  it("fetches web context without requesting network approval", async () => {
     const provider = new MockAgentProvider();
+    const calls: string[] = [];
     const broker: AgentToolBroker = {
-      readFile: () =>
-        Promise.resolve({
+      readFile: (path) => {
+        calls.push(`read-file:${path}`);
+        return Promise.resolve({
           path: "main.tex",
           contents: "\\documentclass{article}\n\\begin{document}\nHello\n",
           mtimeMs: 1
-        }),
-      searchProject: () => Promise.resolve([]),
-      proposePatch: () => {
-        throw new Error("Network approval prompt should not propose patches.");
+        });
       },
+      searchProject: () => Promise.resolve([]),
+      networkFetch: (resource, _prompt) => {
+        calls.push(`network-fetch:${resource}`);
+        return Promise.resolve({
+          fetched: true,
+          resource,
+          content: "@article{example,title={Example}}",
+          fetchedAt: "2026-06-20T00:00:00.000Z"
+        });
+      },
+      proposePatch: (_filePath, _beforeContents, afterContents, summary) =>
+        Promise.resolve({
+          id: "changeset-network-1",
+          projectRoot: "/tmp/project",
+          filePath: "main.tex",
+          summary,
+          patch: afterContents,
+          status: "proposed",
+          baseSnapshotId: "snapshot-network-1",
+          createdAt: "2026-06-20T00:00:00.000Z",
+          updatedAt: "2026-06-20T00:00:00.000Z"
+        }),
       applyPatch: () => {
-        throw new Error("Network approval prompt should not apply patches.");
+        throw new Error("Network fetch preflight should not apply patches.");
       },
       runCompile: () => {
-        throw new Error("Network approval prompt should not compile.");
+        throw new Error("Network fetch preflight should not compile.");
       }
     };
 
@@ -300,23 +321,20 @@ describe("MockAgentProvider", () => {
     );
 
     expect(result.status).toBe("awaiting-approval");
+    expect(calls).toEqual(["read-file:main.tex", "network-fetch:10.1000/example"]);
     expect(
       result.events.some(
         (event) =>
-          event.type === "approval" &&
+          event.type === "tool-call" &&
           event.toolName === "network-fetch" &&
-          event.status === "requested"
+          event.status === "succeeded"
       )
     ).toBe(true);
     expect(
       result.events.some(
-        (event) =>
-          event.type === "message" &&
-          event.content.includes(
-            "If you deny it, I will continue with a local-only alternative"
-          )
+        (event) => event.type === "approval" && event.toolName === "network-fetch"
       )
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("runs a bounded autonomous local repair loop until compile succeeds", async () => {

@@ -37,20 +37,20 @@ describe("agent host process session routing", () => {
     expect(source).toContain('session.approvalToolName ?? "apply-patch"');
   });
 
-  it("preflights external web research before provider execution", async () => {
+  it("fetches external web research before provider execution without approval", async () => {
     const source = await readFile(
       fileURLToPath(new URL("./host-process.ts", import.meta.url)),
       "utf8"
     );
 
     expect(source).toContain("const networkApproval = createNetworkApprovalRequest");
-    expect(source).toContain('status: "awaiting-approval"');
-    expect(source).toContain('approvalToolName: "network-fetch"');
     expect(source).toContain("networkContext = await broker.networkFetch!");
+    expect(source).toContain("provider.startSession(");
     expect(source).toContain("providerRequest");
     expect(source).toContain('normalized.includes("web search")');
     expect(source).toContain("isLikelyLatestExternalResourceRequest");
     expect(source).toContain("official IEEE template sources");
+    expect(source).not.toContain("which is approval-gated");
     expect(source).not.toContain("external fetch is not implemented");
   });
 

@@ -469,32 +469,15 @@ export class MockAgentProvider implements AgentProvider {
       )
     ];
     const targetPath = request.activeFilePath ?? request.mainFilePath;
-
-    if (targetPath === undefined) {
-      events.push(
-        createErrorEvent(sessionId, "Open a project file before starting the agent.")
-      );
-      return {
-        sessionId,
-        providerId: this.id,
-        status: "failed",
-        events
-      };
-    }
-
-    events.push(
-      createToolEvent(sessionId, "read-file", "running", `Reading ${targetPath}`, "low")
-    );
-    const snapshot = await broker.readFile(targetPath);
-    events.push(
-      createToolEvent(
-        sessionId,
-        "read-file",
-        "succeeded",
-        `Read ${snapshot.path}`,
-        "low"
-      )
-    );
+    const snapshot =
+      targetPath === undefined
+        ? createEmptyProjectSnapshot()
+        : await readInitialSnapshot({
+            broker,
+            events,
+            sessionId,
+            targetPath
+          });
 
     if (request.mode === "read-only") {
       events.push(
@@ -537,30 +520,69 @@ export class MockAgentProvider implements AgentProvider {
         ? undefined
         : createNetworkApprovalRequest(request.prompt);
     if (networkApproval !== undefined) {
+      if (broker.networkFetch === undefined) {
+        events.push(
+          createToolEvent(
+            sessionId,
+            "network-fetch",
+            "failed",
+            "Network fetch is not available in this provider bridge.",
+            "high"
+          ),
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            "I could not fetch external web context because the network tool is unavailable. Paste the DOI metadata, BibTeX, or relevant web text and I can continue locally."
+          )
+        );
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
+
       events.push(
-        createMessageEvent(
+        createToolEvent(
           sessionId,
-          "assistant",
-          `This request needs external network access for ${networkApproval.resource}, which is approval-gated. If you deny it, I will continue with a local-only alternative or ask you to paste the data.`
-        ),
-        {
-          id: randomUUID(),
-          sessionId,
-          createdAt: new Date().toISOString(),
-          type: "approval",
-          approvalId: randomUUID(),
-          toolName: "network-fetch",
-          risk: "high",
-          prompt: `Allow external network fetch for ${networkApproval.resource}?`,
-          status: "requested"
-        }
+          "network-fetch",
+          "running",
+          `Fetching ${networkApproval.resource}`,
+          "high"
+        )
       );
-      return {
-        sessionId,
-        providerId: this.id,
-        status: "awaiting-approval",
-        events
-      };
+      const networkContext = await broker.networkFetch(
+        networkApproval.resource,
+        request.prompt
+      );
+      events.push(
+        createToolEvent(
+          sessionId,
+          "network-fetch",
+          networkContext.fetched ? "succeeded" : "failed",
+          networkContext.fetched
+            ? `Fetched web context for ${networkContext.resource}`
+            : `Network fetch failed: ${networkContext.reason}`,
+          "high"
+        )
+      );
+
+      if (!networkContext.fetched) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            "I could not fetch the external source. Paste the DOI metadata, BibTeX, or relevant web text and I can continue locally."
+          )
+        );
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events
+        };
+      }
     }
 
     if (request.mode === "autonomous-local") {
@@ -3390,6 +3412,37 @@ function createMessageEvent(
     role,
     content
   };
+}
+
+const newFileSnapshotPath = "__new_file__.tex";
+
+function createEmptyProjectSnapshot(): ProjectFileSnapshot {
+  return {
+    path: newFileSnapshotPath,
+    contents: "",
+    mtimeMs: Date.now()
+  };
+}
+
+async function readInitialSnapshot({
+  broker,
+  events,
+  sessionId,
+  targetPath
+}: {
+  readonly broker: AgentToolBroker;
+  readonly events: AgentEvent[];
+  readonly sessionId: string;
+  readonly targetPath: string;
+}): Promise<ProjectFileSnapshot> {
+  events.push(
+    createToolEvent(sessionId, "read-file", "running", `Reading ${targetPath}`, "low")
+  );
+  const snapshot = await broker.readFile(targetPath);
+  events.push(
+    createToolEvent(sessionId, "read-file", "succeeded", `Read ${snapshot.path}`, "low")
+  );
+  return snapshot;
 }
 
 function createToolEvent(
