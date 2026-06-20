@@ -11,10 +11,10 @@ and public:
 
 ```json
 {
-  "latestVersion": "0.0.0-alpha.4",
-  "downloadUrl": "https://github.com/Amirmoradi94/zeroleaf/releases/download/v0.0.0-alpha.4/ZeroLeaf-0.0.0-alpha.4-mac.dmg",
-  "releaseNotesUrl": "https://github.com/Amirmoradi94/zeroleaf/releases/tag/v0.0.0-alpha.4",
-  "message": "ZeroLeaf 0.0.0-alpha.4 is available."
+  "latestVersion": "0.0.0-alpha.5",
+  "downloadUrl": "https://github.com/Amirmoradi94/zeroleaf/releases/download/v0.0.0-alpha.5/ZeroLeaf-0.0.0-alpha.5-mac.dmg",
+  "releaseNotesUrl": "https://github.com/Amirmoradi94/zeroleaf/releases/tag/v0.0.0-alpha.5",
+  "message": "ZeroLeaf 0.0.0-alpha.5 is available."
 }
 ```
 
@@ -35,11 +35,11 @@ npm run build
 ZEROLEAF_UPDATE_MANIFEST_URL=https://raw.githubusercontent.com/Amirmoradi94/zeroleaf/main/docs/updates/zeroleaf-update.json npm run package:mac:dmg
 ```
 
-4. Create a GitHub Release tag such as `v0.0.0-alpha.4`.
+4. Create a GitHub Release tag such as `v0.0.0-alpha.5`.
 5. Upload the generated artifact:
 
 ```text
-release/mac/ZeroLeaf-0.0.0-alpha.4-mac.dmg
+release/mac/ZeroLeaf-0.0.0-alpha.5-mac.dmg
 ```
 
 6. Update `docs/updates/zeroleaf-update.json` so `latestVersion`,

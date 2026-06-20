@@ -1,6 +1,6 @@
 {
   "name": "ai-latex-editor",
-  "version": "0.0.0-alpha.4",
+  "version": "0.0.0-alpha.5",
   "private": true,
   "description": "Local-first desktop LaTeX editor with an integrated AI project agent.",
   "license": "UNLICENSED",
