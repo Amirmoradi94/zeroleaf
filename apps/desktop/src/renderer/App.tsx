@@ -371,6 +371,7 @@ export function App() {
   const [agentAuthStatuses, setAgentAuthStatuses] = useState<AgentAuthStatusByProvider>(
     () => createInitialAgentAuthStatuses()
   );
+  const [agentAuthRefreshRunning, setAgentAuthRefreshRunning] = useState(false);
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentSelectedText, setAgentSelectedText] = useState<string | null>(null);
   const [activeAgentSelectionContext, setActiveAgentSelectionContext] =
@@ -474,31 +475,64 @@ export function App() {
     scheduleEditorLayout
   ]);
 
-  const refreshAgentAuthStatuses = useCallback(async () => {
-    const statuses = await Promise.all(
-      agentProviderIds.map(async (providerId) => {
-        try {
-          return await desktopApi.agent.getAuthStatus(providerId);
-        } catch (error) {
-          return {
-            providerId,
-            state: "error" as const,
-            message: getErrorMessage(error)
-          };
-        }
-      })
-    );
+  const refreshAgentAuthStatuses = useCallback(
+    async ({ silent = false }: { readonly silent?: boolean } = {}) => {
+      if (!silent) {
+        setStatusMessage("Checking AI provider status...");
+      }
+      setAgentAuthRefreshRunning(true);
 
-    setAgentAuthStatuses(
-      statuses.reduce<AgentAuthStatusByProvider>(
-        (nextStatuses, status) => ({
-          ...nextStatuses,
-          [status.providerId]: status
-        }),
-        createInitialAgentAuthStatuses()
-      )
-    );
-  }, []);
+      try {
+        const statuses = await Promise.all(
+          agentProviderIds.map(async (providerId) => {
+            try {
+              return await desktopApi.agent.getAuthStatus(providerId);
+            } catch (error) {
+              return {
+                providerId,
+                state: "error" as const,
+                message: getErrorMessage(error)
+              };
+            }
+          })
+        );
+
+        setAgentAuthStatuses(
+          statuses.reduce<AgentAuthStatusByProvider>(
+            (nextStatuses, status) => ({
+              ...nextStatuses,
+              [status.providerId]: status
+            }),
+            createInitialAgentAuthStatuses()
+          )
+        );
+
+        if (!silent) {
+          const connectedProviderLabels = statuses
+            .filter((status) => status.state === "connected")
+            .map((status) => getAgentProviderLabel(status.providerId));
+          const errorStatus = statuses.find((status) => status.state === "error");
+
+          if (errorStatus !== undefined) {
+            setStatusMessage(
+              `${getAgentProviderLabel(errorStatus.providerId)} status check failed: ${errorStatus.message ?? "Unknown error"}`
+            );
+          } else if (connectedProviderLabels.length > 0) {
+            setStatusMessage(
+              `Provider status refreshed: ${connectedProviderLabels.join(", ")} connected.`
+            );
+          } else {
+            setStatusMessage(
+              "Provider status refreshed. No provider is connected yet."
+            );
+          }
+        }
+      } finally {
+        setAgentAuthRefreshRunning(false);
+      }
+    },
+    []
+  );
 
   const checkForAppUpdates = useCallback(async () => {
     setUpdateCheckRunning(true);
@@ -548,7 +582,7 @@ export function App() {
 
         if (result.action === "login") {
           window.setTimeout(() => {
-            void refreshAgentAuthStatuses();
+            void refreshAgentAuthStatuses({ silent: true });
           }, 1000);
         }
       } catch (error) {
@@ -585,7 +619,7 @@ export function App() {
     void desktopApi.lifecycle.listTemplates().then(setProjectTemplates);
     void desktopApi.settings.getPrivacySummary().then(setPrivacySummary);
     void refreshToolchainStatus();
-    void refreshAgentAuthStatuses();
+    void refreshAgentAuthStatuses({ silent: true });
   }, [checkForAppUpdates, refreshAgentAuthStatuses, refreshToolchainStatus]);
 
   useEffect(() => {
@@ -669,7 +703,7 @@ export function App() {
     (providerId: AgentProviderId) => {
       setAgentProviderId(providerId);
       writeStoredAgentProvider(providerId);
-      void refreshAgentAuthStatuses();
+      void refreshAgentAuthStatuses({ silent: true });
       updateAppSettings((settings) => ({
         ...settings,
         agentPermissions: {
@@ -4430,6 +4464,7 @@ export function App() {
 
       <SettingsDialog
         activeTab={activeSettingsTab}
+        agentAuthRefreshRunning={agentAuthRefreshRunning}
         agentAuthStatuses={agentAuthStatuses}
         agentMode={agentMode}
         agentProviderId={agentProviderId}
@@ -7075,6 +7110,7 @@ function QuickOpenDialog({
 
 function SettingsDialog({
   activeTab,
+  agentAuthRefreshRunning,
   agentAuthStatuses,
   agentMode,
   agentProviderId,
@@ -7099,6 +7135,7 @@ function SettingsDialog({
   open
 }: {
   readonly activeTab: SettingsTab;
+  readonly agentAuthRefreshRunning: boolean;
   readonly agentAuthStatuses: AgentAuthStatusByProvider;
   readonly agentMode: AgentMode;
   readonly agentProviderId: AgentProviderId;
@@ -7166,6 +7203,7 @@ function SettingsDialog({
             ))}
           </nav>
           <SettingsTabPanel
+            agentAuthRefreshRunning={agentAuthRefreshRunning}
             agentAuthStatuses={agentAuthStatuses}
             agentMode={agentMode}
             agentProviderId={agentProviderId}
@@ -7194,6 +7232,7 @@ function SettingsDialog({
 }
 
 function SettingsTabPanel({
+  agentAuthRefreshRunning,
   agentAuthStatuses,
   agentMode,
   agentProviderId,
@@ -7215,6 +7254,7 @@ function SettingsTabPanel({
   updateCheckResult,
   updateCheckRunning
 }: {
+  readonly agentAuthRefreshRunning: boolean;
   readonly agentAuthStatuses: AgentAuthStatusByProvider;
   readonly agentMode: AgentMode;
   readonly agentProviderId: AgentProviderId;
@@ -7378,6 +7418,7 @@ function SettingsTabPanel({
           {agentProviderIds.map((providerId) => (
             <ProviderSettingsRow
               authStatus={agentAuthStatuses[providerId]}
+              authStatusRefreshRunning={agentAuthRefreshRunning}
               credentialStatus={settings.credentials.find(
                 (credential) => credential.providerId === providerId
               )}
@@ -7399,10 +7440,13 @@ function SettingsTabPanel({
           <button
             className="text-button settings-action"
             type="button"
+            disabled={agentAuthRefreshRunning}
             onClick={onRefreshAgentAuthStatuses}
           >
             <RefreshCw aria-hidden="true" size={15} />
-            Refresh provider status
+            {agentAuthRefreshRunning
+              ? "Checking provider status"
+              : "Refresh provider status"}
           </button>
         </>
       )}
@@ -7691,12 +7735,14 @@ function SettingsTabPanel({
 
 function ProviderSettingsRow({
   authStatus,
+  authStatusRefreshRunning,
   credentialStatus,
   onOpenProviderSetupTerminal,
   onRefreshAgentAuthStatuses,
   providerId
 }: {
   readonly authStatus: AgentAuthStatus;
+  readonly authStatusRefreshRunning: boolean;
   readonly credentialStatus: AppSettings["credentials"][number] | undefined;
   readonly onOpenProviderSetupTerminal: (
     providerId: AgentProviderId,
@@ -7765,10 +7811,11 @@ function ProviderSettingsRow({
                 <button
                   className="text-button settings-action"
                   type="button"
+                  disabled={authStatusRefreshRunning}
                   onClick={onRefreshAgentAuthStatuses}
                 >
                   <RefreshCw aria-hidden="true" size={15} />
-                  Refresh status
+                  {authStatusRefreshRunning ? "Checking" : "Refresh status"}
                 </button>
               )}
             </div>

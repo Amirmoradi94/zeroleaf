@@ -157,17 +157,20 @@ describe("project-service", () => {
     await expect(detectMainTexFile(projectPath)).resolves.toBe("article.tex");
   });
 
-  it("rejects folders that do not contain a tex source file", async () => {
+  it("opens folders that do not contain a tex source file yet", async () => {
     const notesPath = join(sandboxPath, "notes");
+    const store = new ProjectMetadataStore(metadataPath);
     await mkdir(notesPath, { recursive: true });
-    await writeFile(join(notesPath, "readme.md"), "not a LaTeX project", "utf8");
+    await writeFile(join(notesPath, "readme.md"), "draft notes", "utf8");
 
-    await expect(
-      openProject(notesPath, new ProjectMetadataStore(metadataPath))
-    ).rejects.toMatchObject({
-      code: "unsupported-project",
-      message: "Choose a folder that contains at least one .tex file."
-    });
+    const project = await openProject(notesPath, store);
+
+    expect(project.project.displayName).toBe("notes");
+    expect(project.project.mainFilePath).toBeUndefined();
+    expect(project.tree.map((node) => node.path)).toContain("readme.md");
+    expect(project.recentProjects[0]?.rootPath).toBe(
+      await validateProjectRoot(notesPath)
+    );
   });
 
   it("persists an overridden main tex file", async () => {

@@ -180,14 +180,6 @@ export async function openProject(
   const root = await validateProjectRoot(rootPath);
   const tree = await listProjectTree(root);
   const texPaths = getTexFilePaths(tree);
-
-  if (texPaths.length === 0) {
-    throw new ProjectServiceError(
-      "Choose a folder that contains at least one .tex file.",
-      "unsupported-project"
-    );
-  }
-
   const storedSettings = await metadataStore.readProjectSettings(root);
   const mainFilePath =
     getAvailableMainFilePath(tree, storedSettings.mainFilePath) ??
