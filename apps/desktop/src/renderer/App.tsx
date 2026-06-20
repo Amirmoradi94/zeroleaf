@@ -2901,7 +2901,7 @@ export function App() {
           detail:
             resultApprovalToolName === "network-fetch"
               ? decision === "allowed"
-                ? "This build cannot fetch external web sources yet. Paste the source material for a local-only follow-up."
+                ? "Approved source context was fetched and passed to the agent."
                 : "No external request was made. Paste source material if you want a local-only follow-up."
               : resultApprovalToolName === "delete-entry"
                 ? decision === "allowed"
@@ -2913,7 +2913,7 @@ export function App() {
           title:
             resultApprovalToolName === "network-fetch"
               ? decision === "allowed"
-                ? "Network fetch unavailable"
+                ? "Web context fetched"
                 : "Network request skipped"
               : resultApprovalToolName === "delete-entry"
                 ? decision === "allowed"
@@ -9594,7 +9594,7 @@ function createAgentRunLiveStatus({
 
     return {
       detail: latestNetworkFetch.summary,
-      title: "Network fetch unavailable",
+      title: "Network fetch failed",
       tone: "danger"
     };
   }
@@ -9845,10 +9845,10 @@ function formatAgentToolLiveTitle(
 
   if (toolName === "network-fetch") {
     if (status === "failed" || status === "blocked") {
-      return "Network fetch unavailable";
+      return "Network fetch failed";
     }
 
-    return status === "running" ? "Searching official sources" : "Verifying source";
+    return status === "running" ? "Searching official sources" : "Source fetched";
   }
 
   return `${formatAgentToolName(toolName)} ${formatAgentStatusLabel(status)}`;

@@ -39,7 +39,7 @@ changes without moving the project into a cloud editor.
 
 ## Status
 
-Current version: `0.0.0-alpha.2`
+Current version: `0.0.0-alpha.4`
 
 This is a private alpha. macOS packaging is available, while Windows/Linux
 packaging, cloud sync, collaboration, dark mode, visual editing, unrestricted
@@ -64,13 +64,13 @@ pdflatex --version
 
 Download the latest packaged macOS alpha from GitHub Releases:
 
-- [ZeroLeaf-0.0.0-alpha.2-mac.zip](https://github.com/Amirmoradi94/zeroleaf/releases/download/v0.0.0-alpha.2/ZeroLeaf-0.0.0-alpha.2-mac.zip)
+- [ZeroLeaf-0.0.0-alpha.4-mac.dmg](https://github.com/Amirmoradi94/zeroleaf/releases/download/v0.0.0-alpha.4/ZeroLeaf-0.0.0-alpha.4-mac.dmg)
 - [All releases](https://github.com/Amirmoradi94/zeroleaf/releases)
 
 Then:
 
-1. Unzip `ZeroLeaf-0.0.0-alpha.2-mac.zip`.
-2. Move `ZeroLeaf.app` to `Applications` or another local folder.
+1. Open `ZeroLeaf-0.0.0-alpha.4-mac.dmg`.
+2. Drag `ZeroLeaf.app` to `Applications` or another local folder.
 3. Right-click `ZeroLeaf.app` and choose `Open`.
 4. Confirm the macOS security prompt.
 

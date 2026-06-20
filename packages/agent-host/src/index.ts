@@ -8,6 +8,7 @@ import type {
   AgentApprovalResponseRequest,
   AgentAuthStatus,
   AgentEvent,
+  AgentNetworkFetchResult,
   AgentProviderId,
   AgentSelectionContext,
   AgentSessionResult,
@@ -43,6 +44,10 @@ export type AgentToolBroker = {
     toPath: string
   ) => Promise<AgentMoveEntryOperation>;
   readonly setMainFile?: (path: string) => Promise<{ readonly path: string }>;
+  readonly networkFetch?: (
+    resource: string,
+    prompt: string
+  ) => Promise<AgentNetworkFetchResult>;
   readonly proposePatch: (
     filePath: string,
     beforeContents: string,
@@ -61,7 +66,11 @@ export type AgentToolRequestPayloadMap = {
   readonly "delete-entry": AgentDeleteEntryOperation & { readonly approved: true };
   readonly "move-entry": AgentMoveEntryOperation & { readonly approved: true };
   readonly "set-main-file": { readonly path: string; readonly approved: true };
-  readonly "network-fetch": { readonly resource: string };
+  readonly "network-fetch": {
+    readonly resource: string;
+    readonly prompt: string;
+    readonly approved: true;
+  };
   readonly "codex-exec": { readonly prompt: string };
   readonly "claude-code": { readonly prompt: string };
   readonly "propose-patch": {
@@ -90,7 +99,7 @@ export type AgentToolResultMap = {
   readonly "delete-entry": AgentDeleteEntryOperation;
   readonly "move-entry": AgentMoveEntryOperation;
   readonly "set-main-file": { readonly path: string };
-  readonly "network-fetch": { readonly fetched: false };
+  readonly "network-fetch": AgentNetworkFetchResult;
   readonly "codex-exec": { readonly completed: true };
   readonly "claude-code": { readonly completed: true };
   readonly "propose-patch": HistoryChangeSet;
@@ -523,7 +532,10 @@ export class MockAgentProvider implements AgentProvider {
       };
     }
 
-    const networkApproval = createNetworkApprovalRequest(request.prompt);
+    const networkApproval =
+      request.networkContext?.fetched === true
+        ? undefined
+        : createNetworkApprovalRequest(request.prompt);
     if (networkApproval !== undefined) {
       events.push(
         createMessageEvent(
@@ -731,11 +743,11 @@ export function isAgentToolAllowed(
     return true;
   }
 
-  if (mode === "read-only") {
-    return false;
+  if (toolName === "network-fetch") {
+    return approved;
   }
 
-  if (toolName === "network-fetch") {
+  if (mode === "read-only") {
     return false;
   }
 

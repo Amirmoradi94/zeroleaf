@@ -7,6 +7,7 @@ import type {
   AgentMoveEntryOperation,
   AgentApprovalResponseRequest,
   AgentEvent,
+  AgentNetworkFetchResult,
   AgentProviderId,
   AgentSessionResult,
   AgentStartRequest,
@@ -37,6 +38,7 @@ type HostSession = {
   readonly changesets?: readonly HistoryChangeSet[];
   readonly deleteEntries?: readonly AgentDeleteEntryOperation[];
   readonly moveEntries?: readonly AgentMoveEntryOperation[];
+  readonly networkContext?: AgentNetworkFetchResult;
   readonly approvalId?: string;
   readonly approvalToolName?: AgentToolName;
   readonly events: readonly AgentEvent[];
@@ -122,7 +124,10 @@ async function startSession(
     ...request,
     sessionId
   };
-  const networkApproval = createNetworkApprovalRequest(request.prompt);
+  const networkApproval =
+    request.networkContext?.fetched === true
+      ? undefined
+      : createNetworkApprovalRequest(request.prompt);
   if (networkApproval !== undefined) {
     const approvalId = randomUUID();
     const result: AgentSessionResult = {
@@ -276,31 +281,115 @@ async function respondApproval(
   }
 
   if (session.approvalToolName === "network-fetch") {
-    const result: AgentSessionResult = {
+    const networkApproval = createNetworkApprovalRequest(session.request.prompt);
+    const broker = createBrokerProxy(request.sessionId, session.request);
+    const networkEvents: AgentEvent[] = [
+      ...baseEvents,
+      createToolEvent(
+        request.sessionId,
+        "network-fetch",
+        "running",
+        `Fetching ${networkApproval?.resource ?? "external web content"}`,
+        "high"
+      )
+    ];
+
+    let networkContext: AgentNetworkFetchResult;
+    try {
+      networkContext = await broker.networkFetch!(
+        networkApproval?.resource ?? "external web content",
+        session.request.prompt
+      );
+    } catch (error) {
+      networkContext = {
+        fetched: false,
+        resource: networkApproval?.resource ?? "external web content",
+        reason: getErrorMessage(error),
+        fetchedAt: new Date().toISOString()
+      };
+    }
+
+    if (!networkContext.fetched) {
+      const result: AgentSessionResult = {
+        sessionId: request.sessionId,
+        providerId: session.providerId,
+        status: "completed",
+        events: [
+          ...networkEvents,
+          createToolEvent(
+            request.sessionId,
+            "network-fetch",
+            "failed",
+            `Network fetch failed: ${networkContext.reason}`,
+            "high"
+          ),
+          {
+            id: randomUUID(),
+            sessionId: request.sessionId,
+            createdAt: new Date().toISOString(),
+            type: "message",
+            role: "assistant",
+            content:
+              "I could not fetch the approved external source. Paste the DOI metadata, BibTeX, or relevant web text and I can continue locally."
+          },
+          createVerificationEvent(
+            request.sessionId,
+            "failed",
+            "Network approval was allowed, but the external fetch failed."
+          )
+        ]
+      };
+      sessions.set(request.sessionId, {
+        ...session,
+        events: [...session.events, ...result.events],
+        networkContext
+      });
+      sendHostMessage({ type: "session.result", requestId, result });
+      return;
+    }
+
+    const providerRequest: HostProviderRequest = {
+      ...session.request,
       sessionId: request.sessionId,
-      providerId: session.providerId,
-      status: "completed",
-      events: [
-        ...baseEvents,
-        {
-          id: randomUUID(),
-          sessionId: request.sessionId,
-          createdAt: new Date().toISOString(),
-          type: "message",
-          role: "assistant",
-          content:
-            "Network-enabled fetch is not implemented in this local-first build. Paste the DOI metadata, BibTeX, or web text if you want a local-only follow-up."
-        },
-        createVerificationEvent(
-          request.sessionId,
-          "failed",
-          "Network approval was allowed, but external fetch is not implemented in this local-first build."
-        )
-      ]
+      networkContext
     };
+    networkEvents.push(
+      createToolEvent(
+        request.sessionId,
+        "network-fetch",
+        "succeeded",
+        `Fetched approved source context for ${networkContext.resource}`,
+        "high"
+      )
+    );
+    const providerResult = await getProvider(session.providerId).startSession(
+      providerRequest,
+      createBrokerProxy(request.sessionId, providerRequest)
+    );
+    const result: AgentSessionResult = {
+      ...providerResult,
+      events: [...networkEvents, ...providerResult.events]
+    };
+    const approvalEvent = providerResult.events.find(
+      (event) => event.type === "approval" && event.status === "requested"
+    );
     sessions.set(request.sessionId, {
       ...session,
-      events: [...session.events, ...result.events]
+      request: providerRequest,
+      events: [...session.events, ...result.events],
+      networkContext,
+      ...(result.changeset !== undefined ? { changeset: result.changeset } : {}),
+      ...(result.changesets !== undefined ? { changesets: result.changesets } : {}),
+      ...(result.deleteEntries !== undefined
+        ? { deleteEntries: result.deleteEntries }
+        : {}),
+      ...(result.moveEntries !== undefined ? { moveEntries: result.moveEntries } : {}),
+      ...(approvalEvent?.type === "approval"
+        ? {
+            approvalId: approvalEvent.approvalId,
+            approvalToolName: approvalEvent.toolName
+          }
+        : {})
     });
     sendHostMessage({ type: "session.result", requestId, result });
     return;
@@ -511,6 +600,12 @@ function createBrokerProxy(
     setMainFile: (path) =>
       requestTool(sessionId, context, "set-main-file", {
         path,
+        approved: true
+      }),
+    networkFetch: (resource, prompt) =>
+      requestTool(sessionId, context, "network-fetch", {
+        resource,
+        prompt,
         approved: true
       }),
     proposePatch: (filePath, beforeContents, afterContents, summary) =>

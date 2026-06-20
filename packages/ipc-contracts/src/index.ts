@@ -502,11 +502,28 @@ export type AgentEvent =
   | AgentVerificationEvent
   | AgentErrorEvent;
 
+export type AgentNetworkFetchResult =
+  | {
+      readonly fetched: true;
+      readonly resource: string;
+      readonly sourceUrl?: string;
+      readonly contentType?: string;
+      readonly content: string;
+      readonly fetchedAt: string;
+    }
+  | {
+      readonly fetched: false;
+      readonly resource: string;
+      readonly reason: string;
+      readonly fetchedAt: string;
+    };
+
 export type AgentStartRequest = {
   readonly providerId: AgentProviderId;
   readonly mode: AgentMode;
   readonly projectRoot: string;
   readonly sessionId?: string;
+  readonly networkContext?: AgentNetworkFetchResult;
   readonly maxTurns?: number;
   readonly prompt: string;
   readonly activeFilePath?: string;

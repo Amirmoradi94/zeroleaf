@@ -1682,6 +1682,7 @@ function createCodexPrompt(
     'If no edit is needed, use action "answer" and put the user-facing answer in message.',
     "",
     `User task: ${request.prompt}`,
+    formatApprovedNetworkContext(request),
     `Project root: ${request.projectRoot}`,
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
@@ -1708,6 +1709,27 @@ function createInitialCodexPrompt(
     : createCodexPrompt(request, snapshot);
 }
 
+function formatApprovedNetworkContext(request: AgentStartRequest): string {
+  const context = request.networkContext;
+
+  if (context?.fetched !== true) {
+    return "";
+  }
+
+  return [
+    "User-approved external source context fetched by ZeroLeaf:",
+    `Resource: ${context.resource}`,
+    context.sourceUrl === undefined ? "" : `Source URL: ${context.sourceUrl}`,
+    context.contentType === undefined ? "" : `Content type: ${context.contentType}`,
+    "Use this context only for the user's requested task. If it is insufficient or contradictory, say what is missing instead of inventing details.",
+    "```text",
+    context.content.slice(0, 60_000),
+    "```"
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
 function createCodexSelectedTextPrompt(
   request: AgentStartRequest,
   snapshot: ProjectFileSnapshot
@@ -1726,6 +1748,7 @@ function createCodexSelectedTextPrompt(
     'If no edit is needed, use action "answer" and put the user-facing answer in message.',
     "",
     `User task: ${request.prompt}`,
+    formatApprovedNetworkContext(request),
     `Project root: ${request.projectRoot}`,
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
@@ -1867,6 +1890,7 @@ function createCodexInterruptedRetryPrompt(
     'Use action "patch" for a minimal source edit, "delete-entry" for deleting project files or folders, "move-entry" for file moves, "set-main-file" for changing the main TeX file, "capture-pdf-preview" for rendered preview evidence, "run-compile" for compile requests, or "answer" only when no safe action exists.',
     `Interrupted attempt: ${formatPlannerFailure(error)}`,
     `User task: ${request.prompt}`,
+    formatApprovedNetworkContext(request),
     `Project root: ${request.projectRoot}`,
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,

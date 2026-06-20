@@ -559,6 +559,7 @@ function createClaudePrompt(
     'If no edit is needed, use action "answer" and put the user-facing answer in message.',
     "",
     `User task: ${request.prompt}`,
+    formatApprovedNetworkContext(request),
     `Project root: ${request.projectRoot}`,
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
@@ -570,6 +571,27 @@ function createClaudePrompt(
     `Original ${snapshot.path}:`,
     "```tex",
     snapshot.contents,
+    "```"
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
+function formatApprovedNetworkContext(request: AgentStartRequest): string {
+  const context = request.networkContext;
+
+  if (context?.fetched !== true) {
+    return "";
+  }
+
+  return [
+    "User-approved external source context fetched by ZeroLeaf:",
+    `Resource: ${context.resource}`,
+    context.sourceUrl === undefined ? "" : `Source URL: ${context.sourceUrl}`,
+    context.contentType === undefined ? "" : `Content type: ${context.contentType}`,
+    "Use this context only for the user's requested task. If it is insufficient or contradictory, say what is missing instead of inventing details.",
+    "```text",
+    context.content.slice(0, 60_000),
     "```"
   ]
     .filter((line) => line.length > 0)

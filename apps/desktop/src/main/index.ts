@@ -64,6 +64,7 @@ import {
   type AgentProviderId,
   type AgentProviderSetupAction,
   type AgentEvent,
+  type AgentNetworkFetchResult,
   type AppSettings,
   type AppUpdateCheckResult,
   type EditorProjectState,
@@ -523,6 +524,235 @@ async function fetchExternalTemplateMainTex(sourceUrl: string): Promise<string> 
     contents.trimEnd(),
     ""
   ].join("\n");
+}
+
+async function fetchApprovedAgentNetworkResource(
+  resource: string,
+  prompt: string
+): Promise<AgentNetworkFetchResult> {
+  const fetchedAt = new Date().toISOString();
+
+  try {
+    const doi = /\b10\.\d{4,9}\/[^\s`'"]+/iu.exec(`${resource} ${prompt}`)?.[0];
+    const directUrl = /https?:\/\/[^\s`'"]+/iu.exec(`${resource} ${prompt}`)?.[0];
+
+    if (doi !== undefined) {
+      const normalizedDoi = doi.replace(/[),.;]+$/u, "");
+      const bibtexUrl = `https://api.crossref.org/works/${encodeURIComponent(
+        normalizedDoi
+      )}/transform/application/x-bibtex`;
+      return {
+        fetched: true,
+        resource,
+        sourceUrl: `https://doi.org/${normalizedDoi}`,
+        contentType: "application/x-bibtex",
+        content: await fetchTextWithLimit(bibtexUrl, "application/x-bibtex"),
+        fetchedAt
+      };
+    }
+
+    if (directUrl !== undefined) {
+      const sourceUrl = directUrl.replace(/[),.;]+$/u, "");
+      const fetched = await fetchReadableText(sourceUrl);
+      return {
+        fetched: true,
+        resource,
+        sourceUrl,
+        contentType: fetched.contentType,
+        content: fetched.content,
+        fetchedAt
+      };
+    }
+
+    const searchResult = await fetchSearchContext(resource, prompt);
+    return {
+      fetched: true,
+      resource,
+      sourceUrl: searchResult.sourceUrl,
+      contentType: searchResult.contentType,
+      content: searchResult.content,
+      fetchedAt
+    };
+  } catch (error) {
+    return {
+      fetched: false,
+      resource,
+      reason: getErrorMessage(error),
+      fetchedAt
+    };
+  }
+}
+
+async function fetchSearchContext(
+  resource: string,
+  prompt: string
+): Promise<{
+  readonly sourceUrl: string;
+  readonly contentType: string;
+  readonly content: string;
+}> {
+  const query = createAgentNetworkSearchQuery(resource, prompt);
+  const searchUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  const html = await fetchTextWithLimit(searchUrl, "text/html");
+  const results = extractDuckDuckGoResults(html).slice(0, 3);
+
+  if (results.length === 0) {
+    throw new Error(`No search results found for "${query}".`);
+  }
+
+  const fetchedPages = await Promise.all(
+    results.map(async (result) => {
+      try {
+        const fetched = await fetchReadableText(result.url);
+        return [
+          `Result: ${result.title}`,
+          `URL: ${result.url}`,
+          "",
+          fetched.content.slice(0, 24_000)
+        ].join("\n");
+      } catch (error) {
+        return [
+          `Result: ${result.title}`,
+          `URL: ${result.url}`,
+          `Fetch failed: ${getErrorMessage(error)}`
+        ].join("\n");
+      }
+    })
+  );
+
+  return {
+    sourceUrl: searchUrl,
+    contentType: "text/plain",
+    content: [
+      `Search query: ${query}`,
+      "",
+      "Search results:",
+      ...results.map(
+        (result, index) => `${index + 1}. ${result.title} - ${result.url}`
+      ),
+      "",
+      "Fetched result context:",
+      ...fetchedPages
+    ].join("\n\n")
+  };
+}
+
+function createAgentNetworkSearchQuery(resource: string, prompt: string): string {
+  const normalizedPrompt = prompt.replace(/\s+/gu, " ").trim();
+
+  if (/progress in photovoltaics/iu.test(normalizedPrompt)) {
+    return "Progress in Photovoltaics latex template author guidelines";
+  }
+
+  if (/template/iu.test(normalizedPrompt)) {
+    return `${normalizedPrompt} latex template`;
+  }
+
+  return `${resource} ${normalizedPrompt}`.slice(0, 240);
+}
+
+async function fetchReadableText(
+  sourceUrl: string
+): Promise<{ readonly contentType: string; readonly content: string }> {
+  const response = await fetchWithTimeout(
+    sourceUrl,
+    "text/html,text/plain,application/json,application/xml,*/*"
+  );
+  const contentType = response.headers.get("content-type") ?? "text/plain";
+  const text = (await response.text()).slice(0, 120_000);
+  const trimmed = text.trim();
+  const readable =
+    /<html|<body|<main|<article/iu.test(trimmed) || /<\/[a-z][\s\S]*>/iu.test(trimmed)
+      ? stripHtmlToText(trimmed)
+      : trimmed;
+
+  return {
+    contentType,
+    content: readable.slice(0, 80_000)
+  };
+}
+
+async function fetchTextWithLimit(sourceUrl: string, accept: string): Promise<string> {
+  const response = await fetchWithTimeout(sourceUrl, accept);
+  return (await response.text()).slice(0, 120_000);
+}
+
+async function fetchWithTimeout(sourceUrl: string, accept: string): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    const response = await fetch(sourceUrl, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        accept,
+        "user-agent": `${appName}/0.0 (+https://local-first-latex-editor.invalid)`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Fetch failed with HTTP ${response.status}.`);
+    }
+
+    return response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractDuckDuckGoResults(
+  html: string
+): readonly { readonly title: string; readonly url: string }[] {
+  const results: { title: string; url: string }[] = [];
+  const resultPattern =
+    /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/giu;
+  let match: RegExpExecArray | null;
+
+  while ((match = resultPattern.exec(html)) !== null && results.length < 5) {
+    const rawUrl = decodeHtmlEntities(match[1] ?? "");
+    const title = stripHtmlToText(match[2] ?? "")
+      .replace(/\s+/gu, " ")
+      .trim();
+    const url = normalizeDuckDuckGoResultUrl(rawUrl);
+
+    if (title.length > 0 && url.startsWith("http")) {
+      results.push({ title, url });
+    }
+  }
+
+  return results;
+}
+
+function normalizeDuckDuckGoResultUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl, "https://duckduckgo.com");
+    const redirected = parsed.searchParams.get("uddg");
+    return redirected ?? parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function stripHtmlToText(html: string): string {
+  return decodeHtmlEntities(
+    html
+      .replace(/<script[\s\S]*?<\/script>/giu, " ")
+      .replace(/<style[\s\S]*?<\/style>/giu, " ")
+      .replace(/<[^>]+>/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim()
+  );
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&amp;/gu, "&")
+    .replace(/&lt;/gu, "<")
+    .replace(/&gt;/gu, ">")
+    .replace(/&quot;/gu, '"')
+    .replace(/&#39;/gu, "'")
+    .replace(/&#x2F;/giu, "/");
 }
 
 function handleIpc<TChannel extends IpcChannel>(
@@ -1318,10 +1548,13 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
         );
         return { path: result.project.mainFilePath ?? payload.path };
       }
-      case "network-fetch":
-        throw new Error(
-          "External network fetch is blocked in the local-first desktop app unless an explicit network-enabled tool is implemented and approved."
+      case "network-fetch": {
+        const payload = message.payload as AgentToolRequestPayloadMap["network-fetch"];
+        return await fetchApprovedAgentNetworkResource(
+          payload.resource,
+          payload.prompt
         );
+      }
       case "codex-exec":
         throw new Error("Codex execution is provider-local, not an app tool.");
       case "claude-code":

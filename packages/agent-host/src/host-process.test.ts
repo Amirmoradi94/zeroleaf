@@ -46,9 +46,12 @@ describe("agent host process session routing", () => {
     expect(source).toContain("const networkApproval = createNetworkApprovalRequest");
     expect(source).toContain('status: "awaiting-approval"');
     expect(source).toContain('approvalToolName: "network-fetch"');
+    expect(source).toContain("networkContext = await broker.networkFetch!");
+    expect(source).toContain("providerRequest");
     expect(source).toContain('normalized.includes("web search")');
     expect(source).toContain("isLikelyLatestExternalResourceRequest");
     expect(source).toContain("official IEEE template sources");
+    expect(source).not.toContain("external fetch is not implemented");
   });
 
   it("rejects proposed changesets when approval is denied", async () => {

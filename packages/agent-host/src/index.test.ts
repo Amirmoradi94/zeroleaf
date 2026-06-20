@@ -2508,6 +2508,8 @@ describe("MockAgentProvider", () => {
     expect(isAgentToolAllowed("read-only", "read-file", false)).toBe(true);
     expect(isAgentToolAllowed("read-only", "search-project", false)).toBe(true);
     expect(isAgentToolAllowed("read-only", "capture-pdf-preview", false)).toBe(true);
+    expect(isAgentToolAllowed("read-only", "network-fetch", false)).toBe(false);
+    expect(isAgentToolAllowed("read-only", "network-fetch", true)).toBe(true);
     expect(isAgentToolAllowed("read-only", "propose-patch", false)).toBe(false);
     expect(isAgentToolAllowed("read-only", "delete-entry", true)).toBe(false);
     expect(isAgentToolAllowed("read-only", "set-main-file", true)).toBe(false);
@@ -2530,6 +2532,8 @@ describe("MockAgentProvider", () => {
     expect(isAgentToolAllowed("apply-with-review", "apply-patch", true)).toBe(true);
     expect(isAgentToolAllowed("apply-with-review", "run-compile", false)).toBe(false);
     expect(isAgentToolAllowed("apply-with-review", "run-compile", true)).toBe(true);
+    expect(isAgentToolAllowed("apply-with-review", "network-fetch", false)).toBe(false);
+    expect(isAgentToolAllowed("apply-with-review", "network-fetch", true)).toBe(true);
   });
 
   it("marks provider-local model calls as medium risk and broker-blocked", () => {
