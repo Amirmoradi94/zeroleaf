@@ -1751,13 +1751,17 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
         }
       }
       case "run-compile": {
-        if (message.context.mainFilePath === undefined) {
+        const mainFilePath =
+          message.context.mainFilePath ??
+          (await detectAgentCompileMainFile(projectRoot));
+
+        if (mainFilePath === undefined) {
           throw new Error("Choose a main .tex file before compiling.");
         }
 
         return await runLatexBuild({
           projectRoot,
-          mainFilePath: message.context.mainFilePath,
+          mainFilePath,
           compiler: message.context.compiler ?? "pdflatex"
         });
       }
@@ -1766,6 +1770,18 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
     await recordAgentAudit(projectRoot, "agent.tool.failed", getErrorMessage(error));
     throw error;
   }
+}
+
+async function detectAgentCompileMainFile(
+  projectRoot: string
+): Promise<string | undefined> {
+  const refreshed = await refreshProject(projectRoot, getProjectMetadataStore());
+
+  if (activeProjectRoot === projectRoot) {
+    startProjectWatcher(refreshed.project.rootPath);
+  }
+
+  return refreshed.project.mainFilePath;
 }
 
 async function searchProjectFiles(projectRoot: string, query: string) {

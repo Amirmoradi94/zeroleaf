@@ -119,4 +119,16 @@ describe("desktop main process project watcher", () => {
     expect(source).toContain("app.quit()");
     expect(source).toContain("ipcChannels.appInstallUpdate");
   });
+
+  it("refreshes the project to detect a main file before agent compile fallback", async () => {
+    const source = await readFile(
+      fileURLToPath(new URL("./index.ts", import.meta.url)),
+      "utf8"
+    );
+
+    expect(source).toContain("detectAgentCompileMainFile");
+    expect(source).toContain("message.context.mainFilePath ??");
+    expect(source).toContain("(await detectAgentCompileMainFile(projectRoot));");
+    expect(source).toContain("return refreshed.project.mainFilePath;");
+  });
 });
