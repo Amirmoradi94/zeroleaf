@@ -476,6 +476,21 @@ export function App() {
     scheduleEditorLayout
   ]);
 
+  useLayoutEffect(() => {
+    const contentRow = contentRowRef.current;
+
+    if (contentRow === null || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const contentRowResizeObserver = new ResizeObserver(() => {
+      scheduleEditorLayout();
+    });
+    contentRowResizeObserver.observe(contentRow);
+
+    return () => contentRowResizeObserver.disconnect();
+  }, [scheduleEditorLayout]);
+
   const refreshAgentAuthStatuses = useCallback(
     async ({ silent = false }: { readonly silent?: boolean } = {}) => {
       if (!silent) {
@@ -8237,8 +8252,10 @@ function layoutMonacoEditorToContainer(editor: MonacoStandaloneEditor | null) {
     return;
   }
 
-  const rect = getMonacoLayoutElement(editor).getBoundingClientRect();
-  const width = Math.floor(rect.width);
+  const layoutElement = getMonacoLayoutElement(editor);
+  const rect = layoutElement.getBoundingClientRect();
+  const editorPaneRect = layoutElement.closest(".editor-pane")?.getBoundingClientRect();
+  const width = Math.floor(Math.min(rect.width, editorPaneRect?.width ?? rect.width));
   const height = Math.floor(rect.height);
 
   if (width <= 0 || height <= 0) {

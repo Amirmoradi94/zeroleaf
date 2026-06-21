@@ -99,6 +99,8 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("INLINE_SELECTION_PROMPT_AUTO_OPEN_DELAY_MS");
     expect(appSource).toContain("editorSelectionPointerDownRef");
     expect(appSource).toContain("editorSelectionPendingAfterPointerUpRef");
+    expect(appSource).toContain("contentRowResizeObserver.observe(contentRow)");
+    expect(appSource).toContain('.closest(".editor-pane")');
     expect(appSource).toContain('"pointerup"');
     expect(appSource).toContain('"pointercancel"');
     expect(appSource).toContain("createAgentSelectionContext");
