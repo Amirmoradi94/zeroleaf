@@ -183,6 +183,7 @@ describe("latex-service toolchain preflight", () => {
     const projectRoot = await mkdtemp(join(tmpdir(), "latex-missing-engine-"));
     const binPath = join(projectRoot, "bin");
     const originalPath = process.env.PATH;
+    const originalTexPathDiscovery = disableTexPathDiscovery();
 
     try {
       await writeFile(
@@ -221,6 +222,10 @@ describe("latex-service toolchain preflight", () => {
       expect(result.rawLog).toContain("xelatex is not available on PATH");
     } finally {
       process.env.PATH = originalPath;
+      restoreOptionalEnv(
+        "ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY",
+        originalTexPathDiscovery
+      );
       await rm(projectRoot, { recursive: true, force: true });
     }
   });
@@ -239,6 +244,7 @@ describe("latex-service build cancellation", () => {
     const originalPath = process.env.PATH;
     const originalLatexmkPidFile = process.env.LATEXMK_PID_FILE;
     const originalLatexChildPidFile = process.env.LATEX_CHILD_PID_FILE;
+    const originalTexPathDiscovery = disableTexPathDiscovery();
     const unrelatedProcess = spawnUnrelatedProcess();
     const jobId = "runaway-build";
 
@@ -312,6 +318,10 @@ describe("latex-service build cancellation", () => {
     } finally {
       stopLatexBuild(jobId);
       process.env.PATH = originalPath;
+      restoreOptionalEnv(
+        "ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY",
+        originalTexPathDiscovery
+      );
       restoreOptionalEnv("LATEXMK_PID_FILE", originalLatexmkPidFile);
       restoreOptionalEnv("LATEX_CHILD_PID_FILE", originalLatexChildPidFile);
       terminateProcess(unrelatedProcess);
@@ -330,6 +340,7 @@ describe("latex-service raw log inspection", () => {
     const originalPath = process.env.PATH;
     const originalFakeLogFile = process.env.LATEX_FAKE_LOG_FILE;
     const originalFakeExitCode = process.env.LATEX_FAKE_EXIT_CODE;
+    const originalTexPathDiscovery = disableTexPathDiscovery();
 
     try {
       await writeFile(
@@ -391,6 +402,10 @@ describe("latex-service raw log inspection", () => {
       expect(repairedResult.artifact?.pdfPath).toContain("main.pdf");
     } finally {
       process.env.PATH = originalPath;
+      restoreOptionalEnv(
+        "ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY",
+        originalTexPathDiscovery
+      );
       restoreOptionalEnv("LATEX_FAKE_LOG_FILE", originalFakeLogFile);
       restoreOptionalEnv("LATEX_FAKE_EXIT_CODE", originalFakeExitCode);
       await rm(projectRoot, { recursive: true, force: true });
@@ -406,6 +421,7 @@ describe("latex-service raw log inspection", () => {
     const originalFakeLogFile = process.env.LATEX_FAKE_LOG_FILE;
     const originalFakeExitCode = process.env.LATEX_FAKE_EXIT_CODE;
     const originalFakeArgvFile = process.env.LATEX_FAKE_ARGV_FILE;
+    const originalTexPathDiscovery = disableTexPathDiscovery();
 
     try {
       await writeFile(
@@ -469,6 +485,10 @@ describe("latex-service raw log inspection", () => {
       );
     } finally {
       process.env.PATH = originalPath;
+      restoreOptionalEnv(
+        "ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY",
+        originalTexPathDiscovery
+      );
       restoreOptionalEnv("LATEX_FAKE_LOG_FILE", originalFakeLogFile);
       restoreOptionalEnv("LATEX_FAKE_EXIT_CODE", originalFakeExitCode);
       restoreOptionalEnv("LATEX_FAKE_ARGV_FILE", originalFakeArgvFile);
@@ -483,6 +503,7 @@ describe("latex-service raw log inspection", () => {
     const originalPath = process.env.PATH;
     const originalFakeLogFile = process.env.LATEX_FAKE_LOG_FILE;
     const originalFakeExitCode = process.env.LATEX_FAKE_EXIT_CODE;
+    const originalTexPathDiscovery = disableTexPathDiscovery();
 
     try {
       await writeFile(join(projectRoot, "main.tex"), fixedArticleSource(), "utf8");
@@ -521,6 +542,10 @@ describe("latex-service raw log inspection", () => {
       );
     } finally {
       process.env.PATH = originalPath;
+      restoreOptionalEnv(
+        "ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY",
+        originalTexPathDiscovery
+      );
       restoreOptionalEnv("LATEX_FAKE_LOG_FILE", originalFakeLogFile);
       restoreOptionalEnv("LATEX_FAKE_EXIT_CODE", originalFakeExitCode);
       await rm(projectRoot, { recursive: true, force: true });
@@ -816,6 +841,12 @@ function restoreOptionalEnv(name: string, value: string | undefined): void {
   }
 
   process.env[name] = value;
+}
+
+function disableTexPathDiscovery(): string | undefined {
+  const originalValue = process.env.ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY;
+  process.env.ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY = "1";
+  return originalValue;
 }
 
 async function delay(ms: number): Promise<void> {

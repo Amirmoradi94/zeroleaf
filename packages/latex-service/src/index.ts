@@ -119,6 +119,21 @@ const defaultTimeoutMs = 120_000;
 const defaultMaxOutputBytes = 2_000_000;
 const forceKillDelayMs = 1_500;
 const processTreeExitTimeoutMs = 5_000;
+const texPathDiscoveryDisabledEnv = "ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY";
+const standardTexBinPaths =
+  process.platform === "darwin"
+    ? [
+        "/Library/TeX/texbin",
+        "/usr/local/texlive/2026/bin/universal-darwin",
+        "/usr/local/texlive/2025/bin/universal-darwin",
+        "/usr/local/texlive/2024/bin/universal-darwin"
+      ]
+    : process.platform === "win32"
+      ? []
+      : [
+          "/usr/local/texlive/2026/bin/x86_64-linux",
+          "/usr/local/texlive/2025/bin/x86_64-linux"
+        ];
 const activeBuildJobs = new Map<string, ActiveBuildJob>();
 const defaultBuildSecurityPolicy: BuildSecurityPolicy = {
   shellEscape: {
@@ -185,10 +200,7 @@ export async function runLatexBuild(request: BuildRunRequest): Promise<BuildResu
   const child = spawn(command[0] ?? "latexmk", command.slice(1), {
     cwd: root,
     detached: process.platform !== "win32",
-    env: {
-      ...process.env,
-      max_print_line: "2000"
-    }
+    env: createLatexProcessEnv()
   });
   const activeJob: ActiveBuildJob = {
     process: child,
@@ -486,6 +498,31 @@ function getToolchainSetupMessage(
   return undefined;
 }
 
+function createLatexProcessEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PATH: createLatexPath(process.env.PATH),
+    max_print_line: "2000"
+  };
+}
+
+function createLatexPath(currentPath: string | undefined): string {
+  if (
+    process.env[texPathDiscoveryDisabledEnv] === "1" ||
+    currentPath === undefined ||
+    currentPath.trim().length === 0
+  ) {
+    return currentPath ?? "";
+  }
+
+  const pathSeparator = process.platform === "win32" ? ";" : ":";
+  const existingParts = currentPath.split(pathSeparator).filter(Boolean);
+  const existing = new Set(existingParts);
+  const discoveredParts = standardTexBinPaths.filter((path) => !existing.has(path));
+
+  return [...existingParts, ...discoveredParts].join(pathSeparator);
+}
+
 function createPreflightBuildFailure({
   jobId,
   compiler,
@@ -702,7 +739,7 @@ function appendCapped(current: string, next: string, maxBytes: number): string {
 
 async function runSyncTexCommand(args: readonly string[]): Promise<string> {
   return new Promise((resolveOutput, rejectOutput) => {
-    const child = spawn("synctex", [...args]);
+    const child = spawn("synctex", [...args], { env: createLatexProcessEnv() });
     let stdout = "";
     let stderr = "";
 
@@ -922,7 +959,7 @@ async function runVersionCommand(
   args: readonly string[]
 ): Promise<{ readonly available: boolean; readonly version?: string }> {
   return new Promise((resolveVersion) => {
-    const child = spawn(command, [...args]);
+    const child = spawn(command, [...args], { env: createLatexProcessEnv() });
     let output = "";
 
     child.stdout.setEncoding("utf8");
