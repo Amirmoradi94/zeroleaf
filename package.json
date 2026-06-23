@@ -20,10 +20,11 @@
     "package:mac": "npm run build && node scripts/package-macos.mjs",
     "package:mac:dmg": "npm run package:mac && node scripts/package-macos-dmg.mjs",
     "package:mac:zip": "npm run package:mac && node scripts/package-macos-zip.mjs",
+    "package:win": "npm run build && node scripts/package-windows.mjs",
     "alpha:readiness": "node scripts/private-alpha-readiness.mjs",
     "alpha:pilot": "npm run build && node scripts/private-alpha-pilot.mjs",
     "typecheck": "tsc -b --pretty",
-    "lint": "eslint eslint.config.js scripts/agent-provider-comparison.mjs scripts/e2e-smoke.cjs scripts/package-macos.mjs scripts/package-macos-dmg.mjs scripts/package-macos-zip.mjs scripts/private-alpha-pilot.mjs",
+    "lint": "eslint eslint.config.js scripts/agent-provider-comparison.mjs scripts/e2e-smoke.cjs scripts/package-macos.mjs scripts/package-macos-dmg.mjs scripts/package-macos-zip.mjs scripts/package-windows.mjs scripts/private-alpha-pilot.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run"

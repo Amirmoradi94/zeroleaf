@@ -10,6 +10,7 @@
   "include": ["src/**/*.cts", "src/**/*.d.ts", "src/**/*.ts", "src/**/*.tsx"],
   "references": [
     { "path": "../../packages/ipc-contracts" },
+    { "path": "../../packages/document-service" },
     { "path": "../../packages/agent-host" },
     { "path": "../../packages/history-service" },
     { "path": "../../packages/latex-service" },

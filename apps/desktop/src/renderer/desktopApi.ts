@@ -149,6 +149,16 @@ const fallbackApi: DesktopApi = {
     read: () => Promise.reject(new Error("Electron file API unavailable.")),
     write: () => Promise.reject(new Error("Electron file API unavailable."))
   },
+  word: {
+    read: () => Promise.reject(new Error("Electron Word API unavailable.")),
+    save: () => Promise.reject(new Error("Electron Word API unavailable.")),
+    createChangeSet: () =>
+      Promise.reject(new Error("Electron Word changeset API unavailable.")),
+    applyChangeSet: () =>
+      Promise.reject(new Error("Electron Word changeset API unavailable.")),
+    rollbackChangeSet: () =>
+      Promise.reject(new Error("Electron Word changeset API unavailable."))
+  },
   build: {
     detectToolchain: () =>
       Promise.resolve({
@@ -190,6 +200,13 @@ const fallbackApi: DesktopApi = {
       Promise.reject(new Error("Electron history API unavailable.")),
     rollbackChangeSet: () =>
       Promise.reject(new Error("Electron history API unavailable.")),
+    listWordChangeSets: () => Promise.resolve([]),
+    createWordChangeSet: () =>
+      Promise.reject(new Error("Electron Word history API unavailable.")),
+    markWordChangeSetApplied: () =>
+      Promise.reject(new Error("Electron Word history API unavailable.")),
+    rejectWordChangeSet: () =>
+      Promise.reject(new Error("Electron Word history API unavailable.")),
     listAuditEvents: () => Promise.resolve([])
   },
   references: {

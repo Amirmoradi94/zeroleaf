@@ -24,6 +24,7 @@ import { defaultAppSettings } from "@latex-agent/ipc-contracts";
 import type {
   AgentAuthStatus,
   AgentEvent,
+  AgentImageAttachment,
   AgentMode,
   AgentProviderId,
   AgentSelectionContext,
@@ -55,6 +56,10 @@ import type {
   ReferenceSearchResult,
   RecentProject,
   SubmissionCheckResult,
+  WordBlockOperation,
+  WordDocumentBlock,
+  WordDocumentModel,
+  WordChangeSet,
   WorkbenchLayout
 } from "@latex-agent/ipc-contracts";
 import {
@@ -69,6 +74,7 @@ import {
   FileText,
   FolderPlus,
   FolderOpen,
+  ImagePlus,
   MessageSquareText,
   Pencil,
   Plus,
@@ -231,10 +237,15 @@ type InlineSelectionPromptState = {
 const agentProviderIds = [
   "mock",
   "openai-codex",
-  "anthropic-claude"
+  "anthropic-claude",
+  "openrouter-design"
 ] as const satisfies readonly AgentProviderId[];
 const agentHistoryStorageKey = "zeroleaf-agent-history";
 const agentProviderStorageKey = "zeroleaf-agent-provider";
+const maxAgentImageAttachments = 4;
+const maxAgentImageAttachmentBytes = 6 * 1024 * 1024;
+const agentImageInputAccept =
+  "image/png,image/jpeg,image/webp,image/gif,image/heic,image/heif";
 
 const emptyReferenceAnalysis: ReferenceAnalysis = {
   entries: [],
@@ -244,8 +255,12 @@ const emptyReferenceAnalysis: ReferenceAnalysis = {
 };
 
 type EditorFileState = ProjectFileSnapshot & {
+  readonly documentKind: "text" | "word";
   readonly savedContents: string;
   readonly stale: boolean;
+  readonly wordBlocks?: readonly WordDocumentBlock[];
+  readonly savedWordBlocks?: readonly WordDocumentBlock[];
+  readonly wordWarnings?: readonly string[];
 };
 
 type SavedEditorFile = {
@@ -354,6 +369,7 @@ export function App() {
   const [historyChangeSets, setHistoryChangeSets] = useState<
     readonly HistoryChangeSet[]
   >([]);
+  const [wordChangeSets, setWordChangeSets] = useState<readonly WordChangeSet[]>([]);
   const [acceptedHunkIndexesByChangeSet, setAcceptedHunkIndexesByChangeSet] = useState<
     Readonly<Record<string, readonly number[]>>
   >({});
@@ -362,6 +378,9 @@ export function App() {
   >({});
   const [auditEvents, setAuditEvents] = useState<readonly AuditEvent[]>([]);
   const [selectedChangeSetId, setSelectedChangeSetId] = useState<string | null>(null);
+  const [selectedWordChangeSetId, setSelectedWordChangeSetId] = useState<string | null>(
+    null
+  );
   const [historyMessage, setHistoryMessage] = useState("No history action yet.");
   const [agentProviderId, setAgentProviderId] = useState<AgentProviderId>(() =>
     readStoredAgentProvider(defaultAppSettings.agentPermissions.defaultProviderId)
@@ -374,6 +393,9 @@ export function App() {
   );
   const [agentAuthRefreshRunning, setAgentAuthRefreshRunning] = useState(false);
   const [agentPrompt, setAgentPrompt] = useState("");
+  const [agentImageAttachments, setAgentImageAttachments] = useState<
+    readonly AgentImageAttachment[]
+  >([]);
   const [agentSelectedText, setAgentSelectedText] = useState<string | null>(null);
   const [activeAgentSelectionContext, setActiveAgentSelectionContext] =
     useState<AgentSelectionContext | null>(null);
@@ -775,6 +797,64 @@ export function App() {
     [updateAppSettings]
   );
 
+  const attachAgentImages = useCallback(
+    (files: readonly File[]) => {
+      void (async () => {
+        const remainingSlots = maxAgentImageAttachments - agentImageAttachments.length;
+
+        if (remainingSlots <= 0) {
+          setStatusMessage(
+            `Remove an attached image before adding another. Limit: ${maxAgentImageAttachments}.`
+          );
+          return;
+        }
+
+        const selectedFiles = files.slice(0, remainingSlots);
+        const validFiles = selectedFiles.filter(isSupportedAgentImageFile);
+        const oversizedFiles = validFiles.filter(
+          (file) => file.size > maxAgentImageAttachmentBytes
+        );
+        const readableFiles = validFiles.filter(
+          (file) => file.size <= maxAgentImageAttachmentBytes
+        );
+
+        if (readableFiles.length === 0) {
+          setStatusMessage(
+            oversizedFiles.length > 0
+              ? `Images must be ${formatBytes(maxAgentImageAttachmentBytes)} or smaller.`
+              : "Drop or upload PNG, JPEG, WebP, GIF, HEIC, or HEIF images."
+          );
+          return;
+        }
+
+        const attachments = await Promise.all(
+          readableFiles.map(readAgentImageAttachment)
+        );
+
+        setAgentImageAttachments((currentAttachments) => [
+          ...currentAttachments,
+          ...attachments
+        ]);
+
+        const rejectedCount = files.length - readableFiles.length;
+        setStatusMessage(
+          rejectedCount === 0
+            ? `Attached ${attachments.length} image${attachments.length === 1 ? "" : "s"} for the agent.`
+            : `Attached ${attachments.length} image${attachments.length === 1 ? "" : "s"}; ${rejectedCount} file${rejectedCount === 1 ? "" : "s"} skipped.`
+        );
+      })().catch((error) => {
+        setStatusMessage(`Could not attach image: ${getErrorMessage(error)}`);
+      });
+    },
+    [agentImageAttachments.length]
+  );
+
+  const removeAgentImageAttachment = useCallback((attachmentId: string) => {
+    setAgentImageAttachments((attachments) =>
+      attachments.filter((attachment) => attachment.id !== attachmentId)
+    );
+  }, []);
+
   const refreshPrivacySummary = useCallback(async () => {
     setPrivacySummary(await desktopApi.settings.getPrivacySummary());
   }, []);
@@ -783,10 +863,12 @@ export function App() {
     void desktopApi.settings.clearLocalHistory().then((summary) => {
       setPrivacySummary(summary);
       setHistoryChangeSets([]);
+      setWordChangeSets([]);
       setAcceptedHunkIndexesByChangeSet({});
       setChangeSetVerifications({});
       setAuditEvents([]);
       setSelectedChangeSetId(null);
+      setSelectedWordChangeSetId(null);
       setHistoryMessage("Local history cleared.");
     });
   }, []);
@@ -920,14 +1002,17 @@ export function App() {
     setProjectError(null);
     setActiveBottomTab("Problems");
     setHistoryChangeSets([]);
+    setWordChangeSets([]);
     setAcceptedHunkIndexesByChangeSet({});
     setChangeSetVerifications({});
     setAuditEvents([]);
     setSelectedChangeSetId(null);
+    setSelectedWordChangeSetId(null);
     setHistoryMessage("No history action yet.");
     setAgentEvents([]);
     setAgentSelectedText(null);
     setActiveAgentSelectionContext(null);
+    setAgentImageAttachments([]);
     setAgentSessionId(null);
     setAgentSessionProjectRoot(null);
     setAgentSessionProviderId(null);
@@ -940,10 +1025,7 @@ export function App() {
         return;
       }
 
-      const snapshot = await desktopApi.files.read({
-        projectRoot: currentProject.rootPath,
-        path
-      });
+      const snapshot = await readProjectFileForRoot(currentProject.rootPath, path);
       setOpenFiles((files) =>
         upsertOpenFile(files, {
           ...snapshot,
@@ -1008,9 +1090,12 @@ export function App() {
       setProjectError(null);
       setStatusMessage(`Opened ${result.project.displayName}`);
       if (projectChanged) {
+        setWordChangeSets([]);
+        setSelectedWordChangeSetId(null);
         setAgentEvents([]);
         setAgentSelectedText(null);
         setActiveAgentSelectionContext(null);
+        setAgentImageAttachments([]);
         setAgentSessionId(null);
         setAgentSessionProjectRoot(null);
         setAgentSessionProviderId(null);
@@ -1056,14 +1141,18 @@ export function App() {
       setAcceptedHunkIndexesByChangeSet({});
       setAuditEvents([]);
       setSelectedChangeSetId(null);
+      setWordChangeSets([]);
+      setSelectedWordChangeSetId(null);
       return;
     }
 
-    const [changeSets, events] = await Promise.all([
+    const [changeSets, persistedWordChangeSets, events] = await Promise.all([
       desktopApi.history.listChangeSets({ projectRoot: currentProject.rootPath }),
+      desktopApi.history.listWordChangeSets({ projectRoot: currentProject.rootPath }),
       desktopApi.history.listAuditEvents({ projectRoot: currentProject.rootPath })
     ]);
     setHistoryChangeSets(changeSets);
+    setWordChangeSets(persistedWordChangeSets);
     setAcceptedHunkIndexesByChangeSet((acceptedByChangeSet) => {
       const changesetIds = new Set(changeSets.map((changeSet) => changeSet.id));
       return Object.fromEntries(
@@ -1091,7 +1180,43 @@ export function App() {
 
       return changeSets[0]?.id ?? null;
     });
+    setSelectedWordChangeSetId((selectedId) => {
+      if (
+        selectedId !== null &&
+        persistedWordChangeSets.some((changeSet) => changeSet.id === selectedId)
+      ) {
+        return selectedId;
+      }
+
+      return persistedWordChangeSets[0]?.id ?? null;
+    });
   }, [currentProject]);
+
+  const rememberWordChangeSets = useCallback(
+    async (changesets: readonly WordChangeSet[]) => {
+      if (changesets.length === 0) {
+        return;
+      }
+
+      const persistedChangeSets = await Promise.all(
+        changesets.map((changeset) =>
+          desktopApi.history.createWordChangeSet({ changeset })
+        )
+      );
+
+      setWordChangeSets((currentChangeSets) =>
+        persistedChangeSets.reduce(
+          (nextChangeSets, changeset) =>
+            replaceWordChangeSet(nextChangeSets, changeset),
+          currentChangeSets
+        )
+      );
+      setSelectedWordChangeSetId(persistedChangeSets.at(-1)?.id ?? null);
+      setBottomPanelOpen(true);
+      setActiveBottomTab("History");
+    },
+    []
+  );
 
   const refreshReferences = useCallback(async () => {
     if (currentProject === undefined) {
@@ -1531,13 +1656,46 @@ export function App() {
       }
 
       const editorContents =
-        file.path === activeFilePath
+        file.documentKind === "text" && file.path === activeFilePath
           ? (editorRef.current?.getValue() ?? file.contents)
           : file.contents;
       const fileToSave = {
         ...file,
         contents: editorContents
       };
+
+      if (fileToSave.documentKind === "word") {
+        const wordBlocks =
+          fileToSave.wordBlocks ??
+          fileToSave.contents.split(/\n{2,}/u).map((text, index) => ({
+            id: `p-${index + 1}`,
+            kind: "paragraph" as const,
+            text
+          }));
+
+        let result: Awaited<ReturnType<typeof desktopApi.word.save>>;
+        try {
+          result = await desktopApi.word.save({
+            projectRoot: currentProject.rootPath,
+            path: fileToSave.path,
+            blocks: wordBlocks
+          });
+        } catch (error) {
+          throw new Error(`Could not save ${file.path}: ${getErrorMessage(error)}`);
+        }
+
+        return {
+          file: {
+            ...fileToSave,
+            contents: getWordBlocksPlainText(wordBlocks),
+            savedContents: getWordBlocksPlainText(wordBlocks),
+            mtimeMs: result.mtimeMs,
+            stale: false,
+            wordBlocks,
+            savedWordBlocks: wordBlocks
+          }
+        };
+      }
 
       let result: Awaited<ReturnType<typeof desktopApi.files.write>>;
       try {
@@ -1973,6 +2131,82 @@ export function App() {
     [refreshHistory, runProjectOperation]
   );
 
+  const applyWordChangeSet = useCallback(
+    (changesetId: string) => {
+      void runProjectOperation(async () => {
+        const changeset = wordChangeSets.find(
+          (candidate) => candidate.id === changesetId
+        );
+
+        if (changeset === undefined) {
+          setHistoryMessage("Select a Word changeset before applying.");
+          return;
+        }
+
+        const result = await desktopApi.word.applyChangeSet({ changeset });
+        setWordChangeSets((currentChangeSets) =>
+          replaceWordChangeSet(currentChangeSets, result.changeset)
+        );
+        setSelectedWordChangeSetId(result.changeset.id);
+        setHistoryMessage(
+          `Applied ${result.changeset.summary}; Word document verified.`
+        );
+        setOpenFiles((files) =>
+          upsertOpenFile(files, createEditorFileStateFromWordDocument(result.document))
+        );
+        setActiveFilePath(result.document.path);
+        setSelectedProjectEntryPath(result.document.path);
+        setSelectedProjectDirectoryPath(getProjectDirectoryPath(result.document.path));
+        appWrittenProjectPathsRef.current.add(
+          normalizeProjectPath(result.document.path)
+        );
+        await refreshHistory();
+      });
+    },
+    [refreshHistory, runProjectOperation, wordChangeSets]
+  );
+
+  const rejectWordChangeSet = useCallback(
+    (changesetId: string) => {
+      void runProjectOperation(async () => {
+        const rejected = await desktopApi.history.rejectWordChangeSet(changesetId);
+        setWordChangeSets((currentChangeSets) =>
+          replaceWordChangeSet(currentChangeSets, rejected)
+        );
+        setSelectedWordChangeSetId(rejected.id);
+        setHistoryMessage(`Rejected ${rejected.summary}`);
+        await refreshHistory();
+      });
+    },
+    [refreshHistory, runProjectOperation]
+  );
+
+  const rollbackWordChangeSet = useCallback(
+    (changesetId: string) => {
+      void runProjectOperation(async () => {
+        const result = await desktopApi.word.rollbackChangeSet({ changesetId });
+        setWordChangeSets((currentChangeSets) =>
+          replaceWordChangeSet(currentChangeSets, result.changeset)
+        );
+        setSelectedWordChangeSetId(result.changeset.id);
+        setHistoryMessage(
+          `Rolled back ${result.changeset.summary}; Word document verified.`
+        );
+        setOpenFiles((files) =>
+          upsertOpenFile(files, createEditorFileStateFromWordDocument(result.document))
+        );
+        setActiveFilePath(result.document.path);
+        setSelectedProjectEntryPath(result.document.path);
+        setSelectedProjectDirectoryPath(getProjectDirectoryPath(result.document.path));
+        appWrittenProjectPathsRef.current.add(
+          normalizeProjectPath(result.document.path)
+        );
+        await refreshHistory();
+      });
+    },
+    [refreshHistory, runProjectOperation]
+  );
+
   const setChangeSetHunkAccepted = useCallback(
     (changesetId: string, hunkIndex: number, accepted: boolean) => {
       const changeset = historyChangeSets.find(
@@ -2149,10 +2383,19 @@ export function App() {
       readonly mode?: AgentMode;
     }) => {
       void runProjectOperation(async () => {
+        const composerImageAttachments =
+          options?.prompt === undefined ? agentImageAttachments : [];
+        const rawPrompt = options?.prompt?.trim() ?? agentPrompt.trim();
         const prompt =
-          options?.prompt?.trim() ??
-          agentPrompt.trim() ??
-          "Inspect the current LaTeX context and propose a safe edit.";
+          rawPrompt.length > 0
+            ? rawPrompt
+            : composerImageAttachments.length > 0
+              ? "Inspect the attached image in the current LaTeX project context and respond."
+              : "";
+        const transcriptPrompt = formatAgentPromptForTranscript(
+          prompt,
+          composerImageAttachments
+        );
 
         if (prompt.length === 0) {
           setStatusMessage("Enter an agent prompt first.");
@@ -2168,6 +2411,7 @@ export function App() {
           await runExternalTemplateAgentCommand(prompt, externalTemplateCommand);
           if (options?.prompt === undefined) {
             setAgentPrompt("");
+            setAgentImageAttachments([]);
           }
           return;
         }
@@ -2179,6 +2423,7 @@ export function App() {
             await runNoProjectAgentCommand(prompt, noProjectCommand);
             if (options?.prompt === undefined) {
               setAgentPrompt("");
+              setAgentImageAttachments([]);
             }
             return;
           }
@@ -2187,7 +2432,7 @@ export function App() {
             .toString(36)
             .slice(2, 8)}`;
           const userEvent = buildAgentMessageEvent({
-            content: prompt,
+            content: transcriptPrompt,
             role: "user",
             sessionId
           });
@@ -2211,6 +2456,7 @@ export function App() {
           );
           if (options?.prompt === undefined) {
             setAgentPrompt("");
+            setAgentImageAttachments([]);
           }
           return;
         }
@@ -2260,17 +2506,36 @@ export function App() {
         }
 
         setAgentRunning(true);
-        setAgentLiveStatus(createStartingAgentLiveStatus(prompt, providerLabel));
+        setAgentLiveStatus(
+          createStartingAgentLiveStatus(transcriptPrompt, providerLabel)
+        );
         if (selectionContext !== undefined) {
           setActiveAgentSelectionContext(selectionContext);
         }
-        setAgentEvents((events) => [...events, buildUserEvent(prompt)]);
+        setAgentEvents((events) => [...events, buildUserEvent(transcriptPrompt)]);
         if (options?.prompt === undefined) {
           setAgentPrompt("");
+          setAgentImageAttachments([]);
         }
         setStatusMessage(`${providerLabel} is preparing the request...`);
 
         try {
+          const activeDocument =
+            activeFile === null
+              ? undefined
+              : activeFile.documentKind === "word"
+                ? {
+                    kind: "word" as const,
+                    path: activeFile.path,
+                    plainText: activeFile.contents,
+                    blocks: activeFile.wordBlocks ?? [],
+                    warnings: activeFile.wordWarnings ?? []
+                  }
+                : {
+                    kind: "text" as const,
+                    path: activeFile.path,
+                    contents: activeFile.contents
+                  };
           const result = await desktopApi.agent.start({
             providerId: agentProviderId,
             mode: effectiveAgentMode,
@@ -2281,11 +2546,15 @@ export function App() {
               : { sessionId: continuationSessionId }),
             prompt,
             ...(activeFile === null ? {} : { activeFilePath: activeFile.path }),
+            ...(activeDocument === undefined ? {} : { activeDocument }),
             ...(options?.activeFilePath === undefined
               ? {}
               : { activeFilePath: options.activeFilePath }),
             ...(selectedText === undefined ? {} : { selectedText }),
             ...(selectionContext === undefined ? {} : { selectionContext }),
+            ...(composerImageAttachments.length === 0
+              ? {}
+              : { imageAttachments: composerImageAttachments }),
             ...(currentProject.mainFilePath === undefined
               ? {}
               : { mainFilePath: currentProject.mainFilePath }),
@@ -2348,6 +2617,16 @@ export function App() {
             }));
             setActiveBottomTab("History");
             await refreshHistory();
+          }
+
+          const proposedWordChangeSets = getAgentResultWordChangeSets(result);
+          if (proposedWordChangeSets.length > 0) {
+            await rememberWordChangeSets(proposedWordChangeSets);
+            setHistoryMessage(
+              proposedWordChangeSets.length === 1
+                ? `Agent proposed ${proposedWordChangeSets[0]!.summary}`
+                : `Agent proposed ${proposedWordChangeSets.length} Word changes`
+            );
           }
 
           if (agentSetMainFile(result.events)) {
@@ -2470,6 +2749,7 @@ export function App() {
       activeFile,
       agentAuthStatuses,
       agentEvents,
+      agentImageAttachments,
       agentMode,
       agentPrompt,
       agentProviderId,
@@ -2482,6 +2762,7 @@ export function App() {
       pdfArtifactData,
       pdfStale,
       refreshHistory,
+      rememberWordChangeSets,
       runProjectOperation,
       runExternalTemplateAgentCommand,
       runNoProjectAgentCommand,
@@ -2882,6 +3163,16 @@ export function App() {
           }
         }
 
+        const approvedWordChangeSets = getAgentResultWordChangeSets(result);
+        if (approvedWordChangeSets.length > 0) {
+          await rememberWordChangeSets(approvedWordChangeSets);
+          setHistoryMessage(
+            approvedWordChangeSets.length === 1
+              ? `${decision === "allowed" ? "Reviewed" : "Rejected"} ${approvedWordChangeSets[0]!.summary}`
+              : `${decision === "allowed" ? "Reviewed" : "Rejected"} ${approvedWordChangeSets.length} Word changes`
+          );
+        }
+
         const approvalBuildResult = result.buildResult;
         if (approvalBuildResult !== undefined) {
           setBuildResult(approvalBuildResult);
@@ -2996,7 +3287,13 @@ export function App() {
         });
       });
     },
-    [currentProject, readProjectFile, refreshHistory, runProjectOperation]
+    [
+      currentProject,
+      readProjectFile,
+      refreshHistory,
+      rememberWordChangeSets,
+      runProjectOperation
+    ]
   );
 
   const stopBuild = useCallback(() => {
@@ -3271,10 +3568,10 @@ export function App() {
       const results = (
         await Promise.all(
           filesToSearch.map(async (file) => {
-            const snapshot = await desktopApi.files.read({
-              projectRoot: currentProject.rootPath,
-              path: file.path
-            });
+            const snapshot = await readProjectFileForRoot(
+              currentProject.rootPath,
+              file.path
+            );
             return searchFileContents(snapshot.path, snapshot.contents, query, 8);
           })
         )
@@ -3364,6 +3661,23 @@ export function App() {
       }
     },
     [activeFile, pdfArtifactData]
+  );
+
+  const updateActiveWordBlocks = useCallback(
+    (blocks: readonly WordDocumentBlock[]) => {
+      if (activeFile === null || activeFile.documentKind !== "word") {
+        return;
+      }
+
+      setOpenFiles((files) =>
+        replaceOpenFile(files, {
+          ...activeFile,
+          contents: getWordBlocksPlainText(blocks),
+          wordBlocks: blocks
+        })
+      );
+    },
+    [activeFile]
   );
 
   const jumpToFileLine = useCallback(
@@ -4238,6 +4552,7 @@ export function App() {
               onCloseFile={closeFile}
               onContentsChange={updateActiveFileContents}
               onFind={() => focusMonacoFind(editorRef.current)}
+              onWordBlocksChange={updateActiveWordBlocks}
               onMount={(editor) => {
                 editorRef.current = editor;
                 editorResizeObserverRef.current?.disconnect();
@@ -4366,6 +4681,7 @@ export function App() {
             <AgentPane
               composerRef={agentComposerRef}
               events={agentEvents}
+              imageAttachments={agentImageAttachments}
               liveStatus={agentLiveStatus}
               mode={agentMode}
               providerAuthStatus={agentAuthStatuses[agentProviderId]}
@@ -4376,6 +4692,7 @@ export function App() {
               onAllowApproval={(sessionId, approvalId, toolName) =>
                 respondAgentApproval(sessionId, approvalId, toolName, "allowed")
               }
+              onAttachImages={attachAgentImages}
               onCancel={() => {
                 if (agentSessionId !== null) {
                   void desktopApi.agent.cancel(agentSessionId);
@@ -4391,6 +4708,7 @@ export function App() {
               onModeChange={updateAgentMode}
               onPromptChange={setAgentPrompt}
               onProviderChange={updateAgentProviderId}
+              onRemoveImageAttachment={removeAgentImageAttachment}
               onSelectionAction={openInlineSelectionPrompt}
               onDenyApproval={(sessionId, approvalId, toolName) =>
                 respondAgentApproval(sessionId, approvalId, toolName, "denied")
@@ -4418,6 +4736,8 @@ export function App() {
                 acceptedHunkIndexesByChangeSet={acceptedHunkIndexesByChangeSet}
                 historyChangeSets={historyChangeSets}
                 historyMessage={historyMessage}
+                selectedWordChangeSetId={selectedWordChangeSetId}
+                wordChangeSets={wordChangeSets}
                 onExplainChangeSetHunk={explainChangeSetHunk}
                 outline={projectOutline}
                 projectSearchQuery={projectSearchQuery}
@@ -4430,6 +4750,7 @@ export function App() {
                 submissionCheckResult={submissionCheckResult}
                 onActiveTabChange={setActiveBottomTab}
                 onApplyChangeSet={applyChangeSet}
+                onApplyWordChangeSet={applyWordChangeSet}
                 onAttachReferenceEntry={attachReferenceEntryToAgent}
                 onCreateChangeSet={createActiveFileChangeSet}
                 onInsertCitation={insertCitation}
@@ -4441,13 +4762,19 @@ export function App() {
                   void runProjectOperation(refreshReferences);
                 }}
                 onRejectChangeSet={rejectChangeSet}
+                onRejectWordChangeSet={rejectWordChangeSet}
                 onSetChangeSetHunkAccepted={setChangeSetHunkAccepted}
                 onRemoveUnusedReference={removeUnusedReference}
                 onRepairMissingCitation={repairMissingCitation}
                 onRollbackChangeSet={rollbackChangeSet}
+                onRollbackWordChangeSet={rollbackWordChangeSet}
                 onRunReferenceSearch={runReferenceSearch}
                 onRunProjectSearch={runProjectSearch}
-                onSelectChangeSet={setSelectedChangeSetId}
+                onSelectChangeSet={(changesetId) => {
+                  setSelectedChangeSetId(changesetId);
+                  setSelectedWordChangeSetId(null);
+                }}
+                onSelectWordChangeSet={setSelectedWordChangeSetId}
                 onFixDiagnostic={startDiagnosticAgentFix}
                 onSelectDiagnostic={(diagnostic) => {
                   if (
@@ -5054,6 +5381,7 @@ function EditorPane({
   onContentsChange,
   onFind,
   onMount,
+  onWordBlocksChange,
   onRunBuild,
   onSourceToPdf,
   onSave,
@@ -5077,6 +5405,7 @@ function EditorPane({
   readonly onContentsChange: (contents: string) => void;
   readonly onFind: () => void;
   readonly onMount: (editor: MonacoStandaloneEditor) => void;
+  readonly onWordBlocksChange: (blocks: readonly WordDocumentBlock[]) => void;
   readonly onRunBuild: () => void;
   readonly onSourceToPdf: () => void;
   readonly onSave: () => void;
@@ -5178,7 +5507,7 @@ function EditorPane({
         </IconButton>
         <IconButton
           label="Find in file"
-          disabled={activeFile === null}
+          disabled={activeFile === null || activeFile.documentKind === "word"}
           onClick={onFind}
         >
           <Search aria-hidden="true" size={15} />
@@ -5198,6 +5527,8 @@ function EditorPane({
           <FileText aria-hidden="true" size={24} />
           <p>Open a project file to edit it.</p>
         </div>
+      ) : activeFile.documentKind === "word" ? (
+        <WordEditor file={activeFile} onBlocksChange={onWordBlocksChange} />
       ) : (
         <Editor
           beforeMount={(monaco) => configureMonaco(monaco as unknown as Monaco)}
@@ -5224,6 +5555,91 @@ function EditorPane({
         />
       )}
     </section>
+  );
+}
+
+function WordEditor({
+  file,
+  onBlocksChange
+}: {
+  readonly file: EditorFileState;
+  readonly onBlocksChange: (blocks: readonly WordDocumentBlock[]) => void;
+}) {
+  const blocks =
+    file.wordBlocks ??
+    file.contents.split(/\n{2,}/u).map((text, index) => ({
+      id: `p-${index + 1}`,
+      kind: "paragraph" as const,
+      text
+    }));
+  const warnings = file.wordWarnings ?? [];
+
+  const updateBlock = (blockId: string, text: string) => {
+    onBlocksChange(
+      blocks.map((block) => (block.id === blockId ? { ...block, text } : block))
+    );
+  };
+
+  const addParagraph = () => {
+    onBlocksChange([
+      ...blocks,
+      {
+        id: `p-${blocks.length + 1}-${Date.now().toString(36)}`,
+        kind: "paragraph",
+        text: ""
+      }
+    ]);
+  };
+
+  return (
+    <div className="word-editor" aria-label="Word document editor">
+      <div className="word-editor__header">
+        <div>
+          <span className="eyebrow">Word Document</span>
+          <h3>{getBaseName(file.path)}</h3>
+        </div>
+        <button className="secondary-button" type="button" onClick={addParagraph}>
+          <Plus aria-hidden="true" size={14} />
+          Paragraph
+        </button>
+      </div>
+      {warnings.length > 0 ? (
+        <div className="word-editor__warnings" role="status">
+          {warnings.slice(0, 3).map((warning) => (
+            <p key={warning}>{warning}</p>
+          ))}
+        </div>
+      ) : null}
+      <div className="word-editor__page">
+        {blocks.length === 0 ? (
+          <textarea
+            className="word-editor__paragraph"
+            aria-label="Empty Word document paragraph"
+            value=""
+            onChange={(event) =>
+              onBlocksChange([
+                {
+                  id: "p-1",
+                  kind: "paragraph",
+                  text: event.target.value
+                }
+              ])
+            }
+          />
+        ) : (
+          blocks.map((block, index) => (
+            <textarea
+              aria-label={`Word paragraph ${index + 1}`}
+              className="word-editor__paragraph"
+              key={block.id}
+              rows={Math.max(2, Math.ceil(block.text.length / 92))}
+              value={block.text}
+              onChange={(event) => updateBlock(block.id, event.target.value)}
+            />
+          ))
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -5355,15 +5771,18 @@ function SelectionPromptPopover({
 function AgentPane({
   composerRef,
   events,
+  imageAttachments,
   liveStatus,
   mode,
   onAllowApproval,
+  onAttachImages,
   onCancel,
   onClearHistory,
   onDenyApproval,
   onModeChange,
   onPromptChange,
   onProviderChange,
+  onRemoveImageAttachment,
   onSelectionAction,
   onStart,
   prompt,
@@ -5374,6 +5793,7 @@ function AgentPane({
 }: {
   readonly composerRef: React.RefObject<HTMLTextAreaElement | null>;
   readonly events: readonly AgentEvent[];
+  readonly imageAttachments: readonly AgentImageAttachment[];
   readonly liveStatus: AgentLiveStatus | null;
   readonly mode: AgentMode;
   readonly onAllowApproval: (
@@ -5381,6 +5801,7 @@ function AgentPane({
     approvalId: string,
     toolName: AgentToolName
   ) => void;
+  readonly onAttachImages: (files: readonly File[]) => void;
   readonly onCancel: () => void;
   readonly onClearHistory: () => void;
   readonly onDenyApproval: (
@@ -5391,6 +5812,7 @@ function AgentPane({
   readonly onModeChange: (mode: AgentMode) => void;
   readonly onPromptChange: (prompt: string) => void;
   readonly onProviderChange: (providerId: AgentProviderId) => void;
+  readonly onRemoveImageAttachment: (attachmentId: string) => void;
   readonly onSelectionAction: (action: SelectionAgentAction) => void;
   readonly onStart: () => void;
   readonly prompt: string;
@@ -5400,7 +5822,10 @@ function AgentPane({
   readonly selectedText: string | null;
 }) {
   const threadEndRef = useRef<HTMLDivElement | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const [composerDropActive, setComposerDropActive] = useState(false);
   const elapsedSeconds = useAgentElapsedSeconds(running);
+  const canSend = !running && (prompt.trim().length > 0 || imageAttachments.length > 0);
 
   useLayoutEffect(() => {
     const composer = composerRef.current;
@@ -5500,6 +5925,7 @@ function AgentPane({
             <option value="mock">Mock</option>
             <option value="openai-codex">Codex</option>
             <option value="anthropic-claude">Claude</option>
+            <option value="openrouter-design">OpenRouter Design</option>
           </select>
         </label>
         <label>
@@ -5573,6 +5999,11 @@ function AgentPane({
                 <AgentUserMessage event={item.event} key={itemKey} />
               ) : (
                 <AgentRunCard
+                  activityEvents={getAgentRunActivityEvents(
+                    events,
+                    visibleThreadItems,
+                    index
+                  )}
                   events={item.events}
                   elapsedSeconds={elapsedSeconds}
                   isActive={itemKey === activeRunItemKey}
@@ -5595,32 +6026,99 @@ function AgentPane({
         )}
       </div>
 
-      <div className="agent-composer">
-        <textarea
-          ref={composerRef}
-          aria-label="Agent prompt"
-          value={prompt}
-          placeholder="Ask for a scoped edit, compile, or project inspection..."
-          onChange={(event) => onPromptChange(event.target.value)}
-          onKeyDown={(event) => {
-            if (
-              !running &&
-              prompt.trim().length > 0 &&
-              event.key === "Enter" &&
-              !event.shiftKey
-            ) {
-              event.preventDefault();
-              onStart();
-            }
-          }}
-        />
+      <div
+        className={`agent-composer${composerDropActive ? " drag-active" : ""}`}
+        onDragEnter={(event) => {
+          if (hasImageDragItems(event.dataTransfer)) {
+            event.preventDefault();
+            setComposerDropActive(true);
+          }
+        }}
+        onDragOver={(event) => {
+          if (hasImageDragItems(event.dataTransfer)) {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+            setComposerDropActive(true);
+          }
+        }}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+            setComposerDropActive(false);
+          }
+        }}
+        onDrop={(event) => {
+          if (!hasImageDragItems(event.dataTransfer)) {
+            return;
+          }
+
+          event.preventDefault();
+          setComposerDropActive(false);
+          onAttachImages(Array.from(event.dataTransfer.files));
+        }}
+      >
+        {imageAttachments.length > 0 && (
+          <div className="agent-attachments" aria-label="Attached images">
+            {imageAttachments.map((attachment) => (
+              <div className="agent-attachment" key={attachment.id}>
+                <img alt="" src={attachment.dataUrl} />
+                <div>
+                  <strong>{attachment.name}</strong>
+                  <span>{formatBytes(attachment.byteLength)}</span>
+                </div>
+                <IconButton
+                  disabled={running}
+                  label={`Remove ${attachment.name}`}
+                  onClick={() => onRemoveImageAttachment(attachment.id)}
+                >
+                  <X size={13} />
+                </IconButton>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="agent-prompt-field">
+          <textarea
+            ref={composerRef}
+            aria-label="Agent prompt"
+            value={prompt}
+            placeholder="Ask for a scoped edit, compile, or project inspection..."
+            onChange={(event) => onPromptChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (canSend && event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                onStart();
+              }
+            }}
+          />
+          <input
+            ref={attachmentInputRef}
+            aria-label="Upload image for agent"
+            hidden
+            multiple
+            type="file"
+            accept={agentImageInputAccept}
+            onChange={(event) => {
+              onAttachImages(Array.from(event.target.files ?? []));
+              event.target.value = "";
+            }}
+          />
+          <div className="agent-prompt-attach">
+            <IconButton
+              disabled={running || imageAttachments.length >= maxAgentImageAttachments}
+              label="Attach image"
+              onClick={() => attachmentInputRef.current?.click()}
+            >
+              <ImagePlus size={15} />
+            </IconButton>
+          </div>
+        </div>
         <div className="agent-composer-actions">
           <span>{formatAgentModeLabel(mode)}</span>
           <div className="agent-composer-buttons">
             <button
               className="primary-button"
               type="button"
-              disabled={running || prompt.trim().length === 0}
+              disabled={!canSend}
               onClick={onStart}
             >
               <Sparkles aria-hidden="true" size={15} />
@@ -5664,6 +6162,7 @@ function AgentUserMessage({
 }
 
 function AgentRunCard({
+  activityEvents,
   elapsedSeconds,
   events,
   isActive,
@@ -5674,6 +6173,7 @@ function AgentRunCard({
   requestPrompt,
   workflowEvents
 }: {
+  readonly activityEvents: readonly AgentEvent[];
   readonly elapsedSeconds: number;
   readonly events: readonly AgentEvent[];
   readonly isActive: boolean;
@@ -5697,16 +6197,17 @@ function AgentRunCard({
       event.type === "message" && event.role !== "user"
   );
   const cardEvents = [...events, ...workflowEvents];
+  const statusEvents = [...events, ...activityEvents];
   const visibleWorkflowEvents = getVisibleAgentWorkflowEvents({
     hasAssistantResponse: assistantMessages.length > 0,
     isActive,
     workflowEvents
   });
-  const latestEvent = getLatestAgentEvent(cardEvents);
-  const tone = getAgentRunTone(cardEvents);
+  const latestEvent = getLatestAgentEvent(statusEvents);
+  const tone = getAgentRunTone(statusEvents);
   const effectiveLiveStatus = createAgentRunLiveStatus({
     elapsedSeconds,
-    events: cardEvents,
+    events: statusEvents,
     fallback: liveStatus,
     requestPrompt
   });
@@ -6041,6 +6542,7 @@ function BottomPanel({
   historyChangeSets,
   historyMessage,
   onApplyChangeSet,
+  onApplyWordChangeSet,
   onAttachReferenceEntry,
   onCreateChangeSet,
   onExplainChangeSetHunk,
@@ -6053,13 +6555,16 @@ function BottomPanel({
   onReferenceSearchQueryChange,
   onRefreshReferences,
   onRejectChangeSet,
+  onRejectWordChangeSet,
   onSetChangeSetHunkAccepted,
   onRemoveUnusedReference,
   onRepairMissingCitation,
   onRollbackChangeSet,
+  onRollbackWordChangeSet,
   onRunReferenceSearch,
   onRunProjectSearch,
   onSelectChangeSet,
+  onSelectWordChangeSet,
   onSelectDiagnostic,
   onSelectReferenceCitation,
   onSelectReferenceEntry,
@@ -6074,7 +6579,9 @@ function BottomPanel({
   referenceSearchQuery,
   referenceSearchResults,
   selectedChangeSetId,
-  submissionCheckResult
+  selectedWordChangeSetId,
+  submissionCheckResult,
+  wordChangeSets
 }: {
   readonly activeTab: BottomTab;
   readonly activeFile: EditorFileState | null;
@@ -6088,6 +6595,7 @@ function BottomPanel({
   readonly historyChangeSets: readonly HistoryChangeSet[];
   readonly historyMessage: string;
   readonly onApplyChangeSet: (changesetId: string) => void;
+  readonly onApplyWordChangeSet: (changesetId: string) => void;
   readonly onAttachReferenceEntry: (entry: BibliographyEntry) => void;
   readonly onCreateChangeSet: () => void;
   readonly onExplainChangeSetHunk: (filePath: string, hunkContents: string) => void;
@@ -6099,6 +6607,7 @@ function BottomPanel({
   readonly onReferenceSearchQueryChange: (query: string) => void;
   readonly onRefreshReferences: () => void;
   readonly onRejectChangeSet: (changesetId: string) => void;
+  readonly onRejectWordChangeSet: (changesetId: string) => void;
   readonly onSetChangeSetHunkAccepted: (
     changesetId: string,
     hunkIndex: number,
@@ -6107,9 +6616,11 @@ function BottomPanel({
   readonly onRemoveUnusedReference: (entry: BibliographyEntry) => void;
   readonly onRepairMissingCitation: (key: string) => void;
   readonly onRollbackChangeSet: (changesetId: string) => void;
+  readonly onRollbackWordChangeSet: (changesetId: string) => void;
   readonly onRunReferenceSearch: () => void;
   readonly onRunProjectSearch: () => void;
   readonly onSelectChangeSet: (changesetId: string) => void;
+  readonly onSelectWordChangeSet: (changesetId: string | null) => void;
   readonly onSelectDiagnostic: (diagnostic: LatexDiagnostic) => void;
   readonly onSelectReferenceCitation: (citation: CitationOccurrence) => void;
   readonly onSelectReferenceEntry: (entry: BibliographyEntry) => void;
@@ -6124,7 +6635,9 @@ function BottomPanel({
   readonly referenceSearchQuery: string;
   readonly referenceSearchResults: readonly ReferenceSearchResult[];
   readonly selectedChangeSetId: string | null;
+  readonly selectedWordChangeSetId: string | null;
   readonly submissionCheckResult: SubmissionCheckResult | null;
+  readonly wordChangeSets: readonly WordChangeSet[];
 }) {
   const tabs: readonly BottomTab[] = [
     "Problems",
@@ -6215,12 +6728,18 @@ function BottomPanel({
             acceptedHunkIndexesByChangeSet={acceptedHunkIndexesByChangeSet}
             message={historyMessage}
             selectedChangeSetId={selectedChangeSetId}
+            selectedWordChangeSetId={selectedWordChangeSetId}
+            wordChangeSets={wordChangeSets}
             onApplyChangeSet={onApplyChangeSet}
+            onApplyWordChangeSet={onApplyWordChangeSet}
             onCreateChangeSet={onCreateChangeSet}
             onExplainChangeSetHunk={onExplainChangeSetHunk}
             onRejectChangeSet={onRejectChangeSet}
+            onRejectWordChangeSet={onRejectWordChangeSet}
             onRollbackChangeSet={onRollbackChangeSet}
+            onRollbackWordChangeSet={onRollbackWordChangeSet}
             onSelectChangeSet={onSelectChangeSet}
+            onSelectWordChangeSet={onSelectWordChangeSet}
             onSetChangeSetHunkAccepted={onSetChangeSetHunkAccepted}
             onSnapshotActiveFile={onSnapshotActiveFile}
           />
@@ -6657,14 +7176,20 @@ function HistoryPanel({
   changeSetVerifications,
   message,
   onApplyChangeSet,
+  onApplyWordChangeSet,
   onCreateChangeSet,
   onExplainChangeSetHunk,
   onRejectChangeSet,
+  onRejectWordChangeSet,
   onRollbackChangeSet,
+  onRollbackWordChangeSet,
   onSelectChangeSet,
+  onSelectWordChangeSet,
   onSetChangeSetHunkAccepted,
   onSnapshotActiveFile,
-  selectedChangeSetId
+  selectedChangeSetId,
+  selectedWordChangeSetId,
+  wordChangeSets
 }: {
   readonly activeFile: EditorFileState | null;
   readonly activeFileDirty: boolean;
@@ -6675,11 +7200,15 @@ function HistoryPanel({
   readonly changeSetVerifications: Readonly<Record<string, ChangeSetVerification>>;
   readonly message: string;
   readonly onApplyChangeSet: (changesetId: string) => void;
+  readonly onApplyWordChangeSet: (changesetId: string) => void;
   readonly onCreateChangeSet: () => void;
   readonly onExplainChangeSetHunk: (filePath: string, hunkContents: string) => void;
   readonly onRejectChangeSet: (changesetId: string) => void;
+  readonly onRejectWordChangeSet: (changesetId: string) => void;
   readonly onRollbackChangeSet: (changesetId: string) => void;
+  readonly onRollbackWordChangeSet: (changesetId: string) => void;
   readonly onSelectChangeSet: (changesetId: string) => void;
+  readonly onSelectWordChangeSet: (changesetId: string | null) => void;
   readonly onSetChangeSetHunkAccepted: (
     changesetId: string,
     hunkIndex: number,
@@ -6687,6 +7216,8 @@ function HistoryPanel({
   ) => void;
   readonly onSnapshotActiveFile: () => void;
   readonly selectedChangeSetId: string | null;
+  readonly selectedWordChangeSetId: string | null;
+  readonly wordChangeSets: readonly WordChangeSet[];
 }) {
   const selectedChangeSet =
     changesets.find((changeset) => changeset.id === selectedChangeSetId) ??
@@ -6711,6 +7242,10 @@ function HistoryPanel({
       : (acceptedHunkIndexesByChangeSet[selectedChangeSet.id] ??
         selectedDiffHunks.map((hunk) => hunk.index));
   const acceptedHunkIndexSet = new Set(acceptedHunkIndexes);
+  const selectedWordChangeSet =
+    wordChangeSets.find((changeset) => changeset.id === selectedWordChangeSetId) ??
+    wordChangeSets[0] ??
+    null;
 
   return (
     <div className="history-panel">
@@ -6737,26 +7272,58 @@ function HistoryPanel({
       </div>
       <div className="history-grid">
         <div className="history-list" role="list" aria-label="Changesets">
-          {changesets.length === 0 ? (
+          {changesets.length === 0 && wordChangeSets.length === 0 ? (
             <p>No changesets yet.</p>
-          ) : (
-            changesets.map((changeset) => (
-              <button
-                className={`history-row${changeset.id === selectedChangeSet?.id ? " active" : ""}`}
-                key={changeset.id}
-                type="button"
-                onClick={() => onSelectChangeSet(changeset.id)}
-              >
-                <strong>{changeset.summary}</strong>
-                <span>
-                  {changeset.status} · {changeset.filePath}
-                </span>
-              </button>
-            ))
-          )}
+          ) : null}
+          {changesets.length > 0 ? (
+            <>
+              <span className="history-list-label">LaTeX/text patches</span>
+              {changesets.map((changeset) => (
+                <button
+                  className={`history-row${changeset.id === selectedChangeSet?.id ? " active" : ""}`}
+                  key={changeset.id}
+                  type="button"
+                  onClick={() => {
+                    onSelectChangeSet(changeset.id);
+                    onSelectWordChangeSet(null);
+                  }}
+                >
+                  <strong>{changeset.summary}</strong>
+                  <span>
+                    {changeset.status} · {changeset.filePath}
+                  </span>
+                </button>
+              ))}
+            </>
+          ) : null}
+          {wordChangeSets.length > 0 ? (
+            <>
+              <span className="history-list-label">Word edits</span>
+              {wordChangeSets.map((changeset) => (
+                <button
+                  className={`history-row${changeset.id === selectedWordChangeSet?.id ? " active" : ""}`}
+                  key={changeset.id}
+                  type="button"
+                  onClick={() => onSelectWordChangeSet(changeset.id)}
+                >
+                  <strong>{changeset.summary}</strong>
+                  <span>
+                    {changeset.status} · {changeset.filePath}
+                  </span>
+                </button>
+              ))}
+            </>
+          ) : null}
         </div>
         <div className="history-detail">
-          {selectedChangeSet === null ? (
+          {selectedWordChangeSet !== null ? (
+            <WordChangeSetReview
+              changeset={selectedWordChangeSet}
+              onApply={onApplyWordChangeSet}
+              onReject={onRejectWordChangeSet}
+              onRollback={onRollbackWordChangeSet}
+            />
+          ) : selectedChangeSet === null ? (
             <p>Select a changeset to review its patch.</p>
           ) : (
             <>
@@ -6915,6 +7482,90 @@ function HistoryPanel({
         </div>
       </div>
     </div>
+  );
+}
+
+function WordChangeSetReview({
+  changeset,
+  onApply,
+  onReject,
+  onRollback
+}: {
+  readonly changeset: WordChangeSet;
+  readonly onApply: (changesetId: string) => void;
+  readonly onReject: (changesetId: string) => void;
+  readonly onRollback: (changesetId: string) => void;
+}) {
+  return (
+    <>
+      <div className="history-detail-header">
+        <div>
+          <strong>{changeset.summary}</strong>
+          <span>
+            {changeset.status} · {changeset.filePath}
+          </span>
+        </div>
+        <div className="history-actions">
+          <button
+            className="text-button"
+            type="button"
+            disabled={changeset.status !== "proposed"}
+            onClick={() => onApply(changeset.id)}
+          >
+            <Check aria-hidden="true" size={15} />
+            Apply Word Edit
+          </button>
+          <button
+            className="text-button"
+            type="button"
+            disabled={changeset.status !== "proposed"}
+            onClick={() => onReject(changeset.id)}
+          >
+            <X aria-hidden="true" size={15} />
+            Reject
+          </button>
+          <button
+            className="text-button"
+            type="button"
+            disabled={changeset.status !== "applied"}
+            onClick={() => onRollback(changeset.id)}
+          >
+            <RotateCcw aria-hidden="true" size={15} />
+            Roll Back
+          </button>
+        </div>
+      </div>
+      <div className={`changeset-verification ${changeset.status}`}>
+        <strong>Word round-trip verification</strong>
+        <span>
+          {changeset.status === "applied"
+            ? "Saved and reopened the Word document successfully."
+            : changeset.status === "reverted"
+              ? "Restored the previous Word document bytes and reopened it successfully."
+              : "Review paragraph-level operations before applying them to the .docx file."}
+        </span>
+      </div>
+      <div className="word-change-list" aria-label="Word edit operations">
+        {changeset.operations.map((operation, index) => (
+          <article className="word-change" key={`${changeset.id}:${index}`}>
+            <div className="word-change__header">
+              <strong>{formatWordOperationTitle(operation.type)}</strong>
+              <span>Operation {index + 1}</span>
+            </div>
+            <div className="word-change__body">
+              <div>
+                <span className="eyebrow">Before</span>
+                <p>{getWordOperationBeforeText(changeset.baseBlocks, operation)}</p>
+              </div>
+              <div>
+                <span className="eyebrow">After</span>
+                <p>{getWordOperationAfterText(changeset.baseBlocks, operation)}</p>
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>
+    </>
   );
 }
 
@@ -7931,6 +8582,27 @@ function getProviderSetupSteps(
   readonly action?: AgentProviderSetupAction;
   readonly actionLabel?: string;
 }[] {
+  if (providerId === "openrouter-design") {
+    return [
+      {
+        id: "install",
+        index: 1,
+        title: "Configure OpenRouter key",
+        detail:
+          "Set OPENROUTER_API_KEY in the environment used to launch ZeroLeaf. The app does not store this key.",
+        state: authStatus.state === "connected" ? "complete" : "current"
+      },
+      {
+        id: "refresh",
+        index: 2,
+        title: "Confirm connection",
+        detail:
+          "Refresh after restarting ZeroLeaf with the environment variable available.",
+        state: authStatus.state === "connected" ? "complete" : "pending"
+      }
+    ];
+  }
+
   const installed =
     authStatus.state === "connected" || authStatus.state === "needs-auth";
   const connected = authStatus.state === "connected";
@@ -8237,6 +8909,92 @@ function updateMonacoLabelCompletions(
   );
 }
 
+function hasImageDragItems(dataTransfer: DataTransfer): boolean {
+  return Array.from(dataTransfer.items).some(
+    (item) =>
+      item.kind === "file" && (item.type.startsWith("image/") || item.type.length === 0)
+  );
+}
+
+function isSupportedAgentImageFile(file: File): boolean {
+  return file.type.startsWith("image/") || inferAgentImageMimeType(file.name) !== null;
+}
+
+function inferAgentImageMimeType(fileName: string): string | null {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+
+  switch (extension) {
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "webp":
+      return "image/webp";
+    case "gif":
+      return "image/gif";
+    case "heic":
+      return "image/heic";
+    case "heif":
+      return "image/heif";
+    default:
+      return null;
+  }
+}
+
+function readAgentImageAttachment(file: File): Promise<AgentImageAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        reject(new Error(`Could not read ${file.name}.`));
+        return;
+      }
+
+      resolve({
+        id: `agent-image-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: file.name,
+        mimeType: file.type || inferAgentImageMimeType(file.name) || "image/*",
+        byteLength: file.size,
+        dataUrl: reader.result
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatBytes(byteLength: number): string {
+  if (byteLength < 1024) {
+    return `${byteLength} B`;
+  }
+
+  if (byteLength < 1024 * 1024) {
+    return `${(byteLength / 1024).toFixed(1)} KB`;
+  }
+
+  return `${(byteLength / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatAgentPromptForTranscript(
+  prompt: string,
+  attachments: readonly AgentImageAttachment[]
+): string {
+  if (attachments.length === 0) {
+    return prompt;
+  }
+
+  return [
+    prompt,
+    "",
+    `Attached images (${attachments.length}):`,
+    ...attachments.map(
+      (attachment) =>
+        `- ${attachment.name} (${attachment.mimeType}, ${formatBytes(attachment.byteLength)})`
+    )
+  ].join("\n");
+}
+
 function focusMonacoFind(editor: MonacoStandaloneEditor | null) {
   void editor?.getAction("actions.find")?.run();
 }
@@ -8382,6 +9140,11 @@ function createInitialAgentAuthStatuses(): AgentAuthStatusByProvider {
       providerId: "anthropic-claude",
       state: "disconnected",
       message: "Claude provider is not connected yet."
+    },
+    "openrouter-design": {
+      providerId: "openrouter-design",
+      state: "disconnected",
+      message: "OpenRouter design provider is not connected yet."
     }
   };
 }
@@ -8526,6 +9289,8 @@ function getAgentProviderLabel(providerId: AgentProviderId): string {
       return "Codex";
     case "anthropic-claude":
       return "Claude";
+    case "openrouter-design":
+      return "OpenRouter Design";
   }
 }
 
@@ -8537,6 +9302,8 @@ function getAgentProviderRunLabel(providerId: AgentProviderId): string {
       return "via codex_cli";
     case "anthropic-claude":
       return "via claude_cli";
+    case "openrouter-design":
+      return "via openrouter";
   }
 }
 
@@ -8548,6 +9315,8 @@ function getAgentProviderNote(providerId: AgentProviderId): string {
       return "Uses the installed Codex CLI for planning, then routes edits and builds through ZeroLeaf tools.";
     case "anthropic-claude":
       return "Uses the installed Claude Code CLI, then proposes reviewable patches.";
+    case "openrouter-design":
+      return "Runs structured website design workflow steps through OpenRouter with per-step model routing.";
   }
 }
 
@@ -8821,16 +9590,23 @@ function createAgentCompletionSummary(
   }
 
   const changesets = getAgentResultChangeSets(result);
+  const wordChangeSets = getAgentResultWordChangeSets(result);
   const deletedEntries = result.deleteEntries ?? [];
   const movedEntries = result.moveEntries ?? [];
-  const changedFiles = formatChangedFileList(changesets, deletedEntries, movedEntries);
-  const didCompile = result.buildResult !== undefined;
-  const buildSummary =
-    result.buildResult === undefined
-      ? undefined
-      : `The build ${result.buildResult.status} with ${formatDiagnosticCount(
-          result.buildResult.diagnostics.length
-        )}.`;
+  const changedFiles = formatChangedFileList(
+    changesets,
+    deletedEntries,
+    movedEntries,
+    wordChangeSets
+  );
+
+  if (result.status === "completed") {
+    if (wordChangeSets.length > 0) {
+      return `I prepared ${wordChangeSets.length} reviewable Word ${wordChangeSets.length === 1 ? "edit" : "edits"}${changedFiles}. No files were changed yet.`;
+    }
+
+    return undefined;
+  }
 
   if (result.status === "awaiting-approval") {
     if (deletedEntries.length > 0) {
@@ -8843,40 +9619,6 @@ function createAgentCompletionSummary(
     }
 
     return "I paused for approval before making any project changes.";
-  }
-
-  if (changesets.length > 0) {
-    const appliedCount = changesets.filter(
-      (changeset) => changeset.status === "applied"
-    ).length;
-    const action =
-      appliedCount > 0 || options.decision === "allowed" ? "applied" : "prepared";
-    const patchWord = changesets.length === 1 ? "patch" : "patches";
-    const compilePhrase = didCompile ? " and ran compile verification" : "";
-    return [
-      `I ${action} ${changesets.length} ${patchWord}${changedFiles}${compilePhrase}.`,
-      buildSummary
-    ]
-      .filter((line): line is string => line !== undefined)
-      .join(" ");
-  }
-
-  if (movedEntries.length > 0) {
-    return `I moved ${movedEntries.length} project ${movedEntries.length === 1 ? "entry" : "entries"}${changedFiles}.`;
-  }
-
-  if (deletedEntries.length > 0) {
-    const compilePhrase = didCompile ? " and ran compile verification" : "";
-    return [
-      `I deleted ${deletedEntries.length} project ${deletedEntries.length === 1 ? "entry" : "entries"}${changedFiles}${compilePhrase}.`,
-      buildSummary
-    ]
-      .filter((line): line is string => line !== undefined)
-      .join(" ");
-  }
-
-  if (didCompile) {
-    return `I compiled the project. ${buildSummary ?? ""} No files were changed.`;
   }
 
   return undefined;
@@ -8892,13 +9634,25 @@ function getAgentResultChangeSets(
   return result.changeset === undefined ? [] : [result.changeset];
 }
 
+function getAgentResultWordChangeSets(
+  result: AgentSessionResult
+): readonly WordChangeSet[] {
+  if ((result.wordChangesets?.length ?? 0) > 0) {
+    return result.wordChangesets ?? [];
+  }
+
+  return result.wordChangeset === undefined ? [] : [result.wordChangeset];
+}
+
 function formatChangedFileList(
   changesets: readonly HistoryChangeSet[],
   deletedEntries: readonly { readonly path: string }[],
-  movedEntries: readonly { readonly fromPath: string; readonly toPath: string }[]
+  movedEntries: readonly { readonly fromPath: string; readonly toPath: string }[],
+  wordChangeSets: readonly WordChangeSet[] = []
 ): string {
   const paths = [
     ...changesets.map((changeset) => changeset.filePath),
+    ...wordChangeSets.map((changeset) => changeset.filePath),
     ...deletedEntries.map((entry) => entry.path),
     ...movedEntries.flatMap((entry) => [entry.fromPath, entry.toPath])
   ];
@@ -8917,10 +9671,6 @@ function formatChangedFileList(
   }
 
   return ` across ${uniquePaths.length} files`;
-}
-
-function formatDiagnosticCount(count: number): string {
-  return `${count} diagnostic${count === 1 ? "" : "s"}`;
 }
 
 function createAgentThreadItems(
@@ -9053,6 +9803,31 @@ function getAgentRunWorkflowEvents(
         !isHiddenAgentWorkflowEvent(event) &&
         isAgentEventInRunWindow(event, startTime, endTime)
     )
+  );
+}
+
+function getAgentRunActivityEvents(
+  events: readonly AgentEvent[],
+  items: readonly AgentThreadItem[],
+  assistantRunIndex: number
+): readonly AgentEvent[] {
+  const item = items[assistantRunIndex];
+  if (item?.type !== "assistant-run") {
+    return [];
+  }
+
+  const previousUser = findPreviousUserThreadItem(items, assistantRunIndex);
+  const nextUser = findNextUserThreadItem(items, assistantRunIndex);
+  const startTime = Date.parse(previousUser?.event.createdAt ?? item.createdAt);
+  const endTime =
+    nextUser === undefined
+      ? Number.POSITIVE_INFINITY
+      : Date.parse(nextUser.event.createdAt);
+
+  return events.filter(
+    (event) =>
+      event.sessionId === item.sessionId &&
+      isAgentEventInRunWindow(event, startTime, endTime)
   );
 }
 
@@ -9700,6 +10475,12 @@ function createAgentRunLiveStatus({
     };
   }
 
+  const latestOperationalStatus = findLatestOperationalLiveStatus(events);
+
+  if (latestOperationalStatus !== undefined) {
+    return latestOperationalStatus;
+  }
+
   if (!isExternalResearchPrompt(requestPrompt)) {
     return fallback;
   }
@@ -9746,6 +10527,22 @@ function createAgentRunLiveStatus({
     title: "Preparing recommendation",
     tone: "running"
   };
+}
+
+function findLatestOperationalLiveStatus(
+  events: readonly AgentEvent[]
+): AgentLiveStatus | undefined {
+  const latestEvent = findLastAgentEvent(
+    events,
+    (event): event is AgentEvent =>
+      event.type === "tool-call" ||
+      event.type === "verification" ||
+      event.type === "error"
+  );
+
+  return latestEvent === undefined
+    ? undefined
+    : createAgentLiveStatusFromEvent(latestEvent);
 }
 
 function hasOpenApproval(events: readonly AgentEvent[]): boolean {
@@ -9969,6 +10766,18 @@ function formatAgentModelExecutionTitle(
 
   const normalizedSummary = summary.toLowerCase();
 
+  if (normalizedSummary.includes("running installed codex")) {
+    return "Planning with Codex";
+  }
+
+  if (normalizedSummary.includes("still analyzing")) {
+    return "Codex is still working";
+  }
+
+  if (normalizedSummary.includes("running installed claude")) {
+    return "Planning with Claude";
+  }
+
   if (normalizedSummary.includes("compile failed")) {
     return "Repairing compile error";
   }
@@ -9995,27 +10804,40 @@ function formatAgentModelExecutionTitle(
 }
 
 function formatAgentModelExecutionDetail(summary: string): string {
+  const normalizedSummary = summary.toLowerCase();
   const elapsedText = /\(([^()]+ elapsed)\)/u.exec(summary)?.[1];
 
-  if (summary.toLowerCase().includes("compile failed")) {
+  if (normalizedSummary.includes("still analyzing")) {
+    return summary;
+  }
+
+  if (normalizedSummary.includes("running installed codex")) {
+    return "Codex is inspecting the project and choosing whether to answer, propose a patch, or run an app action.";
+  }
+
+  if (normalizedSummary.includes("running installed claude")) {
+    return "Claude is inspecting the project and choosing whether to answer or propose a patch.";
+  }
+
+  if (normalizedSummary.includes("compile failed")) {
     return "The agent is reading the compile log and preparing a safe LaTeX repair.";
   }
 
   if (
-    summary.toLowerCase().includes("concrete change") ||
-    summary.toLowerCase().includes("tool action")
+    normalizedSummary.includes("concrete change") ||
+    normalizedSummary.includes("tool action")
   ) {
     return "The agent is turning the analysis into a reviewable project action.";
   }
 
   if (
-    summary.toLowerCase().includes("overbroad") ||
-    summary.toLowerCase().includes("complete minimal patch")
+    normalizedSummary.includes("overbroad") ||
+    normalizedSummary.includes("complete minimal patch")
   ) {
     return "The agent is asking for a smaller patch before changing project files.";
   }
 
-  if (summary.toLowerCase().includes("retry")) {
+  if (normalizedSummary.includes("retry")) {
     return "The agent is retrying with a narrower project-scoped prompt.";
   }
 
@@ -10371,10 +11193,107 @@ async function collectPdfSearchMatches(
 }
 
 async function readProjectFileForRoot(projectRoot: string, path: string) {
-  return desktopApi.files.read({
+  if (isWordDocumentPath(path)) {
+    return createEditorFileStateFromWordDocument(
+      await desktopApi.word.read({
+        projectRoot,
+        path
+      })
+    );
+  }
+
+  const snapshot = await desktopApi.files.read({
     projectRoot,
     path
   });
+
+  return {
+    ...snapshot,
+    documentKind: "text" as const,
+    savedContents: snapshot.contents,
+    stale: false
+  };
+}
+
+function createEditorFileStateFromWordDocument(
+  document: WordDocumentModel
+): EditorFileState {
+  return {
+    path: document.path,
+    contents: document.plainText,
+    savedContents: document.plainText,
+    mtimeMs: document.mtimeMs,
+    stale: false,
+    documentKind: "word",
+    wordBlocks: document.blocks,
+    savedWordBlocks: document.blocks,
+    wordWarnings: document.warnings
+  };
+}
+
+function isWordDocumentPath(path: string): boolean {
+  return path.toLowerCase().endsWith(".docx");
+}
+
+function getWordBlocksPlainText(blocks: readonly WordDocumentBlock[]): string {
+  return blocks.map((block) => block.text).join("\n\n");
+}
+
+function formatWordOperationTitle(operationType: WordBlockOperation["type"]): string {
+  switch (operationType) {
+    case "replace-block":
+      return "Replace paragraph";
+    case "insert-block-after":
+      return "Insert paragraph";
+    case "delete-block":
+      return "Delete paragraph";
+    case "move-block":
+      return "Move paragraph";
+    case "replace-selection":
+      return "Replace selection";
+  }
+}
+
+function getWordOperationBeforeText(
+  blocks: readonly WordDocumentBlock[],
+  operation: WordBlockOperation
+): string {
+  switch (operation.type) {
+    case "insert-block-after":
+      return "New paragraph";
+    case "replace-block":
+    case "delete-block":
+    case "move-block":
+    case "replace-selection":
+      return findWordBlockText(blocks, operation.blockId);
+  }
+}
+
+function getWordOperationAfterText(
+  blocks: readonly WordDocumentBlock[],
+  operation: WordBlockOperation
+): string {
+  switch (operation.type) {
+    case "replace-block":
+      return operation.afterText;
+    case "insert-block-after":
+      return operation.block.text;
+    case "delete-block":
+      return "Paragraph removed";
+    case "move-block":
+      return `Moved after ${operation.afterBlockId ?? "document start"}`;
+    case "replace-selection": {
+      const blockText = findWordBlockText(blocks, operation.blockId);
+      return `${blockText.slice(0, operation.startOffset)}${operation.replacementText}${blockText.slice(operation.endOffset)}`;
+    }
+  }
+}
+
+function findWordBlockText(
+  blocks: readonly WordDocumentBlock[],
+  blockId: string
+): string {
+  return blocks.find((block) => block.id === blockId)?.text ?? "Paragraph not found";
 }
 
 function upsertOpenFile(
@@ -10391,6 +11310,17 @@ function replaceOpenFile(
   nextFile: EditorFileState
 ): readonly EditorFileState[] {
   return files.map((file) => (file.path === nextFile.path ? nextFile : file));
+}
+
+function replaceWordChangeSet(
+  changesets: readonly WordChangeSet[],
+  nextChangeSet: WordChangeSet
+): readonly WordChangeSet[] {
+  return changesets.some((changeset) => changeset.id === nextChangeSet.id)
+    ? changesets.map((changeset) =>
+        changeset.id === nextChangeSet.id ? nextChangeSet : changeset
+      )
+    : [nextChangeSet, ...changesets];
 }
 
 function removeOpenFile(

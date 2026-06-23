@@ -137,6 +137,11 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("zeroleaf-agent-provider");
     expect(appSource).toContain("Clear agent history");
     expect(appSource).toContain("Stop agent run");
+    expect(appSource).toContain("Attach image");
+    expect(appSource).toContain("agentImageAttachments");
+    expect(appSource).toContain("hasImageDragItems");
+    expect(appSource).toContain("readAgentImageAttachment");
+    expect(appSource).toContain("imageAttachments: composerImageAttachments");
     expect(appSource).toContain("parseNoProjectAgentCommand");
     expect(appSource).toContain("runNoProjectAgentCommand");
     expect(appSource).toContain("desktopApi.lifecycle.createFromTemplate");
@@ -170,7 +175,8 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("prepareAgentDisplayEvents(result.events)");
     expect(appSource).toContain("mergeAgentThreadEvents");
     expect(appSource).toContain("buildAgentCompletionSummaryEvent(result)");
-    expect(appSource).toContain("I compiled the project.");
+    expect(appSource).not.toContain("I compiled the project.");
+    expect(appSource).not.toContain("ran compile verification");
     expect(appSource).not.toContain(
       "I inspected the scoped project context and answered without changing files."
     );
@@ -180,9 +186,13 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("AgentRunLiveStatus");
     expect(appSource).toContain("createAgentToolLiveStatus");
     expect(appSource).toContain("createAgentRunLiveStatus");
+    expect(appSource).toContain("getAgentRunActivityEvents");
+    expect(appSource).toContain("findLatestOperationalLiveStatus");
     expect(appSource).toContain("createStartingAgentLiveStatus");
     expect(appSource).toContain("createAwaitingApprovalLiveStatus");
     expect(appSource).toContain("Understanding request");
+    expect(appSource).toContain("Planning with Codex");
+    expect(appSource).toContain("Codex is still working");
     expect(appSource).toContain("Network approval required");
     expect(appSource).toContain("Searching official sources");
     expect(appSource).toContain("Verifying source");

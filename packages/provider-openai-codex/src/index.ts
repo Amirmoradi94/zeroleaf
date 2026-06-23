@@ -5,7 +5,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { formatAgentSelectionContextForPrompt } from "@latex-agent/ipc-contracts";
+import {
+  formatAgentImageAttachmentsForPrompt,
+  formatAgentSelectionContextForPrompt
+} from "@latex-agent/ipc-contracts";
 import type {
   AgentAuthStatus,
   AgentDeleteEntryOperation,
@@ -20,8 +23,36 @@ import type {
   BuildResult,
   HistoryChangeSet,
   PdfPreviewCaptureResult,
-  ProjectFileSnapshot
+  ProjectFileSnapshot,
+  WordBlockOperation,
+  WordChangeSet
 } from "@latex-agent/ipc-contracts";
+
+import {
+  createEmptyDesignWorkflowOutput,
+  designWorkflowOutputSchema,
+  isValidDesignWorkflowOutput,
+  type DesignWorkflowOutput
+} from "./design-workflow.js";
+
+export {
+  createOpenRouterChatCompletionRunner,
+  getDefaultOpenRouterDesignModels,
+  openRouterDesignProviderId,
+  OpenRouterDesignProvider,
+  OpenRouterDesignWorkflowRunner,
+  openRouterDesignWorkflowStepDefinitions,
+  type OpenRouterChatMessage,
+  type OpenRouterDesignModelMap,
+  type OpenRouterDesignStepInput,
+  type OpenRouterDesignStepResult,
+  type OpenRouterDesignWorkflowInput,
+  type OpenRouterDesignWorkflowResult,
+  type OpenRouterDesignProviderOptions,
+  type OpenRouterHttpRunnerOptions,
+  type OpenRouterStructuredCallRequest,
+  type OpenRouterStructuredCallRunner
+} from "./openrouter-design-workflow.js";
 
 export const openAiCodexProviderId = "openai-codex" as const;
 const defaultCodexExecTimeoutMs = 7_200_000;
@@ -61,13 +92,29 @@ export type CodexExecRequest = {
   readonly onCodexEvent?: (event: unknown) => void;
   readonly projectRoot: string;
   readonly prompt: string;
+  readonly sandboxMode?: CodexExecSandboxMode;
   readonly timeoutMs: number;
+};
+
+export type CodexExecSandboxMode = "read-only" | "workspace-write";
+
+export type CodexAgentPatch = {
+  readonly targetFilePath: string;
+  readonly summary: string;
+  readonly afterContents: string;
+};
+
+export type CodexAgentWordChangeSet = {
+  readonly filePath: string;
+  readonly summary: string;
+  readonly operations: readonly WordBlockOperation[];
 };
 
 export type CodexAgentResponse = {
   readonly action:
     | "answer"
     | "patch"
+    | "word-edit"
     | "delete-entry"
     | "move-entry"
     | "set-main-file"
@@ -76,6 +123,9 @@ export type CodexAgentResponse = {
   readonly targetFilePath: string;
   readonly summary: string;
   readonly afterContents: string;
+  readonly patches?: readonly CodexAgentPatch[];
+  readonly wordChangesets?: readonly CodexAgentWordChangeSet[];
+  readonly designWorkflow?: DesignWorkflowOutput;
   readonly message: string;
   readonly notes: string;
 };
@@ -156,14 +206,18 @@ export class CodexCliProvider {
       createMessageEvent(
         sessionId,
         "assistant",
-        "I will ask the installed Codex CLI to inspect the project and decide whether to answer or propose a reviewable patch."
+        request.mode === "autonomous-local"
+          ? "I will ask the installed Codex CLI to edit the open project directly and then verify the result through ZeroLeaf."
+          : "I will ask the installed Codex CLI to inspect the project and decide whether to answer or propose a reviewable patch."
       )
     ];
+    const activeDocumentSnapshot = createActiveDocumentSnapshot(request);
     const targetPath = request.activeFilePath ?? request.mainFilePath;
     const snapshot =
-      targetPath === undefined
+      activeDocumentSnapshot ??
+      (targetPath === undefined
         ? createEmptyProjectSnapshot()
-        : await readInitialSnapshot({ broker, events, sessionId, targetPath });
+        : await readInitialSnapshot({ broker, events, sessionId, targetPath }));
 
     pushAgentEvents(
       events,
@@ -355,7 +409,8 @@ export class CodexCliProvider {
         sessionId,
         providerId: this.id,
         status: "completed",
-        events
+        events,
+        designWorkflow: getDesignWorkflow(codexResponse)
       };
     }
 
@@ -655,7 +710,11 @@ export class CodexCliProvider {
       }
 
       events.push(
-        createMessageEvent(sessionId, "assistant", formatCompileMessage(buildResult))
+        createMessageEvent(
+          sessionId,
+          "assistant",
+          formatCompileActionMessage(codexResponse, buildResult)
+        )
       );
 
       return {
@@ -663,97 +722,68 @@ export class CodexCliProvider {
         providerId: this.id,
         status: "completed",
         events,
+        designWorkflow: getDesignWorkflow(codexResponse),
         buildResult
       };
     }
 
-    let patchSnapshot = await readPatchSnapshot(
-      codexResponse.targetFilePath,
-      snapshot,
-      broker
-    );
+    const wordChangeSets = createCodexWordChangeSets(request, codexResponse);
+    if (wordChangeSets.length > 0) {
+      const wordChangeset = wordChangeSets[0];
+      if (wordChangeset === undefined) {
+        throw new Error("Codex returned an empty Word changeset list.");
+      }
 
-    if (isLikelyOverbroadPatch(patchSnapshot.contents, codexResponse.afterContents)) {
       pushAgentEvents(
         events,
         broker,
-        createToolEvent(
-          sessionId,
-          "codex-exec",
-          "running",
-          "Codex returned a patch that removed most of a large file; requesting a complete minimal patch",
-          "medium"
+        ...wordChangeSets.map((changeset) =>
+          createWordChangeSetEvent(sessionId, changeset)
         )
       );
-      codexResponse = await this.runPlannerWithRetry(
-        request,
-        patchSnapshot,
-        createCodexOverbroadPatchRetryPrompt(request, patchSnapshot, codexResponse),
-        events,
-        sessionId,
-        broker
-      );
-      pushAgentEvents(
-        events,
-        broker,
-        createToolEvent(
-          sessionId,
-          "codex-exec",
-          "succeeded",
-          codexResponse.notes,
-          "medium"
-        )
-      );
-
-      if (codexResponse.action !== "patch") {
-        events.push(createMessageEvent(sessionId, "assistant", codexResponse.message));
-        return {
-          sessionId,
-          providerId: this.id,
-          status: "completed",
-          events
-        };
-      }
-
-      patchSnapshot = await readPatchSnapshot(
-        codexResponse.targetFilePath,
-        snapshot,
-        broker
-      );
-
-      if (isLikelyOverbroadPatch(patchSnapshot.contents, codexResponse.afterContents)) {
-        pushAgentEvents(
-          events,
-          broker,
-          createToolEvent(
-            sessionId,
-            "propose-patch",
-            "blocked",
-            "Codex returned a patch that removed most of a large file, so ZeroLeaf did not apply it.",
-            "high"
-          ),
-          createMessageEvent(
-            sessionId,
-            "assistant",
-            "Codex returned a patch that removed too much of the file, so I did not apply it. Please ask for a narrower edit or select the exact lines to change."
-          )
-        );
-
-        return {
-          sessionId,
-          providerId: this.id,
-          status: "completed",
-          events
-        };
-      }
-    }
-
-    if (codexResponse.afterContents === patchSnapshot.contents) {
       events.push(
         createMessageEvent(
           sessionId,
           "assistant",
           codexResponse.message ||
+            `Codex proposed ${wordChangeSets.length} Word edit${wordChangeSets.length === 1 ? "" : "s"}.`
+        )
+      );
+
+      return {
+        sessionId,
+        providerId: this.id,
+        status: "completed",
+        events,
+        designWorkflow: getDesignWorkflow(codexResponse),
+        wordChangeset,
+        wordChangesets: wordChangeSets
+      };
+    }
+
+    const patchPlan = await this.preparePatchChangeSets({
+      broker,
+      codexResponse,
+      events,
+      request,
+      sessionId,
+      snapshot
+    });
+
+    if ("result" in patchPlan) {
+      return patchPlan.result;
+    }
+
+    const { changeSets, codexResponse: finalCodexResponse } = patchPlan;
+    const primaryChangeSet = changeSets[0];
+    const isMultiPatch = changeSets.length > 1;
+
+    if (primaryChangeSet === undefined) {
+      events.push(
+        createMessageEvent(
+          sessionId,
+          "assistant",
+          finalCodexResponse.message ||
             "Codex did not propose a file change for this request."
         )
       );
@@ -761,72 +791,54 @@ export class CodexCliProvider {
         sessionId,
         providerId: this.id,
         status: "completed",
-        events
+        events,
+        designWorkflow: getDesignWorkflow(finalCodexResponse)
       };
     }
 
-    pushAgentEvents(
-      events,
-      broker,
-      createToolEvent(
-        sessionId,
-        "propose-patch",
-        "running",
-        `Creating review patch for ${patchSnapshot.path}`,
-        "medium"
-      )
-    );
-    const changeset = await broker.proposePatch(
-      patchSnapshot.path,
-      patchSnapshot.contents,
-      codexResponse.afterContents,
-      normalizeSummary(codexResponse.summary)
-    );
-    pushAgentEvents(
-      events,
-      broker,
-      createToolEvent(
-        sessionId,
-        "propose-patch",
-        "succeeded",
-        `Created changeset ${changeset.id}`,
-        "medium"
-      )
-    );
-
     if (request.mode === "autonomous-local" && broker.applyPatch !== undefined) {
-      pushAgentEvents(
-        events,
-        broker,
-        createPatchEvent(sessionId, changeset),
-        createToolEvent(
-          sessionId,
-          "apply-patch",
-          "running",
-          `Applying ${changeset.summary}`,
-          "high"
-        )
-      );
-      const applied = await broker.applyPatch(changeset.id);
-      pushAgentEvents(
-        events,
-        broker,
-        createToolEvent(
-          sessionId,
-          "apply-patch",
-          "succeeded",
-          `Applied ${applied.summary}`,
-          "high"
-        ),
-        createPatchEvent(sessionId, applied)
-      );
+      const appliedChangeSets: HistoryChangeSet[] = [];
+
+      for (const changeset of changeSets) {
+        pushAgentEvents(
+          events,
+          broker,
+          createPatchEvent(sessionId, changeset),
+          createToolEvent(
+            sessionId,
+            "apply-patch",
+            "running",
+            `Applying ${changeset.summary}`,
+            "high"
+          )
+        );
+        const applied = await broker.applyPatch(changeset.id);
+        appliedChangeSets.push(applied);
+        pushAgentEvents(
+          events,
+          broker,
+          createToolEvent(
+            sessionId,
+            "apply-patch",
+            "succeeded",
+            `Applied ${applied.summary}`,
+            "high"
+          ),
+          createPatchEvent(sessionId, applied)
+        );
+      }
+
+      const primaryAppliedChangeSet =
+        appliedChangeSets.find((changeset) => changeset.id === primaryChangeSet.id) ??
+        appliedChangeSets[0] ??
+        primaryChangeSet;
 
       if (broker.runCompile === undefined) {
         events.push(
           createMessageEvent(
             sessionId,
             "assistant",
-            `${codexResponse.message}\n\nApplied the patch, but this provider bridge cannot run compile verification.`
+            `${finalCodexResponse.message}\n\nApplied the patch, but this provider bridge cannot run compile verification.`
           )
         );
 
@@ -835,7 +847,9 @@ export class CodexCliProvider {
           providerId: this.id,
           status: "completed",
           events,
-          changeset: applied
+          designWorkflow: getDesignWorkflow(finalCodexResponse),
+          changeset: primaryAppliedChangeSet,
+          ...(isMultiPatch ? { changesets: appliedChangeSets } : {})
         };
       }
 
@@ -875,7 +889,12 @@ export class CodexCliProvider {
         createMessageEvent(
           sessionId,
           "assistant",
-          [codexResponse.message, formatCompileMessage(buildResult)]
+          [
+            finalCodexResponse.message,
+            finalCodexResponse.message.trim().length === 0
+              ? "Compile verification finished. Build details are available in the Log panel."
+              : ""
+          ]
             .filter((line) => line.trim().length > 0)
             .join("\n\n")
         )
@@ -886,7 +905,9 @@ export class CodexCliProvider {
         providerId: this.id,
         status: "completed",
         events,
-        changeset: applied,
+        designWorkflow: getDesignWorkflow(finalCodexResponse),
+        changeset: primaryAppliedChangeSet,
+        ...(isMultiPatch ? { changesets: appliedChangeSets } : {}),
         buildResult
       };
     }
@@ -894,12 +915,20 @@ export class CodexCliProvider {
     pushAgentEvents(
       events,
       broker,
-      createPatchEvent(sessionId, changeset),
-      createApprovalEvent(sessionId),
+      ...changeSets.map((changeset) => createPatchEvent(sessionId, changeset)),
+      createApprovalEvent(
+        sessionId,
+        "apply-patch",
+        isMultiPatch
+          ? "Review the Codex patches before applying them to the project."
+          : "Review the Codex patch before applying it to the project."
+      ),
       createVerificationEvent(
         sessionId,
         "pending",
-        "Apply the Codex patch to start compile verification."
+        isMultiPatch
+          ? "Apply the Codex patches to start compile verification."
+          : "Apply the Codex patch to start compile verification."
       )
     );
 
@@ -908,8 +937,163 @@ export class CodexCliProvider {
       providerId: this.id,
       status: "awaiting-approval",
       events,
-      changeset
+      designWorkflow: getDesignWorkflow(finalCodexResponse),
+      changeset: primaryChangeSet,
+      ...(isMultiPatch ? { changesets: changeSets } : {})
     };
+  }
+
+  private async preparePatchChangeSets({
+    broker,
+    codexResponse,
+    events,
+    request,
+    sessionId,
+    snapshot
+  }: {
+    readonly broker: CodexCliToolBroker;
+    readonly codexResponse: CodexAgentResponse;
+    readonly events: AgentEvent[];
+    readonly request: AgentStartRequest;
+    readonly sessionId: string;
+    readonly snapshot: ProjectFileSnapshot;
+  }): Promise<
+    | {
+        readonly codexResponse: CodexAgentResponse;
+        readonly changeSets: readonly HistoryChangeSet[];
+      }
+    | { readonly result: AgentSessionResult }
+  > {
+    let finalResponse = codexResponse;
+    let patchSnapshots = await readCodexPatchSnapshots(finalResponse, snapshot, broker);
+    const overbroadPatch = patchSnapshots.find((candidate) =>
+      isLikelyOverbroadPatch(candidate.snapshot.contents, candidate.patch.afterContents)
+    );
+
+    if (overbroadPatch !== undefined) {
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "running",
+          "Codex returned a patch that removed most of a large file; requesting a complete minimal patch",
+          "medium"
+        )
+      );
+      finalResponse = await this.runPlannerWithRetry(
+        request,
+        overbroadPatch.snapshot,
+        createCodexOverbroadPatchRetryPrompt(
+          request,
+          overbroadPatch.snapshot,
+          finalResponse
+        ),
+        events,
+        sessionId,
+        broker
+      );
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "codex-exec",
+          "succeeded",
+          finalResponse.notes,
+          "medium"
+        )
+      );
+
+      if (finalResponse.action !== "patch") {
+        events.push(createMessageEvent(sessionId, "assistant", finalResponse.message));
+        return {
+          result: {
+            sessionId,
+            providerId: this.id,
+            status: "completed",
+            events
+          }
+        };
+      }
+
+      patchSnapshots = await readCodexPatchSnapshots(finalResponse, snapshot, broker);
+
+      if (
+        patchSnapshots.some((candidate) =>
+          isLikelyOverbroadPatch(
+            candidate.snapshot.contents,
+            candidate.patch.afterContents
+          )
+        )
+      ) {
+        pushAgentEvents(
+          events,
+          broker,
+          createToolEvent(
+            sessionId,
+            "propose-patch",
+            "blocked",
+            "Codex returned a patch that removed most of a large file, so ZeroLeaf did not apply it.",
+            "high"
+          ),
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            "Codex returned a patch that removed too much of the file, so I did not apply it. Please ask for a narrower edit or select the exact lines to change."
+          )
+        );
+
+        return {
+          result: {
+            sessionId,
+            providerId: this.id,
+            status: "completed",
+            events
+          }
+        };
+      }
+    }
+
+    const changedPatchSnapshots = patchSnapshots.filter(
+      (candidate) => candidate.patch.afterContents !== candidate.snapshot.contents
+    );
+    const changeSets: HistoryChangeSet[] = [];
+
+    for (const candidate of changedPatchSnapshots) {
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "propose-patch",
+          "running",
+          `Creating review patch for ${candidate.snapshot.path}`,
+          "medium"
+        )
+      );
+      const changeset = await broker.proposePatch(
+        candidate.snapshot.path,
+        candidate.snapshot.contents,
+        candidate.patch.afterContents,
+        normalizeSummary(candidate.patch.summary || finalResponse.summary)
+      );
+      changeSets.push(changeset);
+      pushAgentEvents(
+        events,
+        broker,
+        createToolEvent(
+          sessionId,
+          "propose-patch",
+          "succeeded",
+          `Created changeset ${changeset.id}`,
+          "medium"
+        )
+      );
+    }
+
+    return { codexResponse: finalResponse, changeSets };
   }
 
   cancelSession(sessionId: string): Promise<boolean> {
@@ -932,6 +1116,8 @@ export class CodexCliProvider {
         return await this.runCodexExecWithProgress(
           {
             projectRoot: request.projectRoot,
+            sandboxMode:
+              request.mode === "autonomous-local" ? "workspace-write" : "read-only",
             ...(broker === undefined
               ? {}
               : {
@@ -1441,7 +1627,12 @@ async function runCodexExec(
     await writeFile(schemaPath, JSON.stringify(codexOutputSchema, null, 2), "utf8");
     await runCommand(
       codexBinary,
-      createCodexExecArgs(schemaPath, outputPath, request.projectRoot),
+      createCodexExecArgs(
+        schemaPath,
+        outputPath,
+        request.projectRoot,
+        request.sandboxMode ?? "read-only"
+      ),
       request.timeoutMs,
       request.prompt,
       request.onCodexEvent
@@ -1456,7 +1647,8 @@ async function runCodexExec(
 export function createCodexExecArgs(
   schemaPath: string,
   outputPath: string,
-  projectRoot: string
+  projectRoot: string,
+  sandboxMode: CodexExecSandboxMode = "read-only"
 ): readonly string[] {
   return [
     "exec",
@@ -1466,7 +1658,7 @@ export function createCodexExecArgs(
     "--ephemeral",
     "--json",
     "--sandbox",
-    "read-only",
+    sandboxMode,
     "-c",
     'model_reasoning_effort="low"',
     "--output-schema",
@@ -1627,11 +1819,36 @@ function createCodexPrompt(
   return [
     "You are the OpenAI Codex provider inside a local-first LaTeX editor.",
     "Use your own judgment to decide how to complete the user's task.",
-    "You may inspect the project from the current working directory. Do not modify files directly inside Codex CLI; return a ZeroLeaf action so the app can perform project-scoped changes safely.",
+    request.mode === "autonomous-local"
+      ? 'You may inspect and modify files directly inside the current project root with Codex CLI tools. Do not write outside the project root. After direct source edits, return action "run-compile" so ZeroLeaf can verify the result.'
+      : "You may inspect the project from the current working directory. Do not modify files directly inside Codex CLI; return a ZeroLeaf action so the app can perform project-scoped changes safely.",
     'Do not run LaTeX compile commands inside Codex CLI. For compile, recompile, build, or PDF generation requests, return action "run-compile" so ZeroLeaf can run its local build tool.',
     "Return only JSON matching the provided schema.",
+    "The schema always requires a patches array. Use patches: [] for answers, single-file patches, and non-patch app actions.",
+    "The schema always requires a wordChangesets array. Use wordChangesets: [] unless the active document is a Word .docx file and the user requested a Word edit.",
+    'The schema always requires designWorkflow. For non-website, non-UI, and non-design tasks, return an empty design workflow with currentStep "none", steps [], qa status "blocked", codeGeneration status "not-started", and implementationQa status "not-run".',
+    "For website or UI design tasks, fill designWorkflow as a section-by-section structured output: brand-story, information-architecture, creative-direction, section-design, responsive-layout, interaction-motion, accessibility-review, qa-review, code-generation, implementation-qa, and final-polish.",
+    "Every step output.data must include every data key allowed by the schema. For keys that do not apply to the current step, use an empty string, empty array, or passNumber 0.",
+    "For the brand-story step, output.data must not be empty. It must include brandName, businessType, positioning, audience, brandPromise, mood, storyPremise, sensoryAnchors, toneOfVoice, differentiators, and antiPatterns. toneOfVoice must include personality and copyRules arrays.",
+    "For the information-architecture step, output.data must not hide IA details in prose. It must include websiteStoryArc, sectionsDetailed, sectionOrder, primaryUserPaths, ctaPriority, navigationModel, contentRequirements, and handoffToCreativeDirection. sectionsDetailed entries must include id, title, purpose, storyRole, primaryContent, cta, and requiredEvidence. primaryUserPaths entries must include id, audience, intent, steps, and conversionGoal. ctaPriority entries must include rank, label, targetSection, and intent.",
+    "For the creative-direction step, output.data must not hide the visual system in palette or prose. It must include colorSystem, typographySystem, imageDirection, compositionPrinciples, spacingRhythm, textureMaterialRules, iconIllustrationRules, ctaSystem, motionMood, sectionProgression, and handoffToSectionDesign. colorSystem entries must include name, value, role, and usage. sectionProgression entries must include sectionId, visualRole, and treatment.",
+    "For the section-design step, output.data must include sectionDesigns. Each sectionDesigns entry must include id, storyRole, layout, elements, visualAssets, assetPlacement, ctas, responsiveNotes, and acceptanceCriteria.",
+    "For the responsive-layout step, output.data must include responsiveRules. Each responsiveRules entry must include viewport, layout, typography, navigation, assets, and constraints.",
+    "For the interaction-motion step, output.data must include interactionRules. Each interactionRules entry must include trigger, target, feedback, motion, accessibility, and reducedMotion.",
+    "For the accessibility-review step, output.data must include accessibilityChecks. Each accessibilityChecks entry must include id, target, requirement, method, status, and fix.",
+    "For the qa-review step, report evidence-backed defects in qa.issues across visual-layout, responsive, content-quality, accessibility, interaction, brand-story, and performance. Include viewportResults for mobile, tablet, desktop, and wide-desktop when evidence exists, a concrete fixPlan, remainingIssueIds, stopCondition, and nextAction.",
+    "For the code-generation step, fill codeGeneration with status, targetFiles, components, assets, constraints, implementationNotes, and acceptanceCriteria. Generate code only after the approved design QA state is pass or the remaining issues are explicitly accepted.",
+    "For the implementation-qa step, fill implementationQa after code exists. Inspect the rendered implementation, build output, responsive behavior, accessibility, interaction behavior, performance risk, and content integrity. Use implementationQa.checks for runtime evidence and implementationQa.issues for defects.",
+    "For the final-polish step, output.data must include polishChecks. Each polishChecks entry must include target, criterion, status, and recommendation.",
+    "A design QA pass must not claim success without evidence. If visual inspection cannot run, mark unverified viewports as not-checked and explain the evidence gap in qa.stopCondition and message.",
+    "An implementation QA pass must not claim success without rendered or build evidence. If runtime inspection cannot run, mark implementationQa status blocked and explain the evidence gap.",
+    'When a design QA or implementation QA finding requires source changes and the mode allows edits, return action "patch" with a reviewable fix and set the relevant nextAction to "apply-fixes". When no edit is safe, use action "answer" and keep the fixPlan reviewable in designWorkflow.',
     'Set action to "answer" when the task is best completed by explanation, summary, review, diagnosis, or guidance.',
-    'Set action to "patch" when the task requires or asks for a source edit. For patches, produce a minimal full-file replacement for targetFilePath.',
+    'Use action "answer" for planning and scholarly-advice tasks such as literature review plans, paper outlines, manuscript critiques, reading plans, methodology suggestions, and submission checklists unless the user explicitly asks you to insert, rewrite, patch, compile, or change project files.',
+    "A user mentioning a PDF, paper, thesis, manuscript, or active document as source context does not by itself require a file edit, PDF preview capture, or compile action.",
+    'Set action to "patch" when the task requires or asks for one or more source edits. For a single-file patch, produce a minimal full-file replacement for targetFilePath.',
+    "Requests to merge, combine, consolidate, split, reorganize, or restructure sections/subsections are source-edit requests. Do not answer with only a compile action unless you already made the source edit directly in autonomous-local mode.",
+    'For multi-file edits, set action to "patch" and populate patches with one entry per changed file. Each patches entry must include targetFilePath, summary, and the complete afterContents for that file. Also copy the primary patch into the top-level targetFilePath, summary, and afterContents fields for compatibility.',
     'Set action to "delete-entry" when the user asks to remove or delete a project file or folder without editing source contents. Put the project path to delete in targetFilePath.',
     'Set action to "move-entry" when the task requires moving or renaming a project file without changing file contents. Put the current project path in targetFilePath and the destination project path in afterContents.',
     'Set action to "set-main-file" when the user asks to choose, change, set, or switch the project main/root TeX file without editing source contents. Put the desired .tex project path in targetFilePath.',
@@ -1639,12 +1856,19 @@ function createCodexPrompt(
     'Set action to "run-compile" when the user asks to compile, recompile, build, verify compilation, or generate/update the PDF.',
     request.mode === "read-only"
       ? 'The current ZeroLeaf mode is read-only, so action must be "answer". You may describe suggested edits in message, but do not return a patch action.'
-      : 'ZeroLeaf will perform returned actions through project-scoped app tools. In "apply-with-review" mode, patches wait for user approval; in "autonomous-local" mode, patches may be applied and compiled automatically.',
+      : request.mode === "autonomous-local"
+        ? 'The current ZeroLeaf mode is autonomous-local. Prefer direct project-root file edits for safe source changes, then return action "run-compile". If direct editing is not safe, return action "answer" with the reason.'
+        : 'ZeroLeaf will perform returned actions through project-scoped app tools. In "apply-with-review" mode, patches wait for user approval.',
     request.mode === "read-only"
       ? ""
-      : 'For edit, change, rewrite, replace, insert, delete, fix, repair, compile, recompile, build, PDF generation, compile-error, failing-build, visual PDF review, and diagnostic tasks, return the concrete action whenever safe: "patch" for source edits, "delete-entry" for deleting project files or folders, "move-entry" for moving or renaming files, "set-main-file" for changing the project main TeX file, "capture-pdf-preview" for rendered preview evidence, and "run-compile" for builds. Do not stop at explaining the edit or app action.',
+      : 'For edit, change, rewrite, replace, insert, delete, merge, combine, consolidate, reorganize, restructure, fix, repair, compile, recompile, build, PDF generation, compile-error, failing-build, visual PDF review, and diagnostic tasks, return the concrete action whenever safe: "patch" for source edits, "delete-entry" for deleting project files or folders, "move-entry" for moving or renaming files, "set-main-file" for changing the project main TeX file, "capture-pdf-preview" for rendered preview evidence, and "run-compile" for builds. Do not stop at explaining the edit or app action.',
+    "In message, always explain the result in user-facing terms: list the files or sections changed and the purpose of the change. If no source file changed, say why no change was made and do not imply that an edit happened.",
     "Preserve all unrelated text and formatting when returning a patch.",
+    request.activeDocument?.kind === "word"
+      ? 'The active document is a Microsoft Word .docx file represented as extracted paragraphs. Do not return a raw .docx patch. For Word edits, set action "word-edit", patches: [], and populate wordChangesets with filePath, summary, and operations using operation types "replace-block", "insert-block-after", "delete-block", "move-block", or "replace-selection".'
+      : "",
     "For patches, afterContents must be the complete target file after the edit, not a snippet, diff, abbreviated file, or only the changed section. Never omit unchanged content.",
+    "When splitting embedded bibliography entries into a separate .bib file, return one patch for the .bib file and one patch for the TeX file that removes the embedded bibliography block and references the .bib file.",
     snapshot.path === newFileSnapshotPath
       ? 'No active TeX file is open. If the user asks to create a .tex file, return action "patch", choose a clear project-relative targetFilePath ending in .tex, set afterContents to the complete new file contents, and use an empty original file.'
       : "",
@@ -1666,12 +1890,13 @@ function createCodexPrompt(
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
     formatAgentSelectionContextForPrompt(request) ?? "",
+    formatAgentImageAttachmentsForPrompt(request),
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
     "",
     `Active file preview (${snapshot.path}):`,
-    "```tex",
+    request.activeDocument?.kind === "word" ? "```text" : "```tex",
     createSourcePreview(snapshot.contents),
     "```"
   ]
@@ -1685,6 +1910,23 @@ function createEmptyProjectSnapshot(): ProjectFileSnapshot {
   return {
     path: newFileSnapshotPath,
     contents: "",
+    mtimeMs: Date.now()
+  };
+}
+
+function createActiveDocumentSnapshot(
+  request: AgentStartRequest
+): ProjectFileSnapshot | undefined {
+  if (request.activeDocument === undefined) {
+    return undefined;
+  }
+
+  return {
+    path: request.activeDocument.path,
+    contents:
+      request.activeDocument.kind === "word"
+        ? request.activeDocument.plainText
+        : request.activeDocument.contents,
     mtimeMs: Date.now()
   };
 }
@@ -1737,6 +1979,49 @@ async function readPatchSnapshot(
   }
 }
 
+type CodexPatchSnapshot = {
+  readonly patch: CodexAgentPatch;
+  readonly snapshot: ProjectFileSnapshot;
+};
+
+async function readCodexPatchSnapshots(
+  response: CodexAgentResponse,
+  fallbackSnapshot: ProjectFileSnapshot,
+  broker: Pick<CodexCliToolBroker, "readFile">
+): Promise<readonly CodexPatchSnapshot[]> {
+  const patches = getCodexPatchRequests(response);
+  const snapshots: CodexPatchSnapshot[] = [];
+
+  for (const patch of patches) {
+    snapshots.push({
+      patch,
+      snapshot: await readPatchSnapshot(patch.targetFilePath, fallbackSnapshot, broker)
+    });
+  }
+
+  return snapshots;
+}
+
+function getCodexPatchRequests(
+  response: CodexAgentResponse
+): readonly CodexAgentPatch[] {
+  if (response.action !== "patch") {
+    return [];
+  }
+
+  if ((response.patches?.length ?? 0) > 0) {
+    return response.patches ?? [];
+  }
+
+  return [
+    {
+      targetFilePath: response.targetFilePath,
+      summary: response.summary,
+      afterContents: response.afterContents
+    }
+  ];
+}
+
 function createInitialCodexPrompt(
   request: AgentStartRequest,
   snapshot: ProjectFileSnapshot
@@ -1775,6 +2060,7 @@ function createCodexSelectedTextPrompt(
     "You are the OpenAI Codex provider inside ZeroLeaf, a local-first LaTeX editor.",
     "The user selected text in a TeX source file and asked for a focused writing edit.",
     "Do not modify files directly inside Codex CLI. Return only JSON matching the provided schema so ZeroLeaf can perform the project-scoped action.",
+    'The schema always requires designWorkflow. For focused LaTeX writing edits, return an empty design workflow with currentStep "none", steps [], qa status "blocked", codeGeneration status "not-started", and implementationQa status "not-run".',
     request.mode === "read-only"
       ? 'The current ZeroLeaf mode is read-only, so action must be "answer". Describe the suggested replacement in message, but do not return a patch action.'
       : 'Return action "patch" with afterContents set to the complete target file after the edit. ZeroLeaf will apply the patch according to the current mode.',
@@ -1790,6 +2076,7 @@ function createCodexSelectedTextPrompt(
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
     formatAgentSelectionContextForPrompt(request) ?? "",
+    formatAgentImageAttachmentsForPrompt(request),
     "",
     `Focused file context (${snapshot.path}):`,
     "```tex",
@@ -1811,6 +2098,7 @@ function createCodexPatchRetryPrompt(
     "Retry instruction:",
     "Your previous response answered with guidance instead of a concrete app action.",
     'If a concrete safe source edit exists, return action "patch" with afterContents set to the complete target file after the minimal fix.',
+    'If the concrete edit spans multiple files, return action "patch" with patches containing one complete full-file replacement per changed file.',
     'If the user asked to delete or remove a project file or folder, return action "delete-entry" with targetFilePath set to that project path.',
     'If the user asked to move or rename a project file, return action "move-entry" with targetFilePath set to the current project path and afterContents set to the destination project path.',
     'If the user asked to set or change the project main TeX file, return action "set-main-file" with targetFilePath set to that .tex project path.',
@@ -1924,6 +2212,7 @@ function createCodexInterruptedRetryPrompt(
     "The previous Codex planner attempt was interrupted before it returned a valid action.",
     "Use this smaller prompt and avoid broad project scans. Return one JSON action only.",
     "Do not modify files or run LaTeX commands inside Codex CLI. ZeroLeaf will run returned app actions.",
+    "The schema requires designWorkflow. Return an empty design workflow unless this is a website, UI, code-generation, or design/runtime QA task.",
     'Use action "patch" for a minimal source edit, "delete-entry" for deleting project files or folders, "move-entry" for file moves, "set-main-file" for changing the main TeX file, "capture-pdf-preview" for rendered preview evidence, "run-compile" for compile requests, or "answer" only when no safe action exists.',
     `Interrupted attempt: ${formatPlannerFailure(error)}`,
     `User task: ${request.prompt}`,
@@ -1932,6 +2221,7 @@ function createCodexInterruptedRetryPrompt(
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
     formatAgentSelectionContextForPrompt(request) ?? "",
+    formatAgentImageAttachmentsForPrompt(request),
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
@@ -1991,8 +2281,39 @@ function isConcreteActionPreferredRequest(request: AgentStartRequest): boolean {
     return true;
   }
 
-  return /\b(edit|change|set|switch|make|update|rewrite|replace|insert|add|remove|delete|move|rename|fix|repair|compile|recompile|build|pdf|compile error|compilation error|failing build|build failure|latex error|diagnostic|main\s+(?:tex|file)|root\s+(?:tex|file))\b/iu.test(
-    request.prompt
+  if (isAnswerPreferredRequest(request.prompt)) {
+    return false;
+  }
+
+  return (
+    /\b(edit|change|set|switch|make|update|rewrite|replace|insert|add|remove|delete|move|rename|merge|combine|consolidate|split|reorganize|restructure|fix|repair|compile|recompile|build|compile error|compilation error|failing build|build failure|latex error|diagnostic|main\s+(?:tex|file)|root\s+(?:tex|file))\b/iu.test(
+      request.prompt
+    ) || isPdfAppActionRequest(request.prompt)
+  );
+}
+
+function isAnswerPreferredRequest(prompt: string): boolean {
+  const hasAnswerIntent =
+    /\b(answer|explain|summari[sz]e|summary|describe|what|why|how|plan|outline|strategy|review|critique|assess|analy[sz]e|diagnose|guidance|advice|recommend|recommendation|literature review|reading list|submission checklist)\b/iu.test(
+      prompt
+    );
+
+  if (!hasAnswerIntent) {
+    return false;
+  }
+
+  return !/\b(edit|change|set|switch|make|update|rewrite|replace|insert|add|remove|delete|move|rename|merge|combine|consolidate|split|reorganize|restructure|fix|repair|compile|recompile|build|apply|patch)\b/iu.test(
+    prompt
+  );
+}
+
+function isPdfAppActionRequest(prompt: string): boolean {
+  return (
+    /\b(?:generate|update|create|build)\s+(?:the\s+)?pdf\b/iu.test(prompt) ||
+    (/\bpdf\b/iu.test(prompt) &&
+      /\b(preview|screenshot|visual|rendered|layout|formatting|clipping|overlap|page break|figure placement|table placement)\b/iu.test(
+        prompt
+      ))
   );
 }
 
@@ -2132,6 +2453,7 @@ function parseCodexAgentResponse(value: unknown): CodexAgentResponse {
   if (
     (candidate.action !== "answer" &&
       candidate.action !== "patch" &&
+      candidate.action !== "word-edit" &&
       candidate.action !== "delete-entry" &&
       candidate.action !== "move-entry" &&
       candidate.action !== "set-main-file" &&
@@ -2140,6 +2462,10 @@ function parseCodexAgentResponse(value: unknown): CodexAgentResponse {
     typeof candidate.targetFilePath !== "string" ||
     typeof candidate.summary !== "string" ||
     typeof candidate.afterContents !== "string" ||
+    !isValidCodexAgentPatches(candidate.patches) ||
+    !isValidCodexAgentWordChangeSets(candidate.wordChangesets) ||
+    (candidate.designWorkflow !== undefined &&
+      !isValidDesignWorkflowOutput(candidate.designWorkflow)) ||
     typeof candidate.message !== "string" ||
     typeof candidate.notes !== "string"
   ) {
@@ -2151,12 +2477,138 @@ function parseCodexAgentResponse(value: unknown): CodexAgentResponse {
     targetFilePath: candidate.targetFilePath,
     summary: candidate.summary,
     afterContents: candidate.afterContents,
+    ...(candidate.patches === undefined ? {} : { patches: candidate.patches }),
+    ...(candidate.wordChangesets === undefined
+      ? {}
+      : { wordChangesets: candidate.wordChangesets }),
+    designWorkflow: candidate.designWorkflow ?? createEmptyDesignWorkflowOutput(),
     message: candidate.message,
     notes: candidate.notes
   };
 }
 
-const codexOutputSchema = {
+function getDesignWorkflow(response: CodexAgentResponse): DesignWorkflowOutput {
+  return response.designWorkflow ?? createEmptyDesignWorkflowOutput();
+}
+
+function createCodexWordChangeSets(
+  request: AgentStartRequest,
+  response: CodexAgentResponse
+): readonly WordChangeSet[] {
+  const activeDocument = request.activeDocument;
+
+  if (activeDocument?.kind !== "word") {
+    return [];
+  }
+
+  const requestedChangeSets = response.wordChangesets ?? [];
+
+  if (requestedChangeSets.length === 0) {
+    return [];
+  }
+
+  return requestedChangeSets.map((changeset) => {
+    const now = new Date().toISOString();
+    return {
+      id: randomUUID(),
+      projectRoot: request.projectRoot,
+      filePath: changeset.filePath || activeDocument.path,
+      summary: normalizeSummary(changeset.summary || response.summary),
+      baseBlocks: activeDocument.blocks,
+      operations: changeset.operations,
+      status: "proposed",
+      createdAt: now,
+      updatedAt: now
+    };
+  });
+}
+
+function isValidCodexAgentPatches(
+  value: Partial<CodexAgentResponse>["patches"]
+): value is readonly CodexAgentPatch[] | undefined {
+  return (
+    value === undefined ||
+    (Array.isArray(value) &&
+      value.every(
+        (patch) =>
+          patch !== null &&
+          typeof patch === "object" &&
+          typeof (patch as Partial<CodexAgentPatch>).targetFilePath === "string" &&
+          typeof (patch as Partial<CodexAgentPatch>).summary === "string" &&
+          typeof (patch as Partial<CodexAgentPatch>).afterContents === "string"
+      ))
+  );
+}
+
+function isValidCodexAgentWordChangeSets(
+  value: Partial<CodexAgentResponse>["wordChangesets"]
+): value is readonly CodexAgentWordChangeSet[] | undefined {
+  return (
+    value === undefined ||
+    (Array.isArray(value) &&
+      value.every(
+        (changeset) =>
+          changeset !== null &&
+          typeof changeset === "object" &&
+          typeof (changeset as Partial<CodexAgentWordChangeSet>).filePath ===
+            "string" &&
+          typeof (changeset as Partial<CodexAgentWordChangeSet>).summary === "string" &&
+          isValidWordBlockOperations(
+            (changeset as Partial<CodexAgentWordChangeSet>).operations
+          )
+      ))
+  );
+}
+
+function isValidWordBlockOperations(
+  value: unknown
+): value is readonly WordBlockOperation[] {
+  return Array.isArray(value) && value.every(isValidWordBlockOperation);
+}
+
+function isValidWordBlockOperation(value: unknown): value is WordBlockOperation {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const operation = value as Partial<WordBlockOperation>;
+
+  switch (operation.type) {
+    case "replace-block":
+      return (
+        typeof operation.blockId === "string" && typeof operation.afterText === "string"
+      );
+    case "insert-block-after":
+      return (
+        (operation.afterBlockId === undefined ||
+          typeof operation.afterBlockId === "string") &&
+        typeof operation.block === "object" &&
+        operation.block !== null &&
+        typeof operation.block.id === "string" &&
+        operation.block.kind === "paragraph" &&
+        typeof operation.block.text === "string"
+      );
+    case "delete-block":
+      return typeof operation.blockId === "string";
+    case "move-block":
+      return (
+        typeof operation.blockId === "string" &&
+        (operation.afterBlockId === undefined ||
+          typeof operation.afterBlockId === "string")
+      );
+    case "replace-selection":
+      return (
+        typeof operation.blockId === "string" &&
+        typeof operation.startOffset === "number" &&
+        typeof operation.endOffset === "number" &&
+        typeof operation.replacementText === "string"
+      );
+    default:
+      return false;
+  }
+}
+
+export const codexOutputSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
@@ -2164,6 +2616,7 @@ const codexOutputSchema = {
       enum: [
         "answer",
         "patch",
+        "word-edit",
         "delete-entry",
         "move-entry",
         "set-main-file",
@@ -2174,10 +2627,81 @@ const codexOutputSchema = {
     targetFilePath: { type: "string" },
     summary: { type: "string" },
     afterContents: { type: "string" },
+    patches: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          targetFilePath: { type: "string" },
+          summary: { type: "string" },
+          afterContents: { type: "string" }
+        },
+        required: ["targetFilePath", "summary", "afterContents"]
+      }
+    },
+    wordChangesets: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          filePath: { type: "string" },
+          summary: { type: "string" },
+          operations: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                type: {
+                  enum: [
+                    "replace-block",
+                    "insert-block-after",
+                    "delete-block",
+                    "move-block",
+                    "replace-selection"
+                  ]
+                },
+                blockId: { type: "string" },
+                afterText: { type: "string" },
+                afterBlockId: { type: "string" },
+                block: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    id: { type: "string" },
+                    kind: { enum: ["paragraph"] },
+                    text: { type: "string" }
+                  },
+                  required: ["id", "kind", "text"]
+                },
+                startOffset: { type: "number" },
+                endOffset: { type: "number" },
+                replacementText: { type: "string" }
+              },
+              required: ["type"]
+            }
+          }
+        },
+        required: ["filePath", "summary", "operations"]
+      }
+    },
+    designWorkflow: designWorkflowOutputSchema,
     message: { type: "string" },
     notes: { type: "string" }
   },
-  required: ["action", "targetFilePath", "summary", "afterContents", "message", "notes"]
+  required: [
+    "action",
+    "targetFilePath",
+    "summary",
+    "afterContents",
+    "patches",
+    "wordChangesets",
+    "designWorkflow",
+    "message",
+    "notes"
+  ]
 } as const;
 
 function processCodexJsonLines(
@@ -2416,6 +2940,22 @@ function createPatchEvent(sessionId: string, changeset: HistoryChangeSet): Agent
   };
 }
 
+function createWordChangeSetEvent(
+  sessionId: string,
+  changeset: WordChangeSet
+): AgentEvent {
+  return {
+    id: randomUUID(),
+    sessionId,
+    createdAt: new Date().toISOString(),
+    type: "patch",
+    changesetId: changeset.id,
+    filePath: changeset.filePath,
+    summary: changeset.summary,
+    status: changeset.status
+  };
+}
+
 function createApprovalEvent(
   sessionId: string,
   toolName: AgentToolName = "apply-patch",
@@ -2472,6 +3012,25 @@ function formatCompileMessage(buildResult: BuildResult): string {
     `Diagnostics: ${buildResult.diagnostics.length}.`,
     diagnosticSummary
   ].join("\n\n");
+}
+
+function formatCompileActionMessage(
+  response: CodexAgentResponse,
+  buildResult: BuildResult
+): string {
+  const actionSummary =
+    response.message.trim().length > 0
+      ? response.message.trim()
+      : "Codex requested a project compile.";
+
+  return [
+    actionSummary,
+    buildResult.status === "succeeded"
+      ? "Compile finished. Build details are available in the Log panel."
+      : "Compile did not succeed. Build details are available in the Log panel."
+  ]
+    .filter((line) => line.trim().length > 0)
+    .join("\n\n");
 }
 
 function getRequestedSessionId(request: AgentStartRequest): string | undefined {

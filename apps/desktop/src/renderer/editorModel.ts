@@ -79,7 +79,15 @@ export type TextSelectionRange = {
 };
 
 const internalProjectPathPrefixes = [".latex-agent/"] as const;
-const editableExtensions = new Set([".bib", ".cls", ".md", ".sty", ".tex", ".txt"]);
+const editableExtensions = new Set([
+  ".bib",
+  ".cls",
+  ".docx",
+  ".md",
+  ".sty",
+  ".tex",
+  ".txt"
+]);
 
 export const latexSnippets = [
   {

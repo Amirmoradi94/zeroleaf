@@ -57,6 +57,13 @@ const api: DesktopApi = {
     read: (request) => invoke("file.read", request),
     write: (request) => invoke("file.write", request)
   },
+  word: {
+    read: (request) => invoke("word.read", request),
+    save: (request) => invoke("word.save", request),
+    createChangeSet: (request) => invoke("word.createChangeSet", request),
+    applyChangeSet: (request) => invoke("word.applyChangeSet", request),
+    rollbackChangeSet: (request) => invoke("word.rollbackChangeSet", request)
+  },
   build: {
     detectToolchain: () => invoke("build.detectToolchain", undefined),
     run: (request) => invoke("build.run", request),
@@ -82,6 +89,12 @@ const api: DesktopApi = {
       invoke("history.rejectChangeSet", { changesetId }),
     rollbackChangeSet: (changesetId) =>
       invoke("history.rollbackChangeSet", { changesetId }),
+    listWordChangeSets: (request) => invoke("history.listWordChangeSets", request),
+    createWordChangeSet: (request) => invoke("history.createWordChangeSet", request),
+    markWordChangeSetApplied: (request) =>
+      invoke("history.markWordChangeSetApplied", request),
+    rejectWordChangeSet: (changesetId) =>
+      invoke("history.rejectWordChangeSet", { changesetId }),
     listAuditEvents: (request) => invoke("history.listAuditEvents", request)
   },
   references: {

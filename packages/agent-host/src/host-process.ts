@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 import { ClaudeProvider } from "@latex-agent/provider-anthropic-claude";
-import { CodexCliProvider } from "@latex-agent/provider-openai-codex";
+import {
+  CodexCliProvider,
+  OpenRouterDesignProvider
+} from "@latex-agent/provider-openai-codex";
 import type {
   AgentDeleteEntryOperation,
   AgentMoveEntryOperation,
@@ -52,6 +55,7 @@ type PendingToolRequest = {
 const mockProvider = new MockAgentProvider();
 const codexProvider = new CodexCliProvider();
 const claudeProvider = new ClaudeProvider();
+const openRouterDesignProvider = new OpenRouterDesignProvider();
 const sessions = new Map<string, HostSession>();
 const pendingToolRequests = new Map<string, PendingToolRequest>();
 
@@ -606,7 +610,7 @@ async function cancelSession(requestId: string, sessionId: string): Promise<void
 
 function getProvider(
   providerId: AgentProviderId
-): MockAgentProvider | CodexCliProvider | ClaudeProvider {
+): MockAgentProvider | CodexCliProvider | ClaudeProvider | OpenRouterDesignProvider {
   switch (providerId) {
     case "mock":
       return mockProvider;
@@ -614,6 +618,8 @@ function getProvider(
       return codexProvider;
     case "anthropic-claude":
       return claudeProvider;
+    case "openrouter-design":
+      return openRouterDesignProvider;
   }
 }
 

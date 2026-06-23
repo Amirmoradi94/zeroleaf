@@ -64,6 +64,60 @@ describe("MockAgentProvider", () => {
     ).toBe(true);
   });
 
+  it("proposes a reviewable Word changeset for active Word documents", async () => {
+    const provider = new MockAgentProvider();
+    const broker: AgentToolBroker = {
+      readFile: () => {
+        throw new Error("Word active document context should avoid raw file reads.");
+      },
+      searchProject: () => Promise.resolve([]),
+      proposePatch: () => {
+        throw new Error("Word documents should use Word changesets, not text patches.");
+      },
+      applyPatch: () => {
+        throw new Error("Word changeset proposal should not apply text patches.");
+      },
+      runCompile: () => {
+        throw new Error("Word changeset proposal should not compile LaTeX.");
+      }
+    };
+
+    const result = await provider.startSession(
+      {
+        providerId: "mock",
+        mode: "apply-with-review",
+        projectRoot: "/tmp/project",
+        prompt: "Improve academic tone",
+        activeFilePath: "paper.docx",
+        activeDocument: {
+          kind: "word",
+          path: "paper.docx",
+          plainText: "This is a rough paragraph.",
+          blocks: [
+            {
+              id: "p-1",
+              kind: "paragraph",
+              text: "This is a rough paragraph."
+            }
+          ],
+          warnings: []
+        }
+      },
+      broker
+    );
+
+    expect(result.status).toBe("completed");
+    expect(result.wordChangeset?.filePath).toBe("paper.docx");
+    expect(result.wordChangeset?.operations).toEqual([
+      {
+        type: "replace-block",
+        blockId: "p-1",
+        afterText: "Revised for academic clarity: This is a rough paragraph."
+      }
+    ]);
+    expect(result.changeset).toBeUndefined();
+  });
+
   it("explains a build warning in read-only mode without patch or compile tools", async () => {
     const provider = new MockAgentProvider();
     const calls: string[] = [];

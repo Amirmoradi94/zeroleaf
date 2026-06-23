@@ -33,13 +33,15 @@ npm run build
 
 ```bash
 ZEROLEAF_UPDATE_MANIFEST_URL=https://raw.githubusercontent.com/Amirmoradi94/zeroleaf/main/docs/updates/zeroleaf-update.json npm run package:mac:dmg
+ZEROLEAF_UPDATE_MANIFEST_URL=https://raw.githubusercontent.com/Amirmoradi94/zeroleaf/main/docs/updates/zeroleaf-update.json npm run package:win
 ```
 
 4. Create a GitHub Release tag such as `v0.0.0-alpha.6`.
-5. Upload the generated artifact:
+5. Upload the generated artifacts:
 
 ```text
 release/mac/ZeroLeaf-0.0.0-alpha.6-mac.dmg
+release/win/ZeroLeaf-0.0.0-alpha.6-win-x64.zip
 ```
 
 6. Update `docs/updates/zeroleaf-update.json` so `latestVersion`,
@@ -54,6 +56,7 @@ updates`; it should show the new release and open the GitHub download URL.
   appear immediately, wait a few minutes and check again.
 - Users do not need to uninstall old builds. They download the new DMG, quit
   ZeroLeaf, and replace the app in `/Applications`.
+- Windows testers can unzip the Windows artifact and run `ZeroLeaf.exe`.
 - The current implementation downloads manually through the browser. Silent
   in-place updates should wait until release signing and notarization are in
   place.

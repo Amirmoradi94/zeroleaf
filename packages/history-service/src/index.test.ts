@@ -193,6 +193,184 @@ describe("history-service", () => {
     );
   });
 
+  it("persists Word changesets across store instances", async () => {
+    const wordChangeSet = await history.createWordChangeSet({
+      id: "word-changeset-1",
+      projectRoot: projectPath,
+      filePath: "draft.docx",
+      summary: "Rewrite Word abstract",
+      baseBlocks: [
+        { id: "w1", kind: "paragraph", text: "Old abstract text." },
+        { id: "w2", kind: "paragraph", text: "Keep this paragraph." }
+      ],
+      operations: [
+        {
+          type: "replace-block",
+          blockId: "w1",
+          afterText: "Clearer abstract text."
+        }
+      ],
+      status: "proposed",
+      createdAt: "2026-06-23T00:00:00.000Z",
+      updatedAt: "2026-06-23T00:00:00.000Z"
+    });
+
+    expect(wordChangeSet.status).toBe("proposed");
+    expect(wordChangeSet.projectRoot).toBe(await realpath(projectPath));
+    expect(wordChangeSet.filePath).toBe("draft.docx");
+    expect(await history.listWordChangeSets(projectPath)).toEqual([wordChangeSet]);
+
+    history.close();
+    history = new HistoryStore(join(sandboxPath, "history.sqlite"));
+
+    await expect(history.listWordChangeSets(projectPath)).resolves.toEqual([
+      wordChangeSet
+    ]);
+    expect(history.getPrivacySummary().changesetCount).toBe(1);
+  });
+
+  it("persists Word changeset apply and reject status", async () => {
+    const first = await history.createWordChangeSet({
+      id: "word-changeset-apply",
+      projectRoot: projectPath,
+      filePath: "draft.docx",
+      summary: "Apply Word edit",
+      baseBlocks: [{ id: "w1", kind: "paragraph", text: "Old text." }],
+      operations: [
+        {
+          type: "replace-selection",
+          blockId: "w1",
+          startOffset: 0,
+          endOffset: 3,
+          replacementText: "New"
+        }
+      ],
+      status: "proposed",
+      createdAt: "2026-06-23T00:00:00.000Z",
+      updatedAt: "2026-06-23T00:00:00.000Z"
+    });
+    const second = await history.createWordChangeSet({
+      id: "word-changeset-reject",
+      projectRoot: projectPath,
+      filePath: "draft.docx",
+      summary: "Reject Word edit",
+      baseBlocks: [{ id: "w1", kind: "paragraph", text: "Old text." }],
+      operations: [{ type: "delete-block", blockId: "w1" }],
+      status: "proposed",
+      createdAt: "2026-06-23T00:00:01.000Z",
+      updatedAt: "2026-06-23T00:00:01.000Z"
+    });
+
+    await writeFile(join(projectPath, "draft.docx"), Buffer.from("after"), "utf8");
+
+    const applied = await history.markWordChangeSetApplied({
+      ...first,
+      status: "applied",
+      updatedAt: "2026-06-23T00:00:02.000Z",
+      appliedAt: "2026-06-23T00:00:02.000Z"
+    });
+    const rejected = history.rejectWordChangeSet(second.id);
+
+    expect(applied.status).toBe("applied");
+    expect(applied.appliedAt).toBe("2026-06-23T00:00:02.000Z");
+    expect(rejected.status).toBe("rejected");
+
+    const auditEvents = await history.listAuditEvents(projectPath);
+    expect(
+      auditEvents.some((event) => event.eventType === "word-changeset.applied")
+    ).toBe(true);
+    expect(
+      auditEvents.some((event) => event.eventType === "word-changeset.rejected")
+    ).toBe(true);
+  });
+
+  it("rolls back applied Word changesets from binary snapshots", async () => {
+    const documentPath = join(projectPath, "draft.docx");
+    await writeFile(documentPath, Buffer.from("before-docx-bytes"));
+    const beforeSnapshot = await history.createWordDocumentSnapshot(
+      projectPath,
+      "draft.docx"
+    );
+    const changeset = await history.createWordChangeSet({
+      id: "word-changeset-rollback",
+      projectRoot: projectPath,
+      filePath: "draft.docx",
+      summary: "Rollback Word edit",
+      baseBlocks: [{ id: "w1", kind: "paragraph", text: "Before text." }],
+      operations: [
+        {
+          type: "replace-block",
+          blockId: "w1",
+          afterText: "After text."
+        }
+      ],
+      status: "proposed",
+      createdAt: "2026-06-23T00:00:00.000Z",
+      updatedAt: "2026-06-23T00:00:00.000Z"
+    });
+
+    await writeFile(documentPath, Buffer.from("after-docx-bytes"));
+    const applied = await history.markWordChangeSetApplied(
+      {
+        ...changeset,
+        status: "applied",
+        updatedAt: "2026-06-23T00:00:02.000Z",
+        appliedAt: "2026-06-23T00:00:02.000Z"
+      },
+      beforeSnapshot.id
+    );
+
+    expect(applied.beforeSnapshotId).toBe(beforeSnapshot.id);
+    expect(applied.appliedContentHash).toHaveLength(64);
+
+    const reverted = await history.rollbackWordChangeSet(changeset.id);
+
+    expect(reverted.status).toBe("reverted");
+    expect(reverted.revertedAt).toBeDefined();
+    await expect(readFile(documentPath, "utf8")).resolves.toBe("before-docx-bytes");
+  });
+
+  it("blocks Word rollback when the document changed after apply", async () => {
+    const documentPath = join(projectPath, "draft.docx");
+    await writeFile(documentPath, Buffer.from("before-docx-bytes"));
+    const beforeSnapshot = await history.createWordDocumentSnapshot(
+      projectPath,
+      "draft.docx"
+    );
+    const changeset = await history.createWordChangeSet({
+      id: "word-changeset-conflict",
+      projectRoot: projectPath,
+      filePath: "draft.docx",
+      summary: "Conflicting Word rollback",
+      baseBlocks: [{ id: "w1", kind: "paragraph", text: "Before text." }],
+      operations: [{ type: "delete-block", blockId: "w1" }],
+      status: "proposed",
+      createdAt: "2026-06-23T00:00:00.000Z",
+      updatedAt: "2026-06-23T00:00:00.000Z"
+    });
+
+    await writeFile(documentPath, Buffer.from("after-docx-bytes"));
+    await history.markWordChangeSetApplied(
+      {
+        ...changeset,
+        status: "applied",
+        updatedAt: "2026-06-23T00:00:02.000Z",
+        appliedAt: "2026-06-23T00:00:02.000Z"
+      },
+      beforeSnapshot.id
+    );
+    await writeFile(documentPath, Buffer.from("manual-edit-after-apply"));
+
+    await expect(history.rollbackWordChangeSet(changeset.id)).rejects.toMatchObject({
+      code: "rollback-conflict",
+      message:
+        "Cannot roll back Word changeset because the document changed after the edit was applied."
+    });
+    await expect(readFile(documentPath, "utf8")).resolves.toBe(
+      "manual-edit-after-apply"
+    );
+  });
+
   it("records explicit agent audit events", async () => {
     const event = await history.recordAuditEvent({
       projectRoot: projectPath,

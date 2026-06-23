@@ -32,6 +32,74 @@ export type HistoryChangeSet = {
   readonly revertedAt?: string;
 };
 
+export type WordDocumentBlockKind = "paragraph";
+
+export type WordDocumentBlock = {
+  readonly id: string;
+  readonly kind: WordDocumentBlockKind;
+  readonly text: string;
+};
+
+export type WordBlockOperation =
+  | {
+      readonly type: "replace-block";
+      readonly blockId: string;
+      readonly afterText: string;
+    }
+  | {
+      readonly type: "insert-block-after";
+      readonly afterBlockId?: string;
+      readonly block: WordDocumentBlock;
+    }
+  | {
+      readonly type: "delete-block";
+      readonly blockId: string;
+    }
+  | {
+      readonly type: "move-block";
+      readonly blockId: string;
+      readonly afterBlockId?: string;
+    }
+  | {
+      readonly type: "replace-selection";
+      readonly blockId: string;
+      readonly startOffset: number;
+      readonly endOffset: number;
+      readonly replacementText: string;
+    };
+
+export type WordChangeSetStatus =
+  | "proposed"
+  | "applied"
+  | "rejected"
+  | "reverted"
+  | "failed";
+
+export type WordChangeSet = {
+  readonly id: string;
+  readonly projectRoot: string;
+  readonly filePath: string;
+  readonly summary: string;
+  readonly baseBlocks: readonly WordDocumentBlock[];
+  readonly operations: readonly WordBlockOperation[];
+  readonly status: WordChangeSetStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly appliedAt?: string;
+  readonly revertedAt?: string;
+  readonly beforeSnapshotId?: string;
+  readonly appliedContentHash?: string;
+};
+
+export type WordDocumentSnapshot = {
+  readonly id: string;
+  readonly projectRoot: string;
+  readonly filePath: string;
+  readonly contentHash: string;
+  readonly byteLength: number;
+  readonly createdAt: string;
+};
+
 export type AuditEvent = {
   readonly id: string;
   readonly projectRoot: string;
@@ -127,6 +195,32 @@ type AuditEventRow = {
   readonly changeset_id: string | null;
   readonly event_type: string;
   readonly message: string;
+  readonly created_at: string;
+};
+
+type WordChangeSetRow = {
+  readonly id: string;
+  readonly project_root: string;
+  readonly file_path: string;
+  readonly summary: string;
+  readonly base_blocks_json: string;
+  readonly operations_json: string;
+  readonly status: WordChangeSetStatus;
+  readonly created_at: string;
+  readonly updated_at: string;
+  readonly applied_at: string | null;
+  readonly reverted_at: string | null;
+  readonly before_snapshot_id: string | null;
+  readonly applied_content_hash: string | null;
+};
+
+type WordDocumentSnapshotRow = {
+  readonly id: string;
+  readonly project_root: string;
+  readonly file_path: string;
+  readonly content_hash: string;
+  readonly byte_length: number;
+  readonly contents_base64: string;
   readonly created_at: string;
 };
 
@@ -292,6 +386,268 @@ export class HistoryStore {
       .all(root) as ChangeSetRow[];
 
     return rows.map(toChangeSet);
+  }
+
+  async listWordChangeSets(projectRoot: string): Promise<readonly WordChangeSet[]> {
+    const root = await validateProjectRoot(projectRoot);
+    this.upsertProject(root);
+    const rows = this.db
+      .prepare(
+        `select id, project_root, file_path, summary, base_blocks_json,
+                operations_json, status, created_at, updated_at, applied_at,
+                reverted_at, before_snapshot_id, applied_content_hash
+           from word_changesets
+          where project_root = ?
+          order by created_at desc`
+      )
+      .all(root) as WordChangeSetRow[];
+
+    return rows.map(toWordChangeSet);
+  }
+
+  async createWordChangeSet(changeset: WordChangeSet): Promise<WordChangeSet> {
+    const root = await validateProjectRoot(changeset.projectRoot);
+    const filePath = normalizeProjectPath(root, changeset.filePath);
+    const normalizedChangeSet = normalizeWordChangeSet({
+      ...changeset,
+      projectRoot: root,
+      filePath,
+      status: "proposed"
+    });
+    const projectId = this.upsertProject(root);
+
+    this.db
+      .prepare(
+        `insert into word_changesets
+          (
+            id, project_id, project_root, file_path, summary, base_blocks_json,
+            operations_json, status, created_at, updated_at, applied_at
+          )
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         on conflict(id) do nothing`
+      )
+      .run(
+        normalizedChangeSet.id,
+        projectId,
+        normalizedChangeSet.projectRoot,
+        normalizedChangeSet.filePath,
+        normalizedChangeSet.summary,
+        JSON.stringify(normalizedChangeSet.baseBlocks),
+        JSON.stringify(normalizedChangeSet.operations),
+        normalizedChangeSet.status,
+        normalizedChangeSet.createdAt,
+        normalizedChangeSet.updatedAt,
+        normalizedChangeSet.appliedAt ?? null
+      );
+    this.recordAudit(
+      projectId,
+      root,
+      null,
+      "word-changeset.created",
+      `Created Word changeset ${normalizedChangeSet.summary}`
+    );
+
+    return this.getWordChangeSet(normalizedChangeSet.id);
+  }
+
+  async createWordDocumentSnapshot(
+    projectRoot: string,
+    filePath: string
+  ): Promise<WordDocumentSnapshot> {
+    const root = await validateProjectRoot(projectRoot);
+    const normalizedFilePath = normalizeProjectPath(root, filePath);
+    const bytes = await readFile(
+      await resolveExistingProjectPath(root, normalizedFilePath)
+    );
+    const projectId = this.upsertProject(root);
+    const snapshot = {
+      id: randomUUID(),
+      projectRoot: root,
+      filePath: normalizedFilePath,
+      contentHash: hashBytes(bytes),
+      byteLength: bytes.byteLength,
+      createdAt: new Date().toISOString()
+    };
+
+    this.db
+      .prepare(
+        `insert into word_document_snapshots
+          (
+            id, project_id, project_root, file_path, content_hash, byte_length,
+            contents_base64, created_at
+          )
+         values (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        snapshot.id,
+        projectId,
+        snapshot.projectRoot,
+        snapshot.filePath,
+        snapshot.contentHash,
+        snapshot.byteLength,
+        bytes.toString("base64"),
+        snapshot.createdAt
+      );
+    this.recordAudit(
+      projectId,
+      root,
+      null,
+      "word-snapshot.created",
+      `Snapshotted ${normalizedFilePath}`
+    );
+
+    return snapshot;
+  }
+
+  async markWordChangeSetApplied(
+    changeset: WordChangeSet,
+    beforeSnapshotId?: string
+  ): Promise<WordChangeSet> {
+    const existing = this.getWordChangeSetRow(changeset.id);
+
+    if (existing.status !== "proposed") {
+      throw new HistoryServiceError(
+        "Only proposed Word changesets can be applied.",
+        "invalid-state"
+      );
+    }
+
+    const appliedAt = changeset.appliedAt ?? new Date().toISOString();
+    const normalizedChangeSet = normalizeWordChangeSet({
+      ...changeset,
+      projectRoot: existing.project_root,
+      filePath: existing.file_path,
+      status: "applied",
+      appliedAt
+    });
+    const appliedContentHash = await hashProjectFile(
+      existing.project_root,
+      existing.file_path
+    );
+    this.db
+      .prepare(
+        `update word_changesets
+            set status = ?,
+                base_blocks_json = ?,
+                operations_json = ?,
+                updated_at = ?,
+                applied_at = coalesce(?, applied_at),
+                before_snapshot_id = coalesce(?, before_snapshot_id),
+                applied_content_hash = ?
+          where id = ?`
+      )
+      .run(
+        "applied",
+        JSON.stringify(normalizedChangeSet.baseBlocks),
+        JSON.stringify(normalizedChangeSet.operations),
+        normalizedChangeSet.updatedAt,
+        appliedAt,
+        beforeSnapshotId ?? normalizedChangeSet.beforeSnapshotId ?? null,
+        appliedContentHash,
+        changeset.id
+      );
+    this.recordAuditForWordChangeSet(
+      existing,
+      "word-changeset.applied",
+      `Applied Word changeset ${existing.summary}`
+    );
+
+    return this.getWordChangeSet(changeset.id);
+  }
+
+  async rollbackWordChangeSet(changesetId: string): Promise<WordChangeSet> {
+    const changeset = this.getWordChangeSetRow(changesetId);
+
+    if (changeset.status !== "applied") {
+      throw new HistoryServiceError(
+        "Only applied Word changesets can be rolled back.",
+        "invalid-state"
+      );
+    }
+
+    if (changeset.before_snapshot_id === null) {
+      throw new HistoryServiceError(
+        "Word changeset has no binary snapshot to restore.",
+        "invalid-state"
+      );
+    }
+
+    if (changeset.applied_content_hash === null) {
+      throw new HistoryServiceError(
+        "Word changeset has no applied document hash.",
+        "invalid-state"
+      );
+    }
+
+    const currentHash = await hashProjectFile(
+      changeset.project_root,
+      changeset.file_path
+    );
+
+    if (currentHash !== changeset.applied_content_hash) {
+      throw new HistoryServiceError(
+        "Cannot roll back Word changeset because the document changed after the edit was applied.",
+        "rollback-conflict"
+      );
+    }
+
+    const snapshot = this.getWordDocumentSnapshotRow(changeset.before_snapshot_id);
+    const snapshotBytes = Buffer.from(snapshot.contents_base64, "base64");
+
+    if (hashBytes(snapshotBytes) !== snapshot.content_hash) {
+      throw new HistoryServiceError(
+        "Stored Word snapshot failed integrity verification.",
+        "invalid-state"
+      );
+    }
+
+    await writeProjectFileBytes(
+      changeset.project_root,
+      changeset.file_path,
+      snapshotBytes
+    );
+
+    const revertedAt = new Date().toISOString();
+    this.db
+      .prepare(
+        `update word_changesets
+            set status = ?,
+                updated_at = ?,
+                reverted_at = ?
+          where id = ?`
+      )
+      .run("reverted", revertedAt, revertedAt, changeset.id);
+    this.recordAuditForWordChangeSet(
+      changeset,
+      "word-changeset.reverted",
+      `Rolled back Word changeset ${changeset.summary}`
+    );
+
+    return this.getWordChangeSet(changeset.id);
+  }
+
+  rejectWordChangeSet(changesetId: string): WordChangeSet {
+    const changeset = this.getWordChangeSetRow(changesetId);
+
+    if (changeset.status !== "proposed") {
+      throw new HistoryServiceError(
+        "Only proposed Word changesets can be rejected.",
+        "invalid-state"
+      );
+    }
+
+    this.updateWordChangeSetStatus(changeset.id, "rejected", null);
+    this.recordAuditForWordChangeSet(
+      changeset,
+      "word-changeset.rejected",
+      `Rejected Word changeset ${changeset.summary}`
+    );
+
+    return this.getWordChangeSet(changeset.id);
+  }
+
+  getWordChangeSet(changesetId: string): WordChangeSet {
+    return toWordChangeSet(this.getWordChangeSetRow(changesetId));
   }
 
   getChangeSet(changesetId: string): HistoryChangeSet {
@@ -545,8 +901,9 @@ export class HistoryStore {
   getPrivacySummary(): HistoryPrivacySummary {
     return {
       projectCount: this.countRows("projects"),
-      snapshotCount: this.countRows("snapshots"),
-      changesetCount: this.countRows("changesets"),
+      snapshotCount:
+        this.countRows("snapshots") + this.countRows("word_document_snapshots"),
+      changesetCount: this.countRows("changesets") + this.countRows("word_changesets"),
       auditEventCount: this.countRows("audit_events"),
       buildJobCount: this.countRows("build_jobs"),
       agentSessionCount: this.countRows("agent_sessions")
@@ -556,6 +913,8 @@ export class HistoryStore {
   clearAll(): HistoryPrivacySummary {
     this.db.exec(`
       delete from audit_events;
+      delete from word_changesets;
+      delete from word_document_snapshots;
       delete from changesets;
       delete from snapshots;
       delete from agent_sessions;
@@ -622,6 +981,34 @@ export class HistoryStore {
         reverted_at text
       );
 
+      create table if not exists word_document_snapshots (
+        id text primary key,
+        project_id text not null references projects(id) on delete cascade,
+        project_root text not null,
+        file_path text not null,
+        content_hash text not null,
+        byte_length integer not null,
+        contents_base64 text not null,
+        created_at text not null
+      );
+
+      create table if not exists word_changesets (
+        id text primary key,
+        project_id text not null references projects(id) on delete cascade,
+        project_root text not null,
+        file_path text not null,
+        summary text not null,
+        base_blocks_json text not null,
+        operations_json text not null,
+        status text not null,
+        created_at text not null,
+        updated_at text not null,
+        applied_at text,
+        reverted_at text,
+        before_snapshot_id text references word_document_snapshots(id),
+        applied_content_hash text
+      );
+
       create table if not exists audit_events (
         id text primary key,
         project_id text not null references projects(id) on delete cascade,
@@ -632,6 +1019,13 @@ export class HistoryStore {
         created_at text not null
       );
     `);
+    this.ensureColumn("word_changesets", "reverted_at", "text");
+    this.ensureColumn(
+      "word_changesets",
+      "before_snapshot_id",
+      "text references word_document_snapshots(id)"
+    );
+    this.ensureColumn("word_changesets", "applied_content_hash", "text");
   }
 
   private upsertProject(projectRoot: string): string {
@@ -694,6 +1088,44 @@ export class HistoryStore {
     return row;
   }
 
+  private getWordChangeSetRow(changesetId: string): WordChangeSetRow {
+    const row = this.db
+      .prepare(
+        `select id, project_root, file_path, summary, base_blocks_json,
+                operations_json, status, created_at, updated_at, applied_at,
+                reverted_at, before_snapshot_id, applied_content_hash
+           from word_changesets
+          where id = ?`
+      )
+      .get(changesetId) as WordChangeSetRow | undefined;
+
+    if (row === undefined) {
+      throw new HistoryServiceError("Word changeset not found.", "missing-changeset");
+    }
+
+    return row;
+  }
+
+  private getWordDocumentSnapshotRow(snapshotId: string): WordDocumentSnapshotRow {
+    const row = this.db
+      .prepare(
+        `select id, project_root, file_path, content_hash, byte_length,
+                contents_base64, created_at
+           from word_document_snapshots
+          where id = ?`
+      )
+      .get(snapshotId) as WordDocumentSnapshotRow | undefined;
+
+    if (row === undefined) {
+      throw new HistoryServiceError(
+        "Word document snapshot not found.",
+        "invalid-state"
+      );
+    }
+
+    return row;
+  }
+
   private updateChangeSetStatus(
     changesetId: string,
     status: ChangeSetStatus,
@@ -727,6 +1159,31 @@ export class HistoryStore {
     );
   }
 
+  private updateWordChangeSetStatus(
+    changesetId: string,
+    status: WordChangeSetStatus,
+    appliedAt: string | null
+  ): void {
+    this.db
+      .prepare(
+        `update word_changesets
+            set status = ?,
+                updated_at = ?,
+                applied_at = coalesce(?, applied_at)
+          where id = ?`
+      )
+      .run(status, new Date().toISOString(), appliedAt, changesetId);
+  }
+
+  private recordAuditForWordChangeSet(
+    changeset: WordChangeSetRow,
+    eventType: string,
+    message: string
+  ): void {
+    const projectId = this.upsertProject(changeset.project_root);
+    this.recordAudit(projectId, changeset.project_root, null, eventType, message);
+  }
+
   private recordAudit(
     projectId: string,
     projectRoot: string,
@@ -756,6 +1213,22 @@ export class HistoryStore {
       | { readonly count: number }
       | undefined;
     return row?.count ?? 0;
+  }
+
+  private ensureColumn(
+    tableName: string,
+    columnName: string,
+    definition: string
+  ): void {
+    const columns = this.db
+      .prepare(`pragma table_info(${tableName})`)
+      .all() as unknown as readonly { readonly name: string }[] | undefined;
+
+    if (columns?.some((column) => column.name === columnName) === true) {
+      return;
+    }
+
+    this.db.exec(`alter table ${tableName} add column ${columnName} ${definition}`);
   }
 }
 
@@ -1028,6 +1501,226 @@ function toChangeSet(row: ChangeSetRow): HistoryChangeSet {
   };
 }
 
+function toWordChangeSet(row: WordChangeSetRow): WordChangeSet {
+  const baseBlocks = parseJsonField(row.base_blocks_json, "base blocks");
+  const operations = parseJsonField(row.operations_json, "Word operations");
+
+  return normalizeWordChangeSet({
+    id: row.id,
+    projectRoot: row.project_root,
+    filePath: row.file_path,
+    summary: row.summary,
+    baseBlocks: parseWordBlocks(baseBlocks),
+    operations: parseWordOperations(operations),
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.applied_at === null ? {} : { appliedAt: row.applied_at }),
+    ...(row.reverted_at === null ? {} : { revertedAt: row.reverted_at }),
+    ...(row.before_snapshot_id === null
+      ? {}
+      : { beforeSnapshotId: row.before_snapshot_id }),
+    ...(row.applied_content_hash === null
+      ? {}
+      : { appliedContentHash: row.applied_content_hash })
+  });
+}
+
+function normalizeWordChangeSet(changeset: WordChangeSet): WordChangeSet {
+  const baseBlocks = normalizeWordBlocks(changeset.baseBlocks);
+  const operations = normalizeWordOperations(changeset.operations);
+
+  if (baseBlocks.length === 0) {
+    throw new HistoryServiceError(
+      "Word changeset requires a base block snapshot.",
+      "empty-change"
+    );
+  }
+
+  if (operations.length === 0) {
+    throw new HistoryServiceError(
+      "Word changeset requires at least one operation.",
+      "empty-change"
+    );
+  }
+
+  const normalized = {
+    id: changeset.id.trim().length > 0 ? changeset.id : randomUUID(),
+    projectRoot: changeset.projectRoot,
+    filePath: changeset.filePath,
+    summary: normalizeSummary(changeset.summary),
+    baseBlocks,
+    operations,
+    status: changeset.status,
+    createdAt: changeset.createdAt,
+    updatedAt: changeset.updatedAt,
+    appliedAt: changeset.appliedAt,
+    revertedAt: changeset.revertedAt,
+    beforeSnapshotId: changeset.beforeSnapshotId,
+    appliedContentHash: changeset.appliedContentHash
+  };
+
+  return {
+    id: normalized.id,
+    projectRoot: normalized.projectRoot,
+    filePath: normalized.filePath,
+    summary: normalized.summary,
+    baseBlocks: normalized.baseBlocks,
+    operations: normalized.operations,
+    status: normalized.status,
+    createdAt: normalized.createdAt,
+    updatedAt: normalized.updatedAt,
+    ...(normalized.appliedAt === undefined ? {} : { appliedAt: normalized.appliedAt }),
+    ...(normalized.revertedAt === undefined
+      ? {}
+      : { revertedAt: normalized.revertedAt }),
+    ...(normalized.beforeSnapshotId === undefined
+      ? {}
+      : { beforeSnapshotId: normalized.beforeSnapshotId }),
+    ...(normalized.appliedContentHash === undefined
+      ? {}
+      : { appliedContentHash: normalized.appliedContentHash })
+  };
+}
+
+function normalizeWordBlocks(
+  blocks: readonly WordDocumentBlock[]
+): readonly WordDocumentBlock[] {
+  return blocks.map((block, index) => ({
+    id: block.id.trim().length > 0 ? block.id : `p-${index + 1}`,
+    kind: "paragraph",
+    text: block.text
+  }));
+}
+
+function normalizeWordOperations(
+  operations: readonly WordBlockOperation[]
+): readonly WordBlockOperation[] {
+  return operations.map((operation) => {
+    switch (operation.type) {
+      case "replace-block":
+        return {
+          type: "replace-block",
+          blockId: operation.blockId,
+          afterText: operation.afterText
+        };
+      case "insert-block-after":
+        return {
+          type: "insert-block-after",
+          ...(operation.afterBlockId === undefined
+            ? {}
+            : { afterBlockId: operation.afterBlockId }),
+          block: normalizeWordBlocks([operation.block])[0]!
+        };
+      case "delete-block":
+        return {
+          type: "delete-block",
+          blockId: operation.blockId
+        };
+      case "move-block":
+        return {
+          type: "move-block",
+          blockId: operation.blockId,
+          ...(operation.afterBlockId === undefined
+            ? {}
+            : { afterBlockId: operation.afterBlockId })
+        };
+      case "replace-selection":
+        return {
+          type: "replace-selection",
+          blockId: operation.blockId,
+          startOffset: operation.startOffset,
+          endOffset: operation.endOffset,
+          replacementText: operation.replacementText
+        };
+    }
+  });
+}
+
+function parseJsonField(value: string, label: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new HistoryServiceError(
+      `Stored Word changeset ${label} are invalid JSON.`,
+      "invalid-state"
+    );
+  }
+}
+
+function parseWordBlocks(value: unknown): readonly WordDocumentBlock[] {
+  if (!Array.isArray(value) || !value.every(isWordDocumentBlock)) {
+    throw new HistoryServiceError(
+      "Stored Word changeset base blocks are invalid.",
+      "invalid-state"
+    );
+  }
+
+  return normalizeWordBlocks(value);
+}
+
+function parseWordOperations(value: unknown): readonly WordBlockOperation[] {
+  if (!Array.isArray(value) || !value.every(isWordBlockOperation)) {
+    throw new HistoryServiceError(
+      "Stored Word changeset operations are invalid.",
+      "invalid-state"
+    );
+  }
+
+  return normalizeWordOperations(value);
+}
+
+function isWordDocumentBlock(value: unknown): value is WordDocumentBlock {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const block = value as Partial<WordDocumentBlock>;
+  return (
+    typeof block.id === "string" &&
+    block.kind === "paragraph" &&
+    typeof block.text === "string"
+  );
+}
+
+function isWordBlockOperation(value: unknown): value is WordBlockOperation {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const operation = value as Partial<WordBlockOperation>;
+
+  switch (operation.type) {
+    case "replace-block":
+      return (
+        typeof operation.blockId === "string" && typeof operation.afterText === "string"
+      );
+    case "insert-block-after":
+      return (
+        (operation.afterBlockId === undefined ||
+          typeof operation.afterBlockId === "string") &&
+        isWordDocumentBlock(operation.block)
+      );
+    case "delete-block":
+      return typeof operation.blockId === "string";
+    case "move-block":
+      return (
+        typeof operation.blockId === "string" &&
+        (operation.afterBlockId === undefined ||
+          typeof operation.afterBlockId === "string")
+      );
+    case "replace-selection":
+      return (
+        typeof operation.blockId === "string" &&
+        typeof operation.startOffset === "number" &&
+        typeof operation.endOffset === "number" &&
+        typeof operation.replacementText === "string"
+      );
+    default:
+      return false;
+  }
+}
+
 async function validateProjectRoot(rootPath: string): Promise<string> {
   if (rootPath.length === 0) {
     throw new HistoryServiceError("Project root is required.", "invalid-root");
@@ -1052,6 +1745,27 @@ async function writeProjectFile(
   const targetPath = await resolveWritableProjectPath(root, projectPath);
 
   await writeFile(targetPath, contents, "utf8");
+}
+
+async function writeProjectFileBytes(
+  projectRoot: string,
+  projectPath: string,
+  contents: Uint8Array
+): Promise<void> {
+  const root = await validateProjectRoot(projectRoot);
+  const targetPath = await resolveWritableProjectPath(root, projectPath);
+
+  await writeFile(targetPath, contents);
+}
+
+async function hashProjectFile(
+  projectRoot: string,
+  projectPath: string
+): Promise<string> {
+  const root = await validateProjectRoot(projectRoot);
+  const bytes = await readFile(await resolveExistingProjectPath(root, projectPath));
+
+  return hashBytes(bytes);
 }
 
 async function resolveExistingProjectPath(
@@ -1124,6 +1838,10 @@ function isInsideRoot(rootPath: string, absolutePath: string): boolean {
 }
 
 function hashContents(contents: string): string {
+  return createHash("sha256").update(contents).digest("hex");
+}
+
+function hashBytes(contents: Uint8Array): string {
   return createHash("sha256").update(contents).digest("hex");
 }
 

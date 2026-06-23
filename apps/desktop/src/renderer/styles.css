@@ -1416,11 +1416,71 @@ input {
   z-index: 1;
 }
 
+.agent-composer.drag-active {
+  background: #f3fbfa;
+  box-shadow: inset 0 0 0 2px rgba(47, 111, 115, 0.28);
+}
+
+.agent-attachments {
+  display: grid;
+  gap: 6px;
+}
+
+.agent-attachment {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 5px 6px;
+  border: 1px solid #d7e3e5;
+  border-radius: 8px;
+  background: #f8fbfb;
+}
+
+.agent-attachment img {
+  width: 42px;
+  height: 38px;
+  object-fit: cover;
+  border: 1px solid #d7e3e5;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.agent-attachment div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.agent-attachment strong,
+.agent-attachment span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-attachment strong {
+  color: #213032;
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.agent-attachment span {
+  color: #65747b;
+  font-size: 12px;
+}
+
+.agent-prompt-field {
+  position: relative;
+  display: grid;
+}
+
 .agent-composer textarea {
   height: auto;
   min-height: 78px;
   max-height: 180px;
-  padding: 10px 12px;
+  padding: 10px 12px 44px;
   overflow-y: auto;
   resize: none;
   border-color: #b8cdd0;
@@ -1439,6 +1499,26 @@ input {
     0 0 0 3px rgba(47, 111, 115, 0.11),
     inset 0 0 0 1px rgba(47, 111, 115, 0.08);
   outline: none;
+}
+
+.agent-prompt-attach {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  display: flex;
+}
+
+.agent-prompt-attach .icon-button {
+  width: 28px;
+  height: 28px;
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 1px 4px rgba(27, 43, 44, 0.12);
+}
+
+.agent-prompt-attach .icon-button:hover:not(:disabled) {
+  border-color: #b8cdd0;
+  background: #f8fbfb;
 }
 
 .agent-composer-actions,
@@ -2434,6 +2514,16 @@ input {
   white-space: nowrap;
 }
 
+.history-list-label {
+  margin-top: 4px;
+  padding: 4px 8px 2px;
+  color: #65747b;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
 .audit-event {
   display: grid;
   gap: 3px;
@@ -2579,6 +2669,64 @@ input {
 .diff-hunk-header span {
   color: #65747b;
   font-size: 12px;
+}
+
+.word-change-list {
+  display: grid;
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.word-change {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid #e1e6ea;
+  border-left: 3px solid #2f6f73;
+  border-radius: 6px;
+  background: #fbfcfd;
+}
+
+.word-change__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.word-change__header strong {
+  color: #263940;
+  font-size: 12px;
+}
+
+.word-change__header span {
+  color: #65747b;
+  font-size: 12px;
+}
+
+.word-change__body {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.word-change__body div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #e1e6ea;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.word-change__body p {
+  margin: 0;
+  color: #263940;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .log-output {
@@ -3064,6 +3212,84 @@ input {
   font-family: inherit;
   font-size: 11px;
   text-align: center;
+}
+
+.word-editor {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+  background: #f6f8f9;
+}
+
+.word-editor__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #dde5e8;
+  background: #ffffff;
+}
+
+.word-editor__header h3 {
+  max-width: 46vw;
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: #263940;
+  font-size: 14px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.word-editor__warnings {
+  display: grid;
+  gap: 4px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #ead8a6;
+  background: #fff8e6;
+  color: #715a13;
+  font-size: 12px;
+}
+
+.word-editor__warnings p {
+  margin: 0;
+}
+
+.word-editor__page {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  width: min(100%, 820px);
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 28px 44px 56px;
+  overflow: auto;
+  background: #ffffff;
+  box-shadow:
+    inset 1px 0 0 #e4eaed,
+    inset -1px 0 0 #e4eaed;
+}
+
+.word-editor__paragraph {
+  width: 100%;
+  min-height: 64px;
+  padding: 8px 0;
+  resize: vertical;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  outline: none;
+  background: transparent;
+  color: #17262c;
+  font:
+    15px/1.65 Georgia,
+    "Times New Roman",
+    serif;
+}
+
+.word-editor__paragraph:focus {
+  border-bottom-color: #8bb5c7;
 }
 
 .sr-only {

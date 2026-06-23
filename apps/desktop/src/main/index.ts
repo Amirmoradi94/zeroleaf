@@ -23,6 +23,12 @@ import {
   stopLatexBuild
 } from "@latex-agent/latex-service";
 import {
+  applyWordChangeSet,
+  createWordChangeSet,
+  readWordDocument,
+  saveWordDocument
+} from "@latex-agent/document-service";
+import {
   AgentHostClient,
   getAgentToolRisk,
   isAgentToolAllowed,
@@ -146,7 +152,12 @@ function normalizeWorkbenchLayout(value: unknown): WorkbenchLayout {
 }
 
 const compilerIds = ["pdflatex", "xelatex", "lualatex"] as const;
-const agentProviderIds = ["mock", "openai-codex", "anthropic-claude"] as const;
+const agentProviderIds = [
+  "mock",
+  "openai-codex",
+  "anthropic-claude",
+  "openrouter-design"
+] as const;
 const agentModes = ["suggest", "apply-with-review", "autonomous-local"] as const;
 const externalProjectTemplates = {
   "ieee-systems-journal": {
@@ -1279,6 +1290,65 @@ function registerIpcHandlers() {
     writeProjectFile(request.projectRoot, request.path, request.contents)
   );
 
+  handleIpc(ipcChannels.wordRead, (_event, request) =>
+    readWordDocument(request.projectRoot, request.path)
+  );
+
+  handleIpc(ipcChannels.wordSave, (_event, request) =>
+    saveWordDocument(request.projectRoot, request.path, request.blocks)
+  );
+
+  handleIpc(ipcChannels.wordCreateChangeSet, async (_event, request) => {
+    const changeset = await createWordChangeSet({
+      projectRoot: request.projectRoot,
+      filePath: request.filePath,
+      baseBlocks: request.baseBlocks,
+      operations: request.operations,
+      summary: request.summary
+    });
+    const history = getHistoryStore();
+    try {
+      return await history.createWordChangeSet(changeset);
+    } finally {
+      history.close();
+    }
+  });
+
+  handleIpc(ipcChannels.wordApplyChangeSet, async (_event, request) => {
+    const history = getHistoryStore();
+    try {
+      const persistedChangeSet = await history.createWordChangeSet(request.changeset);
+      const beforeSnapshot = await history.createWordDocumentSnapshot(
+        persistedChangeSet.projectRoot,
+        persistedChangeSet.filePath
+      );
+      const result = await applyWordChangeSet(persistedChangeSet);
+      const appliedChangeSet = await history.markWordChangeSetApplied(
+        result.changeset,
+        beforeSnapshot.id
+      );
+      return {
+        ...result,
+        changeset: appliedChangeSet
+      };
+    } finally {
+      history.close();
+    }
+  });
+
+  handleIpc(ipcChannels.wordRollbackChangeSet, async (_event, request) => {
+    const history = getHistoryStore();
+    try {
+      const changeset = await history.rollbackWordChangeSet(request.changesetId);
+      return {
+        changeset,
+        document: await readWordDocument(changeset.projectRoot, changeset.filePath)
+      };
+    } finally {
+      history.close();
+    }
+  });
+
   handleIpc(ipcChannels.buildDetectToolchain, () => detectLatexToolchain());
 
   handleIpc(ipcChannels.buildRun, (_event, request) => runLatexBuild(request));
@@ -1371,6 +1441,42 @@ function registerIpcHandlers() {
     const history = getHistoryStore();
     try {
       return await history.rollbackChangeSet(request.changesetId);
+    } finally {
+      history.close();
+    }
+  });
+
+  handleIpc(ipcChannels.historyListWordChangeSets, async (_event, request) => {
+    const history = getHistoryStore();
+    try {
+      return await history.listWordChangeSets(request.projectRoot);
+    } finally {
+      history.close();
+    }
+  });
+
+  handleIpc(ipcChannels.historyCreateWordChangeSet, async (_event, request) => {
+    const history = getHistoryStore();
+    try {
+      return await history.createWordChangeSet(request.changeset);
+    } finally {
+      history.close();
+    }
+  });
+
+  handleIpc(ipcChannels.historyMarkWordChangeSetApplied, async (_event, request) => {
+    const history = getHistoryStore();
+    try {
+      return await history.markWordChangeSetApplied(request.changeset);
+    } finally {
+      history.close();
+    }
+  });
+
+  handleIpc(ipcChannels.historyRejectWordChangeSet, (_event, request) => {
+    const history = getHistoryStore();
+    try {
+      return history.rejectWordChangeSet(request.changesetId);
     } finally {
       history.close();
     }
@@ -1574,11 +1680,7 @@ function registerIpcHandlers() {
   });
 
   handleIpc(ipcChannels.agentGetAuthStatus, async (_event, request) => {
-    if (
-      request.providerId !== "mock" &&
-      request.providerId !== "openai-codex" &&
-      request.providerId !== "anthropic-claude"
-    ) {
+    if (!isKnownAgentProviderId(request.providerId)) {
       throw new Error("Unknown agent provider.");
     }
 
@@ -1609,11 +1711,7 @@ function registerIpcHandlers() {
   });
 
   handleIpc(ipcChannels.agentStart, async (_event, request) => {
-    if (
-      request.providerId !== "mock" &&
-      request.providerId !== "openai-codex" &&
-      request.providerId !== "anthropic-claude"
-    ) {
+    if (!isKnownAgentProviderId(request.providerId)) {
       throw new Error("Unknown agent provider.");
     }
 
@@ -1810,7 +1908,7 @@ async function searchProjectFiles(projectRoot: string, query: string) {
 }
 
 function getProviderSetupCommand(
-  providerId: Exclude<AgentProviderId, "mock">,
+  providerId: Exclude<AgentProviderId, "mock" | "openrouter-design">,
   action: AgentProviderSetupAction,
   platform: NodeJS.Platform
 ): string {
@@ -1827,6 +1925,10 @@ function getProviderSetupCommand(
   return platform === "win32"
     ? "irm https://claude.ai/install.ps1 | iex"
     : "curl -fsSL https://claude.ai/install.sh | bash";
+}
+
+function isKnownAgentProviderId(providerId: AgentProviderId): boolean {
+  return agentProviderIds.includes(providerId);
 }
 
 async function openSetupTerminal(

@@ -4,6 +4,7 @@
     { "path": "apps/desktop" },
     { "path": "packages/core-domain" },
     { "path": "packages/ipc-contracts" },
+    { "path": "packages/document-service" },
     { "path": "packages/project-service" },
     { "path": "packages/latex-service" },
     { "path": "packages/pdf-service" },

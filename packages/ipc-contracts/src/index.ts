@@ -19,6 +19,11 @@ export const ipcChannels = {
   projectChanged: "project.changed",
   fileRead: "file.read",
   fileWrite: "file.write",
+  wordRead: "word.read",
+  wordSave: "word.save",
+  wordCreateChangeSet: "word.createChangeSet",
+  wordApplyChangeSet: "word.applyChangeSet",
+  wordRollbackChangeSet: "word.rollbackChangeSet",
   buildDetectToolchain: "build.detectToolchain",
   buildRun: "build.run",
   buildStop: "build.stop",
@@ -34,6 +39,10 @@ export const ipcChannels = {
   historyApplyChangeSetHunks: "history.applyChangeSetHunks",
   historyRejectChangeSet: "history.rejectChangeSet",
   historyRollbackChangeSet: "history.rollbackChangeSet",
+  historyListWordChangeSets: "history.listWordChangeSets",
+  historyCreateWordChangeSet: "history.createWordChangeSet",
+  historyMarkWordChangeSetApplied: "history.markWordChangeSetApplied",
+  historyRejectWordChangeSet: "history.rejectWordChangeSet",
   historyListAuditEvents: "history.listAuditEvents",
   referencesAnalyze: "references.analyze",
   referencesSearch: "references.search",
@@ -153,6 +162,100 @@ export type ProjectFileSnapshot = {
   readonly contents: string;
   readonly mtimeMs: number;
 };
+
+export type WordDocumentBlockKind = "paragraph";
+
+export type WordDocumentBlock = {
+  readonly id: string;
+  readonly kind: WordDocumentBlockKind;
+  readonly text: string;
+};
+
+export type WordDocumentModel = {
+  readonly kind: "word";
+  readonly path: string;
+  readonly blocks: readonly WordDocumentBlock[];
+  readonly plainText: string;
+  readonly mtimeMs: number;
+  readonly extractedAt: string;
+  readonly warnings: readonly string[];
+};
+
+export type WordDocumentSaveResult = {
+  readonly saved: true;
+  readonly path: string;
+  readonly mtimeMs: number;
+};
+
+export type WordBlockOperation =
+  | {
+      readonly type: "replace-block";
+      readonly blockId: string;
+      readonly afterText: string;
+    }
+  | {
+      readonly type: "insert-block-after";
+      readonly afterBlockId?: string;
+      readonly block: WordDocumentBlock;
+    }
+  | {
+      readonly type: "delete-block";
+      readonly blockId: string;
+    }
+  | {
+      readonly type: "move-block";
+      readonly blockId: string;
+      readonly afterBlockId?: string;
+    }
+  | {
+      readonly type: "replace-selection";
+      readonly blockId: string;
+      readonly startOffset: number;
+      readonly endOffset: number;
+      readonly replacementText: string;
+    };
+
+export type WordChangeSetStatus =
+  | "proposed"
+  | "applied"
+  | "rejected"
+  | "reverted"
+  | "failed";
+
+export type WordChangeSet = {
+  readonly id: string;
+  readonly projectRoot: string;
+  readonly filePath: string;
+  readonly summary: string;
+  readonly baseBlocks: readonly WordDocumentBlock[];
+  readonly operations: readonly WordBlockOperation[];
+  readonly status: WordChangeSetStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly appliedAt?: string;
+  readonly revertedAt?: string;
+  readonly beforeSnapshotId?: string;
+  readonly appliedContentHash?: string;
+};
+
+export type WordChangeSetApplyResult = {
+  readonly changeset: WordChangeSet;
+  readonly document: WordDocumentModel;
+};
+
+export type AgentActiveDocument =
+  | {
+      readonly kind: "text";
+      readonly path: string;
+      readonly contents: string;
+    }
+  | {
+      readonly kind: "word";
+      readonly path: string;
+      readonly plainText: string;
+      readonly blocks: readonly WordDocumentBlock[];
+      readonly warnings: readonly string[];
+    };
 
 export type ProjectChangeEvent = {
   readonly projectRoot: string;
@@ -403,7 +506,11 @@ export type SubmissionCheckResult = {
   readonly items: readonly SubmissionCheckItem[];
 };
 
-export type AgentProviderId = "mock" | "openai-codex" | "anthropic-claude";
+export type AgentProviderId =
+  | "mock"
+  | "openai-codex"
+  | "anthropic-claude"
+  | "openrouter-design";
 
 export type AgentMode =
   | "read-only"
@@ -526,6 +633,14 @@ export type AgentNetworkFetchResult =
       readonly fetchedAt: string;
     };
 
+export type AgentImageAttachment = {
+  readonly id: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly byteLength: number;
+  readonly dataUrl: string;
+};
+
 export type AgentStartRequest = {
   readonly providerId: AgentProviderId;
   readonly mode: AgentMode;
@@ -537,6 +652,8 @@ export type AgentStartRequest = {
   readonly activeFilePath?: string;
   readonly selectedText?: string;
   readonly selectionContext?: AgentSelectionContext;
+  readonly activeDocument?: AgentActiveDocument;
+  readonly imageAttachments?: readonly AgentImageAttachment[];
   readonly mainFilePath?: string;
   readonly compiler?: LatexCompiler;
   readonly diagnostic?: LatexDiagnostic;
@@ -560,8 +677,11 @@ export type AgentSessionResult = {
   readonly providerId: AgentProviderId;
   readonly status: AgentSessionStatus;
   readonly events: readonly AgentEvent[];
+  readonly designWorkflow?: unknown;
   readonly changeset?: HistoryChangeSet;
   readonly changesets?: readonly HistoryChangeSet[];
+  readonly wordChangeset?: WordChangeSet;
+  readonly wordChangesets?: readonly WordChangeSet[];
   readonly deleteEntries?: readonly AgentDeleteEntryOperation[];
   readonly moveEntries?: readonly AgentMoveEntryOperation[];
   readonly buildResult?: BuildResult;
@@ -583,6 +703,7 @@ export function createReadOnlyAgentExplanation(
   const target = request.diagnostic?.filePath ?? snapshot.path;
   const location = formatDiagnosticLocation(request.diagnostic);
   const selection = formatAgentSelectionContextForPrompt(request);
+  const imageAttachments = formatAgentImageAttachmentsForPrompt(request);
   const lines = [
     ...(selection === undefined
       ? []
@@ -590,6 +711,7 @@ export function createReadOnlyAgentExplanation(
           "I am limiting this answer to the selected LaTeX and the explicitly attached project context.",
           selection
         ]),
+    imageAttachments,
     request.diagnostic === undefined
       ? `For ${target}, I would treat this as an explanation-only review of the selected project context.`
       : `The attached LaTeX ${request.diagnostic.severity}${location} says: "${request.diagnostic.message}"`,
@@ -651,6 +773,30 @@ export function formatAgentSelectionContextForPrompt(
     "",
     `Selection offsets in paragraph: ${request.selectionContext.selectionStartOffset}-${request.selectionContext.selectionEndOffset}`
   ].join("\n");
+}
+
+export function formatAgentImageAttachmentsForPrompt(
+  request: Pick<AgentStartRequest, "imageAttachments">
+): string {
+  const attachments = request.imageAttachments ?? [];
+
+  if (attachments.length === 0) {
+    return "";
+  }
+
+  return [
+    `User attached ${attachments.length} image${attachments.length === 1 ? "" : "s"} to this request.`,
+    "Use these images only for the user's requested task. If the provider cannot inspect data URLs directly, say that limitation plainly and use the image metadata only.",
+    ...attachments.map((attachment, index) =>
+      [
+        `Image ${index + 1}: ${attachment.name}`,
+        `MIME type: ${attachment.mimeType}`,
+        `Bytes: ${attachment.byteLength}`,
+        "Data URL:",
+        attachment.dataUrl
+      ].join("\n")
+    )
+  ].join("\n\n");
 }
 
 function explainSelectedLatex(selectedText: string): string {
@@ -1977,7 +2123,7 @@ export type PrivacyPreferences = {
 
 export type CredentialStorageStatus = {
   readonly providerId: AgentProviderId;
-  readonly storage: "external-cli-login" | "none";
+  readonly storage: "external-cli-login" | "environment-variable" | "none";
   readonly storesSecretInApp: boolean;
   readonly message: string;
 };
@@ -2044,6 +2190,13 @@ export const defaultAppSettings: AppSettings = {
       storage: "external-cli-login",
       storesSecretInApp: false,
       message: "Uses the installed Claude Code CLI login on this computer."
+    },
+    {
+      providerId: "openrouter-design",
+      storage: "environment-variable",
+      storesSecretInApp: false,
+      message:
+        "Uses OPENROUTER_API_KEY from the agent host environment for structured website design workflows."
     }
   ]
 };
@@ -2105,6 +2258,28 @@ export type IpcRequestMap = {
     readonly path: string;
     readonly contents: string;
   };
+  readonly [ipcChannels.wordRead]: {
+    readonly projectRoot: string;
+    readonly path: string;
+  };
+  readonly [ipcChannels.wordSave]: {
+    readonly projectRoot: string;
+    readonly path: string;
+    readonly blocks: readonly WordDocumentBlock[];
+  };
+  readonly [ipcChannels.wordCreateChangeSet]: {
+    readonly projectRoot: string;
+    readonly filePath: string;
+    readonly baseBlocks: readonly WordDocumentBlock[];
+    readonly operations: readonly WordBlockOperation[];
+    readonly summary: string;
+  };
+  readonly [ipcChannels.wordApplyChangeSet]: {
+    readonly changeset: WordChangeSet;
+  };
+  readonly [ipcChannels.wordRollbackChangeSet]: {
+    readonly changesetId: string;
+  };
   readonly [ipcChannels.buildDetectToolchain]: undefined;
   readonly [ipcChannels.buildRun]: BuildRunRequest;
   readonly [ipcChannels.buildStop]: { readonly jobId: string };
@@ -2142,6 +2317,14 @@ export type IpcRequestMap = {
   };
   readonly [ipcChannels.historyRejectChangeSet]: { readonly changesetId: string };
   readonly [ipcChannels.historyRollbackChangeSet]: { readonly changesetId: string };
+  readonly [ipcChannels.historyListWordChangeSets]: { readonly projectRoot: string };
+  readonly [ipcChannels.historyCreateWordChangeSet]: {
+    readonly changeset: WordChangeSet;
+  };
+  readonly [ipcChannels.historyMarkWordChangeSetApplied]: {
+    readonly changeset: WordChangeSet;
+  };
+  readonly [ipcChannels.historyRejectWordChangeSet]: { readonly changesetId: string };
   readonly [ipcChannels.historyListAuditEvents]: { readonly projectRoot: string };
   readonly [ipcChannels.referencesAnalyze]: { readonly projectRoot: string };
   readonly [ipcChannels.referencesSearch]: {
@@ -2214,6 +2397,11 @@ export type IpcResponseMap = {
     readonly saved: true;
     readonly mtimeMs: number;
   };
+  readonly [ipcChannels.wordRead]: WordDocumentModel;
+  readonly [ipcChannels.wordSave]: WordDocumentSaveResult;
+  readonly [ipcChannels.wordCreateChangeSet]: WordChangeSet;
+  readonly [ipcChannels.wordApplyChangeSet]: WordChangeSetApplyResult;
+  readonly [ipcChannels.wordRollbackChangeSet]: WordChangeSetApplyResult;
   readonly [ipcChannels.buildDetectToolchain]: LatexToolchainStatus;
   readonly [ipcChannels.buildRun]: BuildResult;
   readonly [ipcChannels.buildStop]: { readonly stopped: boolean };
@@ -2229,6 +2417,10 @@ export type IpcResponseMap = {
   readonly [ipcChannels.historyApplyChangeSetHunks]: HistoryChangeSet;
   readonly [ipcChannels.historyRejectChangeSet]: HistoryChangeSet;
   readonly [ipcChannels.historyRollbackChangeSet]: HistoryChangeSet;
+  readonly [ipcChannels.historyListWordChangeSets]: readonly WordChangeSet[];
+  readonly [ipcChannels.historyCreateWordChangeSet]: WordChangeSet;
+  readonly [ipcChannels.historyMarkWordChangeSetApplied]: WordChangeSet;
+  readonly [ipcChannels.historyRejectWordChangeSet]: WordChangeSet;
   readonly [ipcChannels.historyListAuditEvents]: readonly AuditEvent[];
   readonly [ipcChannels.referencesAnalyze]: ReferenceAnalysis;
   readonly [ipcChannels.referencesSearch]: readonly ReferenceSearchResult[];
@@ -2311,6 +2503,23 @@ export type DesktopApi = {
       request: IpcRequestMap[typeof ipcChannels.fileWrite]
     ) => Promise<IpcResponseMap[typeof ipcChannels.fileWrite]>;
   };
+  readonly word: {
+    readonly read: (
+      request: IpcRequestMap[typeof ipcChannels.wordRead]
+    ) => Promise<WordDocumentModel>;
+    readonly save: (
+      request: IpcRequestMap[typeof ipcChannels.wordSave]
+    ) => Promise<WordDocumentSaveResult>;
+    readonly createChangeSet: (
+      request: IpcRequestMap[typeof ipcChannels.wordCreateChangeSet]
+    ) => Promise<WordChangeSet>;
+    readonly applyChangeSet: (
+      request: IpcRequestMap[typeof ipcChannels.wordApplyChangeSet]
+    ) => Promise<WordChangeSetApplyResult>;
+    readonly rollbackChangeSet: (
+      request: IpcRequestMap[typeof ipcChannels.wordRollbackChangeSet]
+    ) => Promise<WordChangeSetApplyResult>;
+  };
   readonly build: {
     readonly detectToolchain: () => Promise<LatexToolchainStatus>;
     readonly run: (request: BuildRunRequest) => Promise<BuildResult>;
@@ -2347,6 +2556,16 @@ export type DesktopApi = {
     ) => Promise<HistoryChangeSet>;
     readonly rejectChangeSet: (changesetId: string) => Promise<HistoryChangeSet>;
     readonly rollbackChangeSet: (changesetId: string) => Promise<HistoryChangeSet>;
+    readonly listWordChangeSets: (
+      request: IpcRequestMap[typeof ipcChannels.historyListWordChangeSets]
+    ) => Promise<readonly WordChangeSet[]>;
+    readonly createWordChangeSet: (
+      request: IpcRequestMap[typeof ipcChannels.historyCreateWordChangeSet]
+    ) => Promise<WordChangeSet>;
+    readonly markWordChangeSetApplied: (
+      request: IpcRequestMap[typeof ipcChannels.historyMarkWordChangeSetApplied]
+    ) => Promise<WordChangeSet>;
+    readonly rejectWordChangeSet: (changesetId: string) => Promise<WordChangeSet>;
     readonly listAuditEvents: (
       request: IpcRequestMap[typeof ipcChannels.historyListAuditEvents]
     ) => Promise<readonly AuditEvent[]>;

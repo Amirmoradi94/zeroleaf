@@ -4,7 +4,10 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { formatAgentSelectionContextForPrompt } from "@latex-agent/ipc-contracts";
+import {
+  formatAgentImageAttachmentsForPrompt,
+  formatAgentSelectionContextForPrompt
+} from "@latex-agent/ipc-contracts";
 import type {
   AgentAuthStatus,
   AgentEvent,
@@ -15,7 +18,9 @@ import type {
   AgentToolName,
   AgentToolRisk,
   HistoryChangeSet,
-  ProjectFileSnapshot
+  ProjectFileSnapshot,
+  WordBlockOperation,
+  WordChangeSet
 } from "@latex-agent/ipc-contracts";
 
 export const anthropicClaudeProviderId = "anthropic-claude" as const;
@@ -44,11 +49,18 @@ export type ClaudeCodeRequest = {
   readonly timeoutMs: number;
 };
 
+export type ClaudeAgentWordChangeSet = {
+  readonly filePath: string;
+  readonly summary: string;
+  readonly operations: readonly WordBlockOperation[];
+};
+
 export type ClaudeAgentResponse = {
-  readonly action: "answer" | "patch";
+  readonly action: "answer" | "patch" | "word-edit";
   readonly targetFilePath: string;
   readonly summary: string;
   readonly afterContents: string;
+  readonly wordChangesets?: readonly ClaudeAgentWordChangeSet[];
   readonly message: string;
   readonly notes: string;
 };
@@ -137,11 +149,13 @@ export class ClaudeProvider {
         "I will ask the installed Claude Code CLI to inspect the project and decide whether to answer or propose a reviewable patch."
       )
     ];
+    const activeDocumentSnapshot = createActiveDocumentSnapshot(request);
     const targetPath = request.activeFilePath ?? request.mainFilePath;
     const snapshot =
-      targetPath === undefined
+      activeDocumentSnapshot ??
+      (targetPath === undefined
         ? createEmptyProjectSnapshot()
-        : await readInitialSnapshot({ broker, events, sessionId, targetPath });
+        : await readInitialSnapshot({ broker, events, sessionId, targetPath }));
 
     events.push(
       createToolEvent(
@@ -173,6 +187,35 @@ export class ClaudeProvider {
         providerId: this.id,
         status: "cancelled",
         events
+      };
+    }
+
+    const wordChangeSets = createClaudeWordChangeSets(request, claudeResponse);
+    if (wordChangeSets.length > 0) {
+      const wordChangeset = wordChangeSets[0];
+      if (wordChangeset === undefined) {
+        throw new Error("Claude returned an empty Word changeset list.");
+      }
+
+      events.push(
+        ...wordChangeSets.map((changeset) =>
+          createWordChangeSetEvent(sessionId, changeset)
+        ),
+        createMessageEvent(
+          sessionId,
+          "assistant",
+          claudeResponse.message ||
+            `Claude proposed ${wordChangeSets.length} Word edit${wordChangeSets.length === 1 ? "" : "s"}.`
+        )
+      );
+
+      return {
+        sessionId,
+        providerId: this.id,
+        status: "completed",
+        events,
+        wordChangeset,
+        wordChangesets: wordChangeSets
       };
     }
 
@@ -467,10 +510,13 @@ export function parseClaudeAgentResponse(value: unknown): ClaudeAgentResponse {
   const candidate = parsed as Partial<ClaudeAgentResponse>;
 
   if (
-    (candidate.action !== "answer" && candidate.action !== "patch") ||
+    (candidate.action !== "answer" &&
+      candidate.action !== "patch" &&
+      candidate.action !== "word-edit") ||
     typeof candidate.targetFilePath !== "string" ||
     typeof candidate.summary !== "string" ||
     typeof candidate.afterContents !== "string" ||
+    !isValidClaudeAgentWordChangeSets(candidate.wordChangesets) ||
     typeof candidate.message !== "string" ||
     typeof candidate.notes !== "string"
   ) {
@@ -482,9 +528,81 @@ export function parseClaudeAgentResponse(value: unknown): ClaudeAgentResponse {
     targetFilePath: candidate.targetFilePath,
     summary: candidate.summary,
     afterContents: candidate.afterContents,
+    ...(candidate.wordChangesets === undefined
+      ? {}
+      : { wordChangesets: candidate.wordChangesets }),
     message: candidate.message,
     notes: candidate.notes
   };
+}
+
+function isValidClaudeAgentWordChangeSets(
+  value: Partial<ClaudeAgentResponse>["wordChangesets"]
+): value is readonly ClaudeAgentWordChangeSet[] | undefined {
+  return (
+    value === undefined ||
+    (Array.isArray(value) &&
+      value.every(
+        (changeset) =>
+          changeset !== null &&
+          typeof changeset === "object" &&
+          typeof (changeset as Partial<ClaudeAgentWordChangeSet>).filePath ===
+            "string" &&
+          typeof (changeset as Partial<ClaudeAgentWordChangeSet>).summary ===
+            "string" &&
+          isValidWordBlockOperations(
+            (changeset as Partial<ClaudeAgentWordChangeSet>).operations
+          )
+      ))
+  );
+}
+
+function isValidWordBlockOperations(
+  value: unknown
+): value is readonly WordBlockOperation[] {
+  return Array.isArray(value) && value.every(isValidWordBlockOperation);
+}
+
+function isValidWordBlockOperation(value: unknown): value is WordBlockOperation {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const operation = value as Partial<WordBlockOperation>;
+
+  switch (operation.type) {
+    case "replace-block":
+      return (
+        typeof operation.blockId === "string" && typeof operation.afterText === "string"
+      );
+    case "insert-block-after":
+      return (
+        (operation.afterBlockId === undefined ||
+          typeof operation.afterBlockId === "string") &&
+        typeof operation.block === "object" &&
+        operation.block !== null &&
+        typeof operation.block.id === "string" &&
+        operation.block.kind === "paragraph" &&
+        typeof operation.block.text === "string"
+      );
+    case "delete-block":
+      return typeof operation.blockId === "string";
+    case "move-block":
+      return (
+        typeof operation.blockId === "string" &&
+        (operation.afterBlockId === undefined ||
+          typeof operation.afterBlockId === "string")
+      );
+    case "replace-selection":
+      return (
+        typeof operation.blockId === "string" &&
+        typeof operation.startOffset === "number" &&
+        typeof operation.endOffset === "number" &&
+        typeof operation.replacementText === "string"
+      );
+    default:
+      return false;
+  }
 }
 
 function isClaudeErrorResult(value: unknown): boolean {
@@ -520,11 +638,18 @@ function createClaudePrompt(
     "You may inspect the project from the current working directory, but do not modify files.",
     "Return only JSON matching the provided schema.",
     'Set action to "answer" when the task is best completed by explanation, summary, review, diagnosis, or guidance.',
+    'Use action "answer" for planning and scholarly-advice tasks such as literature review plans, paper outlines, manuscript critiques, reading plans, methodology suggestions, and submission checklists unless the user explicitly asks you to insert, rewrite, patch, compile, or change project files.',
+    "A user mentioning a PDF, paper, thesis, manuscript, or active document as source context does not by itself require a file edit or patch.",
     'Set action to "patch" only when the task requires a source edit. For patches, produce a minimal full-file replacement for targetFilePath.',
+    "Requests to merge, combine, consolidate, split, reorganize, or restructure sections/subsections are source-edit requests.",
     request.mode === "read-only"
       ? 'The current ZeroLeaf mode is read-only, so action must be "answer". You may describe suggested edits in message, but do not return a patch action.'
       : "ZeroLeaf will convert patch actions into a reviewable local changeset before any file is changed.",
+    "In message, always explain the result in user-facing terms: list the files or sections changed and the purpose of the change. If no source file changed, say why no change was made and do not imply that an edit happened.",
     "Preserve all unrelated text and formatting when returning a patch.",
+    request.activeDocument?.kind === "word"
+      ? 'The active document is a Microsoft Word .docx file represented as extracted paragraphs. Do not return a raw .docx patch. For Word edits, set action "word-edit", afterContents "", and populate wordChangesets with filePath, summary, and operations using operation types "replace-block", "insert-block-after", "delete-block", "move-block", or "replace-selection".'
+      : "",
     snapshot.path === newFileSnapshotPath
       ? 'No active TeX file is open. If the user asks to create a .tex file, return action "patch", choose a clear project-relative targetFilePath ending in .tex, set afterContents to the complete new file contents, and use an empty original file.'
       : "",
@@ -546,12 +671,13 @@ function createClaudePrompt(
     `Target file: ${snapshot.path}`,
     request.mainFilePath === undefined ? "" : `Main file: ${request.mainFilePath}`,
     formatAgentSelectionContextForPrompt(request) ?? "",
+    formatAgentImageAttachmentsForPrompt(request),
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
     "",
     `Original ${snapshot.path}:`,
-    "```tex",
+    request.activeDocument?.kind === "word" ? "```text" : "```tex",
     snapshot.contents,
     "```"
   ]
@@ -567,6 +693,51 @@ function createEmptyProjectSnapshot(): ProjectFileSnapshot {
     contents: "",
     mtimeMs: Date.now()
   };
+}
+
+function createActiveDocumentSnapshot(
+  request: AgentStartRequest
+): ProjectFileSnapshot | undefined {
+  if (request.activeDocument === undefined) {
+    return undefined;
+  }
+
+  return {
+    path: request.activeDocument.path,
+    contents:
+      request.activeDocument.kind === "word"
+        ? request.activeDocument.plainText
+        : request.activeDocument.contents,
+    mtimeMs: Date.now()
+  };
+}
+
+function createClaudeWordChangeSets(
+  request: AgentStartRequest,
+  response: ClaudeAgentResponse
+): readonly WordChangeSet[] {
+  const activeDocument = request.activeDocument;
+
+  if (activeDocument?.kind !== "word") {
+    return [];
+  }
+
+  const requestedChangeSets = response.wordChangesets ?? [];
+
+  return requestedChangeSets.map((changeset) => {
+    const now = new Date().toISOString();
+    return {
+      id: randomUUID(),
+      projectRoot: request.projectRoot,
+      filePath: changeset.filePath || activeDocument.path,
+      summary: normalizeSummary(changeset.summary || response.summary),
+      baseBlocks: activeDocument.blocks,
+      operations: changeset.operations,
+      status: "proposed",
+      createdAt: now,
+      updatedAt: now
+    };
+  });
 }
 
 async function readInitialSnapshot({
@@ -638,10 +809,57 @@ const claudeOutputSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    action: { enum: ["answer", "patch"] },
+    action: { enum: ["answer", "patch", "word-edit"] },
     targetFilePath: { type: "string" },
     summary: { type: "string" },
     afterContents: { type: "string" },
+    wordChangesets: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          filePath: { type: "string" },
+          summary: { type: "string" },
+          operations: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                type: {
+                  enum: [
+                    "replace-block",
+                    "insert-block-after",
+                    "delete-block",
+                    "move-block",
+                    "replace-selection"
+                  ]
+                },
+                blockId: { type: "string" },
+                afterText: { type: "string" },
+                afterBlockId: { type: "string" },
+                block: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    id: { type: "string" },
+                    kind: { enum: ["paragraph"] },
+                    text: { type: "string" }
+                  },
+                  required: ["id", "kind", "text"]
+                },
+                startOffset: { type: "number" },
+                endOffset: { type: "number" },
+                replacementText: { type: "string" }
+              },
+              required: ["type"]
+            }
+          }
+        },
+        required: ["filePath", "summary", "operations"]
+      }
+    },
     message: { type: "string" },
     notes: { type: "string" }
   },
@@ -689,6 +907,22 @@ function createToolEvent(
 }
 
 function createPatchEvent(sessionId: string, changeset: HistoryChangeSet): AgentEvent {
+  return {
+    id: randomUUID(),
+    sessionId,
+    createdAt: new Date().toISOString(),
+    type: "patch",
+    changesetId: changeset.id,
+    filePath: changeset.filePath,
+    summary: changeset.summary,
+    status: changeset.status
+  };
+}
+
+function createWordChangeSetEvent(
+  sessionId: string,
+  changeset: WordChangeSet
+): AgentEvent {
   return {
     id: randomUUID(),
     sessionId,

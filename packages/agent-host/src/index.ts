@@ -20,7 +20,8 @@ import type {
   HistoryChangeSet,
   PdfPreviewCaptureResult,
   LatexCompiler,
-  ProjectFileSnapshot
+  ProjectFileSnapshot,
+  WordChangeSet
 } from "@latex-agent/ipc-contracts";
 
 export type AgentProvider = {
@@ -468,16 +469,18 @@ export class MockAgentProvider implements AgentProvider {
           : "I will inspect the scoped project context and prepare a reviewable patch."
       )
     ];
+    const activeDocumentSnapshot = createActiveDocumentSnapshot(request);
     const targetPath = request.activeFilePath ?? request.mainFilePath;
     const snapshot =
-      targetPath === undefined
+      activeDocumentSnapshot ??
+      (targetPath === undefined
         ? createEmptyProjectSnapshot()
         : await readInitialSnapshot({
             broker,
             events,
             sessionId,
             targetPath
-          });
+          }));
 
     if (request.mode === "read-only") {
       events.push(
@@ -594,6 +597,53 @@ export class MockAgentProvider implements AgentProvider {
         baseEvents: events,
         isCancelled: () => this.cancelledSessionIds.has(sessionId)
       });
+    }
+
+    if (request.activeDocument?.kind === "word") {
+      const wordChangeSet = createMockWordChangeSet(request);
+
+      if (wordChangeSet !== undefined) {
+        events.push(
+          createMessageEvent(
+            sessionId,
+            "assistant",
+            `I prepared a reviewable Word edit for ${wordChangeSet.filePath}.`
+          ),
+          {
+            id: `${sessionId}-word-changeset-${wordChangeSet.id}`,
+            sessionId,
+            createdAt: new Date().toISOString(),
+            type: "patch",
+            changesetId: wordChangeSet.id,
+            filePath: wordChangeSet.filePath,
+            summary: wordChangeSet.summary,
+            status: wordChangeSet.status
+          }
+        );
+
+        return {
+          sessionId,
+          providerId: this.id,
+          status: "completed",
+          events,
+          wordChangeset: wordChangeSet,
+          wordChangesets: [wordChangeSet]
+        };
+      }
+
+      events.push(
+        createMessageEvent(
+          sessionId,
+          "assistant",
+          "I can read the active Word document context now, but reviewable Word edits need the Word-block changeset path. For this document, I would propose paragraph-level edits rather than writing a raw .docx patch."
+        )
+      );
+      return {
+        sessionId,
+        providerId: this.id,
+        status: "completed",
+        events
+      };
     }
 
     const preflightMessage = await createMockPreflightMessage({
@@ -3422,6 +3472,81 @@ function createEmptyProjectSnapshot(): ProjectFileSnapshot {
     contents: "",
     mtimeMs: Date.now()
   };
+}
+
+function createActiveDocumentSnapshot(
+  request: AgentStartRequest
+): ProjectFileSnapshot | undefined {
+  if (request.activeDocument === undefined) {
+    return undefined;
+  }
+
+  return {
+    path: request.activeDocument.path,
+    contents:
+      request.activeDocument.kind === "word"
+        ? request.activeDocument.plainText
+        : request.activeDocument.contents,
+    mtimeMs: Date.now()
+  };
+}
+
+function createMockWordChangeSet(
+  request: AgentStartRequest
+): WordChangeSet | undefined {
+  if (request.activeDocument?.kind !== "word") {
+    return undefined;
+  }
+
+  const targetBlock = request.activeDocument.blocks.find(
+    (block) => block.text.trim().length > 0
+  );
+
+  if (targetBlock === undefined) {
+    return undefined;
+  }
+
+  const afterText = createMockWordRevision(targetBlock.text, request.prompt);
+  if (afterText === targetBlock.text) {
+    return undefined;
+  }
+
+  const now = new Date().toISOString();
+  return {
+    id: randomUUID(),
+    projectRoot: request.projectRoot,
+    filePath: request.activeDocument.path,
+    summary: `Review Word edit: ${request.activeDocument.path}`,
+    baseBlocks: request.activeDocument.blocks,
+    operations: [
+      {
+        type: "replace-block",
+        blockId: targetBlock.id,
+        afterText
+      }
+    ],
+    status: "proposed",
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function createMockWordRevision(text: string, prompt: string): string {
+  const normalizedPrompt = prompt.toLowerCase();
+  const trimmedText = text.trim();
+
+  if (/\b(shorten|concise|brief)\b/u.test(normalizedPrompt)) {
+    return trimToWordLimit(
+      trimmedText,
+      Math.max(18, Math.ceil(countWords(trimmedText) * 0.7))
+    );
+  }
+
+  if (/\b(academic|formal|polish|improve|rewrite|edit)\b/u.test(normalizedPrompt)) {
+    return ensureSentence(`Revised for academic clarity: ${trimmedText}`);
+  }
+
+  return trimmedText;
 }
 
 async function readInitialSnapshot({
