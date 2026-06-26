@@ -20,6 +20,7 @@ import {
   sep
 } from "node:path";
 import { tmpdir } from "node:os";
+import { TextDecoder } from "node:util";
 
 export type ProjectTemplateId = "article" | "report" | "thesis" | "beamer" | "cv";
 
@@ -72,10 +73,35 @@ export type CreateProjectFromTemplateRequest = {
   readonly projectName: string;
 };
 
+export type CreateEmptyProjectRequest = {
+  readonly destinationParentPath: string;
+  readonly projectName: string;
+};
+
+export type CollectSharedProjectSourceFilesRequest = {
+  readonly projectRoot: string;
+};
+
+export type SharedProjectSourceFile = {
+  readonly path: string;
+  readonly contents: string;
+  readonly contentEncoding?: "utf8" | "base64";
+};
+
+export type SharedProjectSourceDirectory = {
+  readonly path: string;
+};
+
+export type CollectSharedProjectSourceFilesResult = {
+  readonly files: readonly SharedProjectSourceFile[];
+  readonly directories: readonly SharedProjectSourceDirectory[];
+  readonly skippedFilePaths: readonly string[];
+};
+
 export type CreateProjectFromTemplateResult = {
   readonly projectRoot: string;
   readonly fileCount: number;
-  readonly mainFilePath: string;
+  readonly mainFilePath?: string;
 };
 
 export type SubmissionCheckSeverity = "error" | "warning" | "info";
@@ -169,6 +195,9 @@ const standardDocumentClasses = new Set([
   "proc",
   "slides"
 ]);
+const maxSharedProjectTextFileBytes = 2_000_000;
+const maxSharedProjectBinaryFileBytes = 10_000_000;
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 export async function exportSourceZip(
   request: ExportSourceZipRequest
@@ -179,12 +208,21 @@ export async function exportSourceZip(
     projectRoot,
     request.includeBuildArtifacts === true
   );
-  const zipEntries = await Promise.all(
-    files.map(async (filePath) => ({
+  const directories = await collectProjectDirectories(
+    projectRoot,
+    request.includeBuildArtifacts === true
+  );
+  const zipEntries = await Promise.all([
+    ...directories.map((directory) => ({
+      path: `${directory.path}/`,
+      data: Buffer.alloc(0),
+      directory: true
+    })),
+    ...files.map(async (filePath) => ({
       path: filePath,
       data: await readFile(join(projectRoot, filePath))
     }))
-  );
+  ]);
   const archive = createZipArchive(zipEntries);
 
   await mkdir(dirname(destinationPath), { recursive: true });
@@ -192,7 +230,7 @@ export async function exportSourceZip(
 
   return {
     archivePath: destinationPath,
-    fileCount: zipEntries.length,
+    fileCount: files.length,
     byteLength: archive.byteLength,
     includedBuildArtifacts: request.includeBuildArtifacts === true
   };
@@ -279,6 +317,46 @@ export async function createProjectFromTemplate(
   };
 }
 
+export async function createEmptyProject(
+  request: CreateEmptyProjectRequest
+): Promise<CreateProjectFromTemplateResult> {
+  const destinationParentPath = await validateDirectory(request.destinationParentPath);
+  const projectName = validateProjectName(request.projectName);
+  const projectRoot = resolve(destinationParentPath, projectName);
+
+  assertInsideRoot(destinationParentPath, projectRoot);
+  await createNewProjectRoot(projectRoot);
+
+  return {
+    projectRoot,
+    fileCount: 0
+  };
+}
+
+export async function collectSharedProjectSourceFiles(
+  request: CollectSharedProjectSourceFilesRequest
+): Promise<CollectSharedProjectSourceFilesResult> {
+  const projectRoot = await validateDirectory(request.projectRoot);
+  const filePaths = await collectProjectFiles(projectRoot, false);
+  const directories = await collectProjectDirectories(projectRoot, false);
+  const files: SharedProjectSourceFile[] = [];
+  const skippedFilePaths: string[] = [];
+
+  for (const filePath of filePaths) {
+    const data = await readFile(join(projectRoot, filePath));
+    const file = createSharedProjectSourceFile(filePath, data);
+
+    if (file === undefined) {
+      skippedFilePaths.push(filePath);
+      continue;
+    }
+
+    files.push(file);
+  }
+
+  return { files, directories, skippedFilePaths };
+}
+
 export async function checkSubmissionBundle(
   projectRoot: string,
   mainFilePath?: string
@@ -341,6 +419,36 @@ export async function checkSubmissionBundle(
   };
 }
 
+function createSharedProjectSourceFile(
+  path: string,
+  data: Buffer
+): SharedProjectSourceFile | undefined {
+  const textContents = decodeSharedProjectTextFile(data);
+
+  if (textContents !== undefined) {
+    return { path, contents: textContents };
+  }
+
+  if (data.byteLength > maxSharedProjectBinaryFileBytes) {
+    return undefined;
+  }
+
+  return { path, contents: data.toString("base64"), contentEncoding: "base64" };
+}
+
+function decodeSharedProjectTextFile(data: Buffer): string | undefined {
+  if (data.byteLength > maxSharedProjectTextFileBytes) {
+    return undefined;
+  }
+
+  try {
+    const contents = fatalUtf8Decoder.decode(data);
+    return contents.includes("\u0000") ? undefined : contents;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function createTemporaryExportPath(
   projectRoot: string,
   extension: string
@@ -389,22 +497,61 @@ async function collectProjectFiles(
   return files;
 }
 
+async function collectProjectDirectories(
+  projectRoot: string,
+  includeBuildArtifacts: boolean
+): Promise<readonly SharedProjectSourceDirectory[]> {
+  const directories: SharedProjectSourceDirectory[] = [];
+
+  async function visit(directoryPath: string): Promise<void> {
+    const entries = await readdir(directoryPath, { withFileTypes: true });
+
+    for (const entry of entries.sort((left, right) =>
+      left.name.localeCompare(right.name)
+    )) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      if (!includeBuildArtifacts && ignoredSourceDirectories.has(entry.name)) {
+        continue;
+      }
+
+      const absolutePath = join(directoryPath, entry.name);
+      const projectPath = toProjectPath(projectRoot, absolutePath);
+      directories.push({ path: projectPath });
+      await visit(absolutePath);
+    }
+  }
+
+  await visit(projectRoot);
+  return directories;
+}
+
 function createZipArchive(
-  entries: readonly { readonly path: string; readonly data: Buffer }[]
+  entries: readonly {
+    readonly path: string;
+    readonly data: Buffer;
+    readonly directory?: boolean;
+  }[]
 ): Buffer {
   const localParts: Buffer[] = [];
   const centralParts: Buffer[] = [];
   let offset = 0;
 
   for (const entry of entries) {
-    const pathBytes = Buffer.from(entry.path.replace(/\\\\/gu, "/"), "utf8");
-    const compressedData = deflateRawSync(entry.data);
+    const path =
+      entry.directory === true ? entry.path.replace(/\/?$/u, "/") : entry.path;
+    const pathBytes = Buffer.from(path.replace(/\\\\/gu, "/"), "utf8");
+    const compressionMethod = entry.directory === true ? 0 : 8;
+    const compressedData =
+      entry.directory === true ? Buffer.alloc(0) : deflateRawSync(entry.data);
     const checksum = crc32(entry.data);
     const localHeader = Buffer.alloc(30);
     localHeader.writeUInt32LE(0x04034b50, 0);
     localHeader.writeUInt16LE(20, 4);
     localHeader.writeUInt16LE(0x0800, 6);
-    localHeader.writeUInt16LE(8, 8);
+    localHeader.writeUInt16LE(compressionMethod, 8);
     localHeader.writeUInt16LE(0, 10);
     localHeader.writeUInt16LE(0, 12);
     localHeader.writeUInt32LE(checksum, 14);
@@ -419,7 +566,7 @@ function createZipArchive(
     centralHeader.writeUInt16LE(20, 4);
     centralHeader.writeUInt16LE(20, 6);
     centralHeader.writeUInt16LE(0x0800, 8);
-    centralHeader.writeUInt16LE(8, 10);
+    centralHeader.writeUInt16LE(compressionMethod, 10);
     centralHeader.writeUInt16LE(0, 12);
     centralHeader.writeUInt16LE(0, 14);
     centralHeader.writeUInt32LE(checksum, 16);

@@ -11,6 +11,7 @@ export type LatexToolchainStatus = {
   readonly latexmkAvailable: boolean;
   readonly synctexAvailable: boolean;
   readonly latexmkVersion?: string;
+  readonly compilerVersions?: Readonly<Partial<Record<LatexCompiler, string>>>;
   readonly availableCompilers: readonly LatexCompiler[];
 };
 
@@ -155,6 +156,12 @@ export async function detectLatexToolchain(): Promise<LatexToolchainStatus> {
     runVersionCommand("lualatex", ["--version"])
   ]);
   const compilerNames: readonly LatexCompiler[] = ["pdflatex", "xelatex", "lualatex"];
+  const compilerVersions = Object.fromEntries(
+    compilerNames.flatMap((compiler, index) => {
+      const version = compilerResults[index]?.version;
+      return version === undefined ? [] : [[compiler, version]];
+    })
+  ) as Partial<Record<LatexCompiler, string>>;
 
   return {
     latexmkAvailable: latexmkResult.available,
@@ -162,6 +169,7 @@ export async function detectLatexToolchain(): Promise<LatexToolchainStatus> {
     ...(latexmkResult.version === undefined
       ? {}
       : { latexmkVersion: latexmkResult.version }),
+    ...(Object.keys(compilerVersions).length === 0 ? {} : { compilerVersions }),
     availableCompilers: compilerNames.filter(
       (_compiler, index) => compilerResults[index]?.available === true
     )

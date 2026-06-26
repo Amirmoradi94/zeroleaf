@@ -39,11 +39,11 @@ import type {
   BuildResult,
   AuditEvent,
   CitationOccurrence,
-  ExternalProjectTemplateId,
   HistoryChangeSet,
   LatexCompiler,
   LatexDiagnostic,
   LatexToolchainStatus,
+  OnlyOfficeStatus,
   PdfArtifactData,
   PrivacySummary,
   ProjectFileSnapshot,
@@ -55,11 +55,29 @@ import type {
   ReferenceAnalysis,
   ReferenceSearchResult,
   RecentProject,
+  SharedProjectActivitySummary,
+  SharedProjectAuditEventSummary,
+  SharedProjectAgentChangeSetSummary,
+  SharedProjectAgentRunSummary,
+  SharedProjectBuildArtifactDetails,
+  SharedProjectBuildArtifactSummary,
+  SharedProjectCommentSummary,
+  SharedProjectConnection,
+  SharedProjectDocumentTextOperation,
+  SharedProjectFileRevisionDetails,
+  SharedProjectFileRevisionSummary,
+  SharedProjectMemberSummary,
+  SharedProjectPresenceSummary,
+  SharedProjectRealtimeEvent,
+  SharedProjectRole,
+  SharedProjectSessionSummary,
+  SharedProjectSummary,
   SubmissionCheckResult,
   WordBlockOperation,
   WordDocumentBlock,
   WordDocumentModel,
   WordChangeSet,
+  WordChangeSetApplyResult,
   WorkbenchLayout
 } from "@latex-agent/ipc-contracts";
 import {
@@ -88,6 +106,7 @@ import {
   Terminal,
   Trash2,
   TriangleAlert,
+  UploadCloud,
   X
 } from "lucide-react";
 
@@ -97,9 +116,14 @@ import {
   type CommandId
 } from "./commands.js";
 import { IconButton } from "./components/IconButton.js";
+import { OnlyOfficeWordEditorPane } from "./components/OnlyOfficeWordEditorPane.js";
 import { PdfPane } from "./components/PdfPane.js";
 import { desktopApi } from "./desktopApi.js";
 import zeroleafMarkUrl from "./assets/zeroleaf-mark.png";
+import {
+  parseNoProjectAgentCommand,
+  type NoProjectAgentCommand
+} from "./noProjectAgentCommand.js";
 import { formatPdfStaleReason, type PdfStaleReason } from "./pdfPreviewModel.js";
 import {
   buildProjectLatexOutline,
@@ -146,6 +170,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 const settingsTabs = [
   "Editor",
   "Compiler",
+  "Word",
   "AI Providers",
   "Agent Permissions",
   "Appearance",
@@ -177,16 +202,6 @@ type AgentLiveStatus = {
   readonly detail: string;
   readonly title: string;
   readonly tone: "idle" | "running" | "success" | "warning" | "danger";
-};
-type NoProjectAgentCommand = {
-  readonly kind: "create-project";
-  readonly projectName: string;
-  readonly templateId: ProjectTemplateId;
-};
-type ExternalTemplateAgentCommand = {
-  readonly kind: "create-external-template-project";
-  readonly projectName: string;
-  readonly templateId: ExternalProjectTemplateId;
 };
 type AgentEventTone = "neutral" | "running" | "success" | "warning" | "danger";
 type AgentThreadItem =
@@ -268,6 +283,24 @@ type SavedEditorFile = {
   readonly changeset?: HistoryChangeSet;
 };
 
+type OnlyOfficeWordFileState = {
+  readonly dirty: boolean;
+  readonly sessionId?: string;
+};
+
+type ActiveSharedProject = {
+  readonly id: string;
+  readonly localCachePath: string;
+  readonly role: SharedProjectRole;
+  readonly compiler?: LatexCompiler;
+};
+
+type SharedDocumentPendingOperation = {
+  readonly id: string;
+  readonly operations: readonly SharedProjectDocumentTextOperation[];
+  readonly contents: string;
+};
+
 type PdfSearchMatch = {
   readonly page: number;
   readonly matchIndex: number;
@@ -295,9 +328,17 @@ export function App() {
     recentProjects: []
   });
   const [projectResult, setProjectResult] = useState<ProjectOpenResult | null>(null);
+  const [activeSharedProject, setActiveSharedProject] =
+    useState<ActiveSharedProject | null>(null);
   const [openFiles, setOpenFiles] = useState<readonly EditorFileState[]>([]);
   const [outlineFiles, setOutlineFiles] = useState<readonly LatexOutlineSource[]>([]);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
+  const [onlyOfficeWordFileStates, setOnlyOfficeWordFileStates] = useState<
+    Readonly<Record<string, OnlyOfficeWordFileState>>
+  >({});
+  const [onlyOfficeWordReloadVersions, setOnlyOfficeWordReloadVersions] = useState<
+    Readonly<Record<string, number>>
+  >({});
   const [selectedProjectDirectoryPath, setSelectedProjectDirectoryPath] = useState(".");
   const [selectedProjectEntryPath, setSelectedProjectEntryPath] = useState<
     string | null
@@ -320,6 +361,84 @@ export function App() {
   const [projectTemplates, setProjectTemplates] = useState<readonly ProjectTemplate[]>(
     []
   );
+  const [sharedConnection, setSharedConnection] = useState<SharedProjectConnection>({
+    connected: false
+  });
+  const [sharedSessions, setSharedSessions] = useState<
+    readonly SharedProjectSessionSummary[]
+  >([]);
+  const [sharedProjects, setSharedProjects] = useState<readonly SharedProjectSummary[]>(
+    []
+  );
+  const [sharedBuildArtifacts, setSharedBuildArtifacts] = useState<
+    readonly SharedProjectBuildArtifactSummary[]
+  >([]);
+  const [sharedFileRevisions, setSharedFileRevisions] = useState<
+    readonly SharedProjectFileRevisionSummary[]
+  >([]);
+  const [selectedSharedFileRevision, setSelectedSharedFileRevision] =
+    useState<SharedProjectFileRevisionDetails | null>(null);
+  const [sharedComments, setSharedComments] = useState<
+    readonly SharedProjectCommentSummary[]
+  >([]);
+  const [sharedCommentDraft, setSharedCommentDraft] = useState("");
+  const [sharedActivity, setSharedActivity] = useState<
+    readonly SharedProjectActivitySummary[]
+  >([]);
+  const [sharedAuditEvents, setSharedAuditEvents] = useState<
+    readonly SharedProjectAuditEventSummary[]
+  >([]);
+  const [sharedMembers, setSharedMembers] = useState<
+    readonly SharedProjectMemberSummary[]
+  >([]);
+  const [sharedAgentChangeSets, setSharedAgentChangeSets] = useState<
+    readonly SharedProjectAgentChangeSetSummary[]
+  >([]);
+  const [sharedAgentRuns, setSharedAgentRuns] = useState<
+    readonly SharedProjectAgentRunSummary[]
+  >([]);
+  const [sharedAgentRunIdsBySessionId, setSharedAgentRunIdsBySessionId] = useState<
+    Readonly<Record<string, string>>
+  >({});
+  const [sharedAgentRunIdsByLocalChangeSetId, setSharedAgentRunIdsByLocalChangeSetId] =
+    useState<Readonly<Record<string, string>>>({});
+  const [sharedPresence, setSharedPresence] = useState<
+    readonly SharedProjectPresenceSummary[]
+  >([]);
+  const [sharedServerUrl, setSharedServerUrl] = useState("http://127.0.0.1:3768");
+  const [sharedEmail, setSharedEmail] = useState("");
+  const [sharedName, setSharedName] = useState("");
+  const [sharedProjectName, setSharedProjectName] = useState("shared-paper");
+  const [sharedInviteEmail, setSharedInviteEmail] = useState("");
+  const [sharedInviteRole, setSharedInviteRole] =
+    useState<Exclude<SharedProjectRole, "owner">>("editor");
+  const [sharedInvitationId, setSharedInvitationId] = useState("");
+  const [sharedBusy, setSharedBusy] = useState(false);
+  const [sharedStatus, setSharedStatus] = useState("Connect to a shared server.");
+  const [sharedDocumentSyncStatus, setSharedDocumentSyncStatus] = useState(
+    "Shared editor sync idle."
+  );
+  const [sharedDocumentConflictPaths, setSharedDocumentConflictPaths] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
+  const [sharedDocumentOperationFailedPaths, setSharedDocumentOperationFailedPaths] =
+    useState<ReadonlySet<string>>(() => new Set());
+  const [sharedDocumentPendingOperations, setSharedDocumentPendingOperations] =
+    useState<Readonly<Record<string, readonly SharedDocumentPendingOperation[]>>>({});
+  const [sharedDocumentUpdateCursors, setSharedDocumentUpdateCursors] = useState<
+    Readonly<Record<string, string>>
+  >({});
+  const [sharedRealtimeActivityVersion, setSharedRealtimeActivityVersion] = useState(0);
+  const [sharedRealtimeAgentVersion, setSharedRealtimeAgentVersion] = useState(0);
+  const [sharedRealtimeBuildVersion, setSharedRealtimeBuildVersion] = useState(0);
+  const [sharedRealtimeCommentVersion, setSharedRealtimeCommentVersion] = useState(0);
+  const [sharedRealtimeMemberVersion, setSharedRealtimeMemberVersion] = useState(0);
+  const [sharedRealtimeDocumentVersions, setSharedRealtimeDocumentVersions] = useState<
+    Readonly<Record<string, number>>
+  >({});
+  const [sharedRealtimeTreeVersion, setSharedRealtimeTreeVersion] = useState(0);
+  const [sharedAgentChangeSetIdsByLocalId, setSharedAgentChangeSetIdsByLocalId] =
+    useState<Readonly<Record<string, string>>>({});
   const [selectedTemplateId, setSelectedTemplateId] =
     useState<ProjectTemplateId>("article");
   const [templateProjectName, setTemplateProjectName] = useState("article");
@@ -431,6 +550,9 @@ export function App() {
   const editorResizeObserverRef = useRef<ResizeObserver | null>(null);
   const contentRowRef = useRef<HTMLElement | null>(null);
   const editorRef = useRef<MonacoStandaloneEditor | null>(null);
+  const sharedPresenceDecorationsRef = useRef<ReturnType<
+    MonacoStandaloneEditor["createDecorationsCollection"]
+  > | null>(null);
   const pdfCanvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map());
   const pdfDocumentRef = useRef<PDFDocumentProxy | null>(null);
   const selectionChangeSubscriptionRef = useRef<{ dispose: () => void } | null>(null);
@@ -443,6 +565,28 @@ export function App() {
     number | ReturnType<typeof setTimeout> | null
   >(null);
   const appWrittenProjectPathsRef = useRef<Set<string>>(new Set());
+  const sharedRemoteEditPathsRef = useRef<Set<string>>(new Set());
+  const sharedProjectCanEdit =
+    activeSharedProject === null || activeSharedProject.role !== "viewer";
+
+  useEffect(() => {
+    setSharedDocumentConflictPaths((paths) => (paths.size === 0 ? paths : new Set()));
+    setSharedDocumentOperationFailedPaths((paths) =>
+      paths.size === 0 ? paths : new Set()
+    );
+    setSharedDocumentPendingOperations((operations) =>
+      Object.keys(operations).length === 0 ? operations : {}
+    );
+    setSharedDocumentUpdateCursors((cursors) =>
+      Object.keys(cursors).length === 0 ? cursors : {}
+    );
+    setSharedAgentChangeSetIdsByLocalId((idsByLocalId) =>
+      Object.keys(idsByLocalId).length === 0 ? idsByLocalId : {}
+    );
+    setSharedAgentRunIdsBySessionId((idsBySessionId) =>
+      Object.keys(idsBySessionId).length === 0 ? idsBySessionId : {}
+    );
+  }, [activeSharedProject?.id]);
 
   const scheduleEditorLayout = useCallback(() => {
     if (editorLayoutRafRef.current !== null) {
@@ -477,6 +621,8 @@ export function App() {
       }
       editorResizeObserverRef.current?.disconnect();
       editorResizeObserverRef.current = null;
+      sharedPresenceDecorationsRef.current?.clear();
+      sharedPresenceDecorationsRef.current = null;
     };
   }, []);
 
@@ -675,6 +821,20 @@ export function App() {
       }
     });
     void desktopApi.lifecycle.listTemplates().then(setProjectTemplates);
+    void desktopApi.shared.getConnection().then((connection) => {
+      setSharedConnection(connection);
+      if (connection.baseUrl !== undefined) {
+        setSharedServerUrl(connection.baseUrl);
+      }
+      if (connection.user !== undefined) {
+        setSharedEmail(connection.user.email);
+        setSharedName(connection.user.name);
+      }
+      if (connection.connected) {
+        void desktopApi.shared.listProjects().then(setSharedProjects);
+        void desktopApi.shared.listSessions().then(setSharedSessions);
+      }
+    });
     void desktopApi.settings.getPrivacySummary().then(setPrivacySummary);
     void refreshToolchainStatus();
     void refreshAgentAuthStatuses({ silent: true });
@@ -690,6 +850,961 @@ export function App() {
       }
     });
   }, []);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      return;
+    }
+
+    let cancelled = false;
+    const projectId = activeSharedProject.id;
+    const unsubscribe = desktopApi.shared.onRealtimeEvent(
+      (event: SharedProjectRealtimeEvent) => {
+        if (event.projectId !== projectId) {
+          return;
+        }
+
+        switch (event.type) {
+          case "presence.updated":
+            setSharedPresence((presence) =>
+              upsertSharedPresence(presence, event.presence)
+            );
+            break;
+          case "document.updated":
+            setSharedRealtimeDocumentVersions((versions) => ({
+              ...versions,
+              [event.path]: (versions[event.path] ?? 0) + 1
+            }));
+            break;
+          case "file.updated":
+          case "tree.updated":
+            setSharedRealtimeTreeVersion((version) => version + 1);
+            break;
+          case "members.updated":
+            setSharedRealtimeMemberVersion((version) => version + 1);
+            setSharedRealtimeActivityVersion((version) => version + 1);
+            break;
+          case "comments.updated":
+            setSharedRealtimeCommentVersion((version) => version + 1);
+            setSharedRealtimeActivityVersion((version) => version + 1);
+            break;
+          case "build-artifact.created":
+            setSharedRealtimeBuildVersion((version) => version + 1);
+            setSharedRealtimeActivityVersion((version) => version + 1);
+            break;
+          case "agent.run.updated":
+          case "agent.changeset.updated":
+            setSharedRealtimeAgentVersion((version) => version + 1);
+            setSharedRealtimeActivityVersion((version) => version + 1);
+            break;
+          case "error":
+            setSharedStatus(`Shared realtime unavailable: ${event.message}`);
+            break;
+        }
+      }
+    );
+
+    void desktopApi.shared
+      .startRealtime(projectId)
+      .then(() => {
+        if (!cancelled) {
+          setSharedStatus("Shared realtime connected.");
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setSharedStatus(`Shared realtime unavailable: ${getErrorMessage(error)}`);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+      void desktopApi.shared.stopRealtime(projectId);
+    };
+  }, [activeSharedProject, sharedConnection.connected, sharedRealtimeBuildVersion]);
+
+  useEffect(() => {
+    if (!sharedConnection.connected) {
+      setSharedSessions([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    void desktopApi.shared
+      .listProjects()
+      .then((projects) => {
+        if (cancelled) {
+          return;
+        }
+
+        setSharedProjects(projects);
+        setActiveSharedProject((current) => {
+          if (current === null) {
+            return current;
+          }
+
+          const refreshedProject = projects.find(
+            (project) => project.id === current.id
+          );
+          if (refreshedProject === undefined) {
+            return null;
+          }
+
+          if (refreshedProject.compiler !== undefined) {
+            setSelectedCompiler(refreshedProject.compiler);
+          }
+
+          return {
+            ...current,
+            role: refreshedProject.role,
+            ...(refreshedProject.compiler === undefined
+              ? {}
+              : { compiler: refreshedProject.compiler })
+          };
+        });
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setSharedStatus(`Shared projects unavailable: ${getErrorMessage(error)}`);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    sharedConnection.connected,
+    sharedRealtimeMemberVersion,
+    sharedRealtimeTreeVersion
+  ]);
+
+  useEffect(() => {
+    if (!sharedConnection.connected) {
+      setSharedSessions([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    const refreshSessions = async () => {
+      try {
+        const sessions = await desktopApi.shared.listSessions();
+        if (!cancelled) {
+          setSharedSessions(sessions);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSharedStatus(`Shared sessions unavailable: ${getErrorMessage(error)}`);
+        }
+      }
+    };
+
+    void refreshSessions();
+    const interval = window.setInterval(() => {
+      void refreshSessions();
+    }, 30_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [sharedConnection.connected]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      setSharedPresence([]);
+      return;
+    }
+
+    let cancelled = false;
+    const refreshPresence = async () => {
+      try {
+        await desktopApi.shared.updatePresence({
+          projectId: activeSharedProject.id,
+          ...(activeFilePath === null ? {} : { filePath: activeFilePath })
+        });
+        const presence = await desktopApi.shared.listPresence(activeSharedProject.id);
+
+        if (!cancelled) {
+          setSharedPresence(presence);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSharedStatus(getErrorMessage(error));
+        }
+      }
+    };
+
+    void refreshPresence();
+    const presenceRefreshInterval = window.setInterval(() => {
+      void refreshPresence();
+    }, 5_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(presenceRefreshInterval);
+    };
+  }, [activeFilePath, activeSharedProject, sharedConnection.connected]);
+
+  useEffect(() => {
+    if (
+      activeSharedProject === null ||
+      !sharedConnection.connected ||
+      activeFilePath === null
+    ) {
+      return;
+    }
+
+    const editor = editorRef.current;
+    if (editor === null) {
+      return;
+    }
+
+    let cursorPublishTimer: number | undefined;
+    const publishCursorPresence = () => {
+      const position = editor.getPosition();
+      if (position === null) {
+        return;
+      }
+
+      if (cursorPublishTimer !== undefined) {
+        window.clearTimeout(cursorPublishTimer);
+      }
+
+      cursorPublishTimer = window.setTimeout(() => {
+        cursorPublishTimer = undefined;
+        void desktopApi.shared
+          .updatePresence({
+            projectId: activeSharedProject.id,
+            filePath: activeFilePath,
+            cursorLine: position.lineNumber,
+            cursorColumn: position.column
+          })
+          .catch((error) => {
+            setSharedStatus(`Shared cursor unavailable: ${getErrorMessage(error)}`);
+          });
+      }, 250);
+    };
+
+    publishCursorPresence();
+    const cursorSubscription = editor.onDidChangeCursorPosition(() => {
+      publishCursorPresence();
+    });
+
+    return () => {
+      cursorSubscription.dispose();
+      if (cursorPublishTimer !== undefined) {
+        window.clearTimeout(cursorPublishTimer);
+      }
+    };
+  }, [activeFilePath, activeSharedProject, sharedConnection.connected]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (editor === null) {
+      return;
+    }
+
+    if (
+      activeSharedProject === null ||
+      activeFilePath === null ||
+      !sharedConnection.connected
+    ) {
+      sharedPresenceDecorationsRef.current?.clear();
+      return;
+    }
+
+    const model = editor.getModel();
+    if (model === null) {
+      sharedPresenceDecorationsRef.current?.clear();
+      return;
+    }
+
+    sharedPresenceDecorationsRef.current ??= editor.createDecorationsCollection();
+    sharedPresenceDecorationsRef.current.set(
+      createSharedPresenceCursorDecorations({
+        activeFilePath,
+        currentUserId: sharedConnection.user?.id,
+        model,
+        presence: sharedPresence
+      })
+    );
+  }, [
+    activeFilePath,
+    activeSharedProject,
+    sharedConnection.connected,
+    sharedConnection.user?.id,
+    sharedPresence
+  ]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      setSharedBuildArtifacts([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    void desktopApi.shared
+      .listBuildArtifacts(activeSharedProject.id)
+      .then((artifacts) => {
+        if (!cancelled) {
+          setSharedBuildArtifacts(artifacts.slice(0, 5));
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setSharedStatus(
+            `Shared build history unavailable: ${getErrorMessage(error)}`
+          );
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSharedProject, sharedConnection.connected, sharedRealtimeActivityVersion]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      setSharedActivity([]);
+      return;
+    }
+
+    let cancelled = false;
+    const refreshActivity = async () => {
+      try {
+        const activity = await desktopApi.shared.listActivity(activeSharedProject.id);
+
+        if (!cancelled) {
+          setSharedActivity(activity.slice(0, 6));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSharedStatus(`Shared activity unavailable: ${getErrorMessage(error)}`);
+        }
+      }
+    };
+
+    void refreshActivity();
+    const activityRefreshInterval = window.setInterval(() => {
+      void refreshActivity();
+    }, 5_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(activityRefreshInterval);
+    };
+  }, [
+    activeSharedProject,
+    sharedConnection.connected,
+    sharedRealtimeActivityVersion,
+    sharedRealtimeAgentVersion
+  ]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      setSharedComments([]);
+      return;
+    }
+
+    let cancelled = false;
+    const refreshComments = async () => {
+      try {
+        const comments = await desktopApi.shared.listComments(activeSharedProject.id);
+
+        if (!cancelled) {
+          setSharedComments(comments.slice(0, 12));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSharedStatus(`Shared comments unavailable: ${getErrorMessage(error)}`);
+        }
+      }
+    };
+
+    void refreshComments();
+    const commentsRefreshInterval = window.setInterval(() => {
+      void refreshComments();
+    }, 10_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(commentsRefreshInterval);
+    };
+  }, [activeSharedProject, sharedConnection.connected, sharedRealtimeCommentVersion]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      setSharedMembers([]);
+      return;
+    }
+
+    let cancelled = false;
+    const refreshMembers = async () => {
+      try {
+        const members = await desktopApi.shared.listMembers(activeSharedProject.id);
+
+        if (!cancelled) {
+          setSharedMembers(members);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSharedStatus(`Shared members unavailable: ${getErrorMessage(error)}`);
+        }
+      }
+    };
+
+    void refreshMembers();
+    const memberRefreshInterval = window.setInterval(() => {
+      void refreshMembers();
+    }, 10_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(memberRefreshInterval);
+    };
+  }, [activeSharedProject, sharedConnection.connected, sharedRealtimeMemberVersion]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      setSharedAgentChangeSets([]);
+      setSharedAgentRuns([]);
+      setSharedAuditEvents([]);
+      return;
+    }
+
+    let cancelled = false;
+    const refreshSharedAgentRuns = async () => {
+      try {
+        const [agentRuns, changesets, auditEvents] = await Promise.all([
+          desktopApi.shared.listAgentRuns(activeSharedProject.id),
+          desktopApi.shared.listAgentChangeSets(activeSharedProject.id),
+          desktopApi.shared.listAuditEvents(activeSharedProject.id)
+        ]);
+
+        if (!cancelled) {
+          setSharedAgentRuns(agentRuns.slice(0, 5));
+          setSharedAgentChangeSets(changesets.slice(0, 5));
+          setSharedAuditEvents(auditEvents.slice(0, 5));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSharedStatus(`Shared agent runs unavailable: ${getErrorMessage(error)}`);
+        }
+      }
+    };
+
+    void refreshSharedAgentRuns();
+    const sharedAgentRunsRefreshInterval = window.setInterval(() => {
+      void refreshSharedAgentRuns();
+    }, 5_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(sharedAgentRunsRefreshInterval);
+    };
+  }, [activeSharedProject, sharedConnection.connected]);
+
+  useEffect(() => {
+    if (
+      activeSharedProject === null ||
+      !sharedConnection.connected ||
+      !sharedProjectCanEdit
+    ) {
+      return;
+    }
+
+    const pendingEntries = Object.entries(sharedDocumentPendingOperations).filter(
+      ([, operations]) => operations.length > 0
+    );
+    if (pendingEntries.length === 0) {
+      return;
+    }
+
+    const replayTimer = window.setTimeout(() => {
+      void (async () => {
+        for (const [path, operations] of pendingEntries) {
+          if (sharedDocumentConflictPaths.has(path)) {
+            continue;
+          }
+
+          const pendingOperation = operations[0];
+          if (pendingOperation === undefined) {
+            continue;
+          }
+
+          setSharedDocumentSyncStatus(
+            `Replaying ${operations.length} queued shared ${operations.length === 1 ? "operation" : "operations"} for ${path}...`
+          );
+
+          try {
+            const result = await desktopApi.shared.applyDocumentTextOperations({
+              projectId: activeSharedProject.id,
+              path,
+              operations: pendingOperation.operations,
+              clientOperationId: pendingOperation.id
+            });
+            if (result.lastUpdateId !== undefined) {
+              setSharedDocumentUpdateCursors((cursors) =>
+                cursors[result.path] === result.lastUpdateId
+                  ? cursors
+                  : { ...cursors, [result.path]: result.lastUpdateId ?? "" }
+              );
+            }
+            appWrittenProjectPathsRef.current.add(normalizeProjectPath(result.path));
+            setOpenFiles((files) =>
+              files.map((candidate) => {
+                if (
+                  candidate.path !== result.path ||
+                  candidate.documentKind !== "text"
+                ) {
+                  return candidate;
+                }
+
+                return {
+                  ...candidate,
+                  contents:
+                    candidate.contents === pendingOperation.contents
+                      ? result.contents
+                      : candidate.contents,
+                  savedContents: result.contents,
+                  mtimeMs: result.mtimeMs,
+                  stale: false
+                };
+              })
+            );
+            let remainingCount = 0;
+            setSharedDocumentPendingOperations((currentOperations) => {
+              const currentPathOperations = currentOperations[result.path] ?? [];
+              if (currentPathOperations[0]?.id !== pendingOperation.id) {
+                remainingCount = currentPathOperations.length;
+                return currentOperations;
+              }
+
+              const remainingOperations = currentPathOperations.slice(1);
+              remainingCount = remainingOperations.length;
+              if (remainingOperations.length > 0) {
+                return {
+                  ...currentOperations,
+                  [result.path]: remainingOperations
+                };
+              }
+
+              const { [result.path]: _syncedOperations, ...nextOperations } =
+                currentOperations;
+              return nextOperations;
+            });
+            if (remainingCount === 0) {
+              setSharedDocumentOperationFailedPaths((paths) => {
+                if (!paths.has(result.path)) {
+                  return paths;
+                }
+
+                const nextPaths = new Set(paths);
+                nextPaths.delete(result.path);
+                return nextPaths;
+              });
+            }
+            setSharedDocumentSyncStatus(
+              remainingCount === 0
+                ? `Synced queued shared operations for ${result.path}.`
+                : `Synced one queued shared operation for ${result.path}; ${remainingCount} pending.`
+            );
+          } catch (error) {
+            setSharedDocumentOperationFailedPaths((paths) =>
+              paths.has(path) ? paths : new Set(paths).add(path)
+            );
+            setSharedDocumentSyncStatus(
+              `Queued shared operation retry failed: ${getErrorMessage(error)}`
+            );
+            break;
+          }
+        }
+      })();
+    }, 1_500);
+
+    return () => window.clearTimeout(replayTimer);
+  }, [
+    activeSharedProject,
+    sharedConnection.connected,
+    sharedDocumentConflictPaths,
+    sharedDocumentPendingOperations,
+    sharedProjectCanEdit
+  ]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      setSharedDocumentSyncStatus("Shared editor sync idle.");
+      setSharedDocumentConflictPaths((paths) => (paths.size === 0 ? paths : new Set()));
+      setSharedDocumentOperationFailedPaths((paths) =>
+        paths.size === 0 ? paths : new Set()
+      );
+      setSharedDocumentPendingOperations((operations) =>
+        Object.keys(operations).length === 0 ? operations : {}
+      );
+      setSharedDocumentUpdateCursors((cursors) =>
+        Object.keys(cursors).length === 0 ? cursors : {}
+      );
+      return;
+    }
+
+    const file =
+      activeFilePath === null
+        ? undefined
+        : openFiles.find((candidate) => candidate.path === activeFilePath);
+
+    if (
+      file === undefined ||
+      file.documentKind !== "text" ||
+      file.contents === file.savedContents
+    ) {
+      return;
+    }
+
+    if (sharedDocumentConflictPaths.has(file.path)) {
+      setSharedDocumentSyncStatus(`Resolve remote changes for ${file.path}.`);
+      return;
+    }
+
+    const pendingOperations = sharedDocumentPendingOperations[file.path] ?? [];
+    if (pendingOperations.length > 0) {
+      setSharedDocumentSyncStatus(
+        `${pendingOperations.length} queued shared ${pendingOperations.length === 1 ? "operation" : "operations"} pending for ${file.path}.`
+      );
+      return;
+    }
+
+    if (!sharedDocumentOperationFailedPaths.has(file.path)) {
+      setSharedDocumentSyncStatus(`Waiting for shared operation ack for ${file.path}.`);
+      return;
+    }
+
+    const syncTimer = window.setTimeout(() => {
+      void (async () => {
+        setSharedDocumentSyncStatus(
+          `Shared operation fallback syncing ${file.path}...`
+        );
+        try {
+          const result = await desktopApi.shared.syncDocumentContents({
+            projectId: activeSharedProject.id,
+            path: file.path,
+            contents: file.contents
+          });
+          if (result.lastUpdateId !== undefined) {
+            setSharedDocumentUpdateCursors((cursors) =>
+              cursors[result.path] === result.lastUpdateId
+                ? cursors
+                : { ...cursors, [result.path]: result.lastUpdateId ?? "" }
+            );
+          }
+          appWrittenProjectPathsRef.current.add(normalizeProjectPath(result.path));
+          setOpenFiles((files) =>
+            files.map((candidate) => {
+              if (candidate.path !== result.path || candidate.documentKind !== "text") {
+                return candidate;
+              }
+
+              return {
+                ...candidate,
+                contents:
+                  candidate.contents === file.contents
+                    ? result.contents
+                    : candidate.contents,
+                savedContents: result.contents,
+                mtimeMs: result.mtimeMs,
+                stale: false
+              };
+            })
+          );
+          setSharedDocumentOperationFailedPaths((paths) => {
+            if (!paths.has(result.path)) {
+              return paths;
+            }
+
+            const nextPaths = new Set(paths);
+            nextPaths.delete(result.path);
+            return nextPaths;
+          });
+          setSharedDocumentSyncStatus(`Synced ${result.path}.`);
+        } catch (error) {
+          setSharedDocumentConflictPaths((paths) =>
+            paths.has(file.path) ? paths : new Set(paths).add(file.path)
+          );
+          setSharedDocumentSyncStatus(
+            `Shared sync failed for ${file.path}; resolve remote changes before saving. ${getErrorMessage(error)}`
+          );
+        }
+      })();
+    }, 700);
+
+    return () => window.clearTimeout(syncTimer);
+  }, [
+    activeFilePath,
+    activeSharedProject,
+    openFiles,
+    sharedConnection.connected,
+    sharedDocumentConflictPaths,
+    sharedDocumentOperationFailedPaths,
+    sharedDocumentPendingOperations
+  ]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      return;
+    }
+
+    const file =
+      activeFilePath === null
+        ? undefined
+        : openFiles.find((candidate) => candidate.path === activeFilePath);
+
+    if (file === undefined || file.documentKind !== "text") {
+      return;
+    }
+
+    let pullCancelled = false;
+    let pullInFlight = false;
+    const pullSharedDocumentUpdates = () => {
+      if (pullCancelled || pullInFlight) {
+        return;
+      }
+
+      pullInFlight = true;
+      void (async () => {
+        const afterUpdateId = sharedDocumentUpdateCursors[file.path];
+        try {
+          const result = await desktopApi.shared.pullDocumentContents({
+            projectId: activeSharedProject.id,
+            path: file.path,
+            ...(afterUpdateId === undefined ? {} : { afterUpdateId })
+          });
+          if (pullCancelled) {
+            return;
+          }
+
+          if (result.lastUpdateId !== undefined) {
+            setSharedDocumentUpdateCursors((cursors) =>
+              cursors[result.path] === result.lastUpdateId
+                ? cursors
+                : { ...cursors, [result.path]: result.lastUpdateId ?? "" }
+            );
+          }
+
+          if (result.remoteUpdateCount === 0) {
+            return;
+          }
+
+          if (result.contents === file.savedContents) {
+            return;
+          }
+
+          appWrittenProjectPathsRef.current.add(normalizeProjectPath(result.path));
+          const conflictDetected = file.contents !== file.savedContents;
+          const remoteTextOperations = result.remoteTextOperations ?? [];
+          if (
+            !conflictDetected &&
+            activeFilePath === result.path &&
+            editorRef.current !== null &&
+            remoteTextOperations.length > 0
+          ) {
+            sharedRemoteEditPathsRef.current.add(result.path);
+            try {
+              applySharedRemoteTextOperationsToEditor(
+                editorRef.current,
+                remoteTextOperations
+              );
+            } finally {
+              sharedRemoteEditPathsRef.current.delete(result.path);
+            }
+          }
+          setOpenFiles((files) =>
+            files.map((candidate) => {
+              if (candidate.path !== result.path || candidate.documentKind !== "text") {
+                return candidate;
+              }
+
+              const hasLocalEdits = candidate.contents !== candidate.savedContents;
+              return {
+                ...candidate,
+                contents: hasLocalEdits ? candidate.contents : result.contents,
+                savedContents: result.contents,
+                mtimeMs: result.mtimeMs,
+                stale: hasLocalEdits
+              };
+            })
+          );
+          if (conflictDetected) {
+            setSharedDocumentConflictPaths((paths) => {
+              const nextPaths = new Set(paths);
+              nextPaths.add(result.path);
+              return nextPaths;
+            });
+          }
+          setSharedDocumentSyncStatus(
+            file.contents === file.savedContents
+              ? `Pulled ${result.path}.`
+              : `Remote changes available for ${result.path}.`
+          );
+        } catch (error) {
+          if (pullCancelled) {
+            return;
+          }
+
+          setSharedDocumentSyncStatus(`Shared pull failed: ${getErrorMessage(error)}`);
+        } finally {
+          pullInFlight = false;
+        }
+      })();
+    };
+
+    const sharedRemotePullInterval = window.setInterval(
+      pullSharedDocumentUpdates,
+      2_500
+    );
+    pullSharedDocumentUpdates();
+
+    return () => {
+      pullCancelled = true;
+      window.clearInterval(sharedRemotePullInterval);
+    };
+  }, [
+    activeFilePath,
+    activeSharedProject,
+    openFiles,
+    sharedConnection.connected,
+    sharedDocumentUpdateCursors,
+    sharedRealtimeDocumentVersions
+  ]);
+
+  useEffect(() => {
+    if (activeSharedProject === null || !sharedConnection.connected) {
+      return;
+    }
+
+    const openSharedTextFiles = openFiles.filter(
+      (file) =>
+        file.documentKind === "text" &&
+        file.path !== activeFilePath &&
+        !sharedDocumentConflictPaths.has(file.path) &&
+        (sharedDocumentPendingOperations[file.path] ?? []).length === 0
+    );
+
+    if (openSharedTextFiles.length === 0) {
+      return;
+    }
+
+    let backgroundPullCancelled = false;
+    let backgroundPullInFlight = false;
+    const pullBackgroundSharedDocumentUpdates = () => {
+      if (backgroundPullCancelled || backgroundPullInFlight) {
+        return;
+      }
+
+      backgroundPullInFlight = true;
+      void (async () => {
+        try {
+          for (const file of openSharedTextFiles) {
+            if (backgroundPullCancelled) {
+              return;
+            }
+
+            const afterUpdateId = sharedDocumentUpdateCursors[file.path];
+            const result = await desktopApi.shared.pullDocumentContents({
+              projectId: activeSharedProject.id,
+              path: file.path,
+              ...(afterUpdateId === undefined ? {} : { afterUpdateId })
+            });
+
+            if (backgroundPullCancelled) {
+              return;
+            }
+
+            if (result.lastUpdateId !== undefined) {
+              setSharedDocumentUpdateCursors((cursors) =>
+                cursors[result.path] === result.lastUpdateId
+                  ? cursors
+                  : { ...cursors, [result.path]: result.lastUpdateId ?? "" }
+              );
+            }
+
+            if (
+              result.remoteUpdateCount === 0 ||
+              result.contents === file.savedContents
+            ) {
+              continue;
+            }
+
+            appWrittenProjectPathsRef.current.add(normalizeProjectPath(result.path));
+            const conflictDetected = file.contents !== file.savedContents;
+            setOpenFiles((files) =>
+              files.map((candidate) => {
+                if (
+                  candidate.path !== result.path ||
+                  candidate.documentKind !== "text"
+                ) {
+                  return candidate;
+                }
+
+                const hasLocalEdits = candidate.contents !== candidate.savedContents;
+                return {
+                  ...candidate,
+                  contents: hasLocalEdits ? candidate.contents : result.contents,
+                  savedContents: result.contents,
+                  mtimeMs: result.mtimeMs,
+                  stale: hasLocalEdits
+                };
+              })
+            );
+
+            if (conflictDetected) {
+              setSharedDocumentConflictPaths((paths) => {
+                const nextPaths = new Set(paths);
+                nextPaths.add(result.path);
+                return nextPaths;
+              });
+            }
+
+            setSharedDocumentSyncStatus(
+              conflictDetected
+                ? `Remote changes available for ${result.path}.`
+                : `Pulled background shared update for ${result.path}.`
+            );
+          }
+        } catch (error) {
+          if (!backgroundPullCancelled) {
+            setSharedDocumentSyncStatus(
+              `Shared background pull failed: ${getErrorMessage(error)}`
+            );
+          }
+        } finally {
+          backgroundPullInFlight = false;
+        }
+      })();
+    };
+
+    const sharedBackgroundPullInterval = window.setInterval(
+      pullBackgroundSharedDocumentUpdates,
+      6_000
+    );
+    pullBackgroundSharedDocumentUpdates();
+
+    return () => {
+      backgroundPullCancelled = true;
+      window.clearInterval(sharedBackgroundPullInterval);
+    };
+  }, [
+    activeFilePath,
+    activeSharedProject,
+    openFiles,
+    sharedConnection.connected,
+    sharedDocumentConflictPaths,
+    sharedDocumentPendingOperations,
+    sharedDocumentUpdateCursors,
+    sharedRealtimeDocumentVersions
+  ]);
 
   useEffect(() => {
     writeStoredAgentHistory(agentEvents);
@@ -876,9 +1991,39 @@ export function App() {
     activeFilePath === null
       ? null
       : (openFiles.find((file) => file.path === activeFilePath) ?? null);
-  const activeFileDirty =
-    activeFile !== null && activeFile.contents !== activeFile.savedContents;
-  const dirtyFiles = openFiles.filter((file) => file.contents !== file.savedContents);
+  const isFileDirty = useCallback(
+    (file: EditorFileState) =>
+      !sharedProjectCanEdit
+        ? false
+        : file.documentKind === "word"
+          ? (onlyOfficeWordFileStates[file.path]?.dirty ?? false)
+          : file.contents !== file.savedContents,
+    [onlyOfficeWordFileStates, sharedProjectCanEdit]
+  );
+  const activeFileDirty = activeFile !== null && isFileDirty(activeFile);
+  const activeSharedDocumentConflict =
+    activeFile !== null &&
+    activeFile.documentKind === "text" &&
+    sharedDocumentConflictPaths.has(activeFile.path);
+  const dirtyFiles = openFiles.filter(
+    (file) =>
+      sharedProjectCanEdit &&
+      file.documentKind === "text" &&
+      file.contents !== file.savedContents
+  );
+  const dirtyWordFileCount = openFiles.filter(
+    (file) =>
+      sharedProjectCanEdit &&
+      file.documentKind === "word" &&
+      (onlyOfficeWordFileStates[file.path]?.dirty ?? false)
+  ).length;
+  const dirtyOnlyOfficeWordPath = openFiles.find(
+    (file) =>
+      sharedProjectCanEdit &&
+      file.documentKind === "word" &&
+      (onlyOfficeWordFileStates[file.path]?.dirty ?? false)
+  )?.path;
+  const dirtyFileCount = dirtyFiles.length + dirtyWordFileCount;
   const editableProjectFiles = useMemo(
     () => getEditableProjectFiles(projectResult?.tree ?? []),
     [projectResult]
@@ -966,14 +2111,16 @@ export function App() {
     }
 
     if (
-      dirtyFiles.length > 0 &&
+      dirtyFileCount > 0 &&
       !window.confirm("Close project and discard unsaved changes?")
     ) {
       return;
     }
 
     setProjectResult(null);
+    setActiveSharedProject(null);
     setOpenFiles([]);
+    setOnlyOfficeWordFileStates({});
     setOutlineFiles([]);
     setActiveFilePath(null);
     setSelectedProjectDirectoryPath(".");
@@ -1017,7 +2164,7 @@ export function App() {
     setAgentSessionProjectRoot(null);
     setAgentSessionProviderId(null);
     setStatusMessage("Project closed");
-  }, [buildRunning, dirtyFiles.length, toolchainStatus]);
+  }, [buildRunning, dirtyFileCount, toolchainStatus]);
 
   const readProjectFile = useCallback(
     async (path: string, revealLine?: number) => {
@@ -1135,6 +2282,81 @@ export function App() {
     [showErrorInTerminal]
   );
 
+  const updateProjectCompiler = useCallback(
+    (compiler: LatexCompiler) => {
+      const sharedProject = activeSharedProject;
+      setSelectedCompiler(compiler);
+      updateAppSettings((settings) => ({
+        ...settings,
+        compiler: {
+          ...settings.compiler,
+          compiler
+        }
+      }));
+
+      if (sharedProject === null) {
+        return;
+      }
+
+      if (sharedProject.role === "viewer") {
+        setStatusMessage(
+          "Shared viewers can compile locally, but cannot change project settings."
+        );
+        return;
+      }
+
+      void runProjectOperation(async () => {
+        const updated = await desktopApi.shared.updateProjectSettings({
+          projectId: sharedProject.id,
+          compiler
+        });
+        setSharedProjects((projects) =>
+          projects.map((project) =>
+            project.id === updated.id ? { ...project, ...updated } : project
+          )
+        );
+        setActiveSharedProject((current) =>
+          current === null || current.id !== updated.id
+            ? current
+            : { ...current, compiler: updated.compiler ?? compiler }
+        );
+        setSharedStatus(`Set shared compiler to ${formatCompilerLabel(compiler)}.`);
+      });
+    },
+    [activeSharedProject, runProjectOperation, updateAppSettings]
+  );
+
+  const refreshSharedFileRevisions = useCallback(async () => {
+    const sharedProject = activeSharedProject;
+    const filePath = activeFilePath;
+
+    if (sharedProject === null || !sharedConnection.connected || filePath === null) {
+      setSharedFileRevisions([]);
+      return;
+    }
+
+    try {
+      const revisions = await desktopApi.shared.listFileRevisions({
+        projectId: sharedProject.id,
+        path: filePath
+      });
+      setSharedFileRevisions(revisions.slice(0, 5));
+    } catch (error) {
+      setSharedFileRevisions([]);
+      setSharedStatus(
+        `Could not load shared revisions for ${filePath}: ${getErrorMessage(error)}`
+      );
+    }
+  }, [activeFilePath, activeSharedProject, sharedConnection.connected]);
+
+  useEffect(() => {
+    void refreshSharedFileRevisions();
+  }, [refreshSharedFileRevisions, sharedRealtimeDocumentVersions]);
+
+  useEffect(() => {
+    setSelectedSharedFileRevision(null);
+  }, [activeFilePath, activeSharedProject?.id]);
+
   const refreshHistory = useCallback(async () => {
     if (currentProject === undefined) {
       setHistoryChangeSets([]);
@@ -1218,6 +2440,92 @@ export function App() {
     []
   );
 
+  const reloadOnlyOfficeWordDocument = useCallback((filePath: string) => {
+    setOnlyOfficeWordReloadVersions((versions) => ({
+      ...versions,
+      [filePath]: (versions[filePath] ?? 0) + 1
+    }));
+  }, []);
+
+  const applyWordChangeSetsDirectly = useCallback(
+    async (changesets: readonly WordChangeSet[], sourceLabel = "Agent") => {
+      if (changesets.length === 0) {
+        return [];
+      }
+
+      const appliedResults: WordChangeSetApplyResult[] = [];
+      for (const changeset of changesets) {
+        if (onlyOfficeWordFileStates[changeset.filePath]?.dirty === true) {
+          throw new Error(
+            `Save or sync ${changeset.filePath} in ONLYOFFICE before applying the Word edit.`
+          );
+        }
+
+        const result = await desktopApi.word.applyChangeSet({ changeset });
+        appliedResults.push(result);
+        setWordChangeSets((currentChangeSets) =>
+          replaceWordChangeSet(currentChangeSets, result.changeset)
+        );
+        setSelectedWordChangeSetId(result.changeset.id);
+        setOpenFiles((files) =>
+          upsertOpenFile(files, createEditorFileStateFromWordDocument(result.document))
+        );
+        setActiveFilePath(result.document.path);
+        setSelectedProjectEntryPath(result.document.path);
+        setSelectedProjectDirectoryPath(getProjectDirectoryPath(result.document.path));
+        appWrittenProjectPathsRef.current.add(
+          normalizeProjectPath(result.document.path)
+        );
+        reloadOnlyOfficeWordDocument(result.document.path);
+      }
+
+      const lastResult = appliedResults.at(-1);
+      if (lastResult !== undefined) {
+        setHistoryMessage(
+          appliedResults.length === 1
+            ? `${sourceLabel} applied ${lastResult.changeset.summary}; Word document verified.`
+            : `${sourceLabel} applied ${appliedResults.length} Word edits; documents verified.`
+        );
+      }
+
+      await refreshHistory();
+      return appliedResults;
+    },
+    [onlyOfficeWordFileStates, refreshHistory, reloadOnlyOfficeWordDocument]
+  );
+
+  const handleAgentWordChangeSets = useCallback(
+    async (
+      changesets: readonly WordChangeSet[],
+      options: {
+        readonly autoApply: boolean;
+        readonly proposedLabel?: string;
+        readonly appliedLabel?: string;
+      }
+    ) => {
+      if (changesets.length === 0) {
+        return { applied: false, count: 0 };
+      }
+
+      if (options.autoApply) {
+        const appliedResults = await applyWordChangeSetsDirectly(
+          changesets,
+          options.appliedLabel ?? "Agent"
+        );
+        return { applied: appliedResults.length > 0, count: appliedResults.length };
+      }
+
+      await rememberWordChangeSets(changesets);
+      setHistoryMessage(
+        changesets.length === 1
+          ? `${options.proposedLabel ?? "Agent proposed"} ${changesets[0]!.summary}`
+          : `${options.proposedLabel ?? "Agent proposed"} ${changesets.length} Word changes`
+      );
+      return { applied: false, count: changesets.length };
+    },
+    [applyWordChangeSetsDirectly, rememberWordChangeSets]
+  );
+
   const refreshReferences = useCallback(async () => {
     if (currentProject === undefined) {
       setReferenceAnalysis(emptyReferenceAnalysis);
@@ -1242,6 +2550,7 @@ export function App() {
     void runProjectOperation(async () => {
       const result = await desktopApi.project.open();
       if (result !== undefined) {
+        setActiveSharedProject(null);
         await applyProjectResult(result);
       }
     });
@@ -1250,11 +2559,537 @@ export function App() {
   const openRecentProject = useCallback(
     (rootPath: string) => {
       void runProjectOperation(async () => {
+        setActiveSharedProject(null);
         await applyProjectResult(await desktopApi.project.openRecent(rootPath));
       });
     },
     [applyProjectResult, runProjectOperation]
   );
+
+  const clearRecentProjects = useCallback(() => {
+    void runProjectOperation(async () => {
+      const result = await desktopApi.project.clearRecent();
+      setProjectState(result);
+      setStatusMessage("Cleared recent projects.");
+    });
+  }, [runProjectOperation]);
+
+  const refreshSharedProjects = useCallback(() => {
+    void runProjectOperation(async () => {
+      if (!sharedConnection.connected) {
+        setSharedStatus("Sign in before refreshing shared projects.");
+        return;
+      }
+
+      setSharedBusy(true);
+      try {
+        const projects = await desktopApi.shared.listProjects();
+        setSharedProjects(projects);
+        setSharedStatus(
+          projects.length === 1
+            ? "Loaded 1 shared project."
+            : `Loaded ${projects.length} shared projects.`
+        );
+      } finally {
+        setSharedBusy(false);
+      }
+    });
+  }, [runProjectOperation, sharedConnection.connected]);
+
+  const signInToSharedProjects = useCallback(() => {
+    void runProjectOperation(async () => {
+      const baseUrl = sharedServerUrl.trim();
+      const email = sharedEmail.trim();
+      const name = sharedName.trim();
+
+      if (baseUrl.length === 0 || email.length === 0) {
+        setSharedStatus("Enter a server URL and email.");
+        return;
+      }
+
+      setSharedBusy(true);
+      try {
+        const connection = await desktopApi.shared.signIn(
+          name.length === 0 ? { baseUrl, email } : { baseUrl, email, name }
+        );
+        const [projects, sessions] = await Promise.all([
+          desktopApi.shared.listProjects(),
+          desktopApi.shared.listSessions()
+        ]);
+        setSharedConnection(connection);
+        setSharedProjects(projects);
+        setSharedSessions(sessions);
+        setSharedStatus(
+          connection.user === undefined
+            ? "Signed in to shared projects."
+            : `Signed in as ${connection.user.email}.`
+        );
+      } finally {
+        setSharedBusy(false);
+      }
+    });
+  }, [runProjectOperation, sharedEmail, sharedName, sharedServerUrl]);
+
+  const signOutFromSharedProjects = useCallback(() => {
+    void runProjectOperation(async () => {
+      setSharedBusy(true);
+      try {
+        const connection = await desktopApi.shared.signOut();
+        setSharedConnection(connection);
+        setSharedProjects([]);
+        setSharedSessions([]);
+        setSharedMembers([]);
+        setSharedPresence([]);
+        setSharedBuildArtifacts([]);
+        setSharedActivity([]);
+        setSharedAuditEvents([]);
+        setSharedAgentRuns([]);
+        setSharedAgentChangeSets([]);
+        setSharedAgentRunIdsBySessionId({});
+        setSharedAgentRunIdsByLocalChangeSetId({});
+        setSharedAgentChangeSetIdsByLocalId({});
+        setSharedDocumentConflictPaths(new Set());
+        setSharedDocumentOperationFailedPaths(new Set());
+        setSharedDocumentPendingOperations({});
+        setSharedDocumentUpdateCursors({});
+        setSharedRealtimeDocumentVersions({});
+        setSharedDocumentSyncStatus("Shared editor sync idle.");
+        setActiveSharedProject(null);
+        setSharedStatus("Signed out of shared projects.");
+      } finally {
+        setSharedBusy(false);
+      }
+    });
+  }, [runProjectOperation]);
+
+  const revokeSharedSession = useCallback(
+    (sessionId: string) => {
+      void runProjectOperation(async () => {
+        if (!sharedConnection.connected) {
+          setSharedStatus("Sign in before managing sessions.");
+          return;
+        }
+
+        setSharedBusy(true);
+        try {
+          const result = await desktopApi.shared.revokeSession({ sessionId });
+          const sessions = await desktopApi.shared.listSessions();
+          setSharedSessions(sessions);
+          setSharedStatus(
+            result.revoked
+              ? `Revoked ${formatSharedSessionLabel({ id: sessionId })}.`
+              : "Shared session was already inactive."
+          );
+        } finally {
+          setSharedBusy(false);
+        }
+      });
+    },
+    [runProjectOperation, sharedConnection.connected]
+  );
+
+  const createSharedProject = useCallback(() => {
+    void runProjectOperation(async () => {
+      const name = sharedProjectName.trim();
+
+      if (!sharedConnection.connected) {
+        setSharedStatus("Sign in before creating a shared project.");
+        return;
+      }
+
+      if (name.length === 0) {
+        setSharedStatus("Enter a shared project name.");
+        return;
+      }
+
+      setSharedBusy(true);
+      try {
+        const project = await desktopApi.shared.createProject({
+          name,
+          files: [
+            {
+              path: "main.tex",
+              contents:
+                "\\documentclass{article}\n\\begin{document}\nShared ZeroLeaf project.\n\\end{document}\n"
+            }
+          ]
+        });
+        const projects = await desktopApi.shared.listProjects();
+        setSharedProjects(projects);
+        setSharedProjectName("");
+        setSharedStatus(`Created ${project.name}.`);
+      } finally {
+        setSharedBusy(false);
+      }
+    });
+  }, [runProjectOperation, sharedConnection.connected, sharedProjectName]);
+
+  const createSharedProjectFromLocalProject = useCallback(() => {
+    void runProjectOperation(async () => {
+      const currentProject = projectResult?.project;
+      const name = sharedProjectName.trim();
+
+      if (!sharedConnection.connected) {
+        setSharedStatus("Sign in before sharing a local project.");
+        return;
+      }
+
+      if (currentProject === undefined) {
+        setSharedStatus("Open a local project before sharing it.");
+        return;
+      }
+
+      if (activeSharedProject !== null) {
+        setSharedStatus("This project is already shared.");
+        return;
+      }
+
+      if (name.length === 0) {
+        setSharedStatus("Enter a shared project name.");
+        return;
+      }
+
+      setSharedBusy(true);
+      try {
+        const created = await desktopApi.shared.createFromLocalProject({
+          projectRoot: currentProject.rootPath,
+          name
+        });
+        const [projects, opened] = await Promise.all([
+          desktopApi.shared.listProjects(),
+          desktopApi.shared.openProject(created.project.id)
+        ]);
+        setSharedProjects(projects);
+        setSharedProjectName("");
+        setActiveSharedProject({
+          id: opened.sharedProjectId,
+          localCachePath: opened.localCachePath,
+          role: opened.role,
+          ...(opened.compiler === undefined ? {} : { compiler: opened.compiler })
+        });
+        if (opened.compiler !== undefined) {
+          setSelectedCompiler(opened.compiler);
+        }
+        await applyProjectResult(opened, opened.project.mainFilePath);
+        setProjectState({ recentProjects: opened.recentProjects });
+        setSharedStatus(
+          `Shared ${created.importedFileCount} files from ${currentProject.displayName}${
+            created.skippedFilePaths.length === 0
+              ? "."
+              : `; skipped ${created.skippedFilePaths.length} binary or unsupported files.`
+          }`
+        );
+      } finally {
+        setSharedBusy(false);
+      }
+    });
+  }, [
+    activeSharedProject,
+    applyProjectResult,
+    projectResult?.project,
+    runProjectOperation,
+    sharedConnection.connected,
+    sharedProjectName
+  ]);
+
+  const createSharedProjectFromSourceZip = useCallback(() => {
+    void runProjectOperation(async () => {
+      const name = sharedProjectName.trim();
+
+      if (!sharedConnection.connected) {
+        setSharedStatus("Sign in before importing a shared ZIP.");
+        return;
+      }
+
+      setSharedBusy(true);
+      try {
+        const created = await desktopApi.shared.createFromSourceZip(
+          name.length === 0 ? {} : { name }
+        );
+        if (created === undefined) {
+          setSharedStatus("Shared ZIP import cancelled.");
+          return;
+        }
+        const projects = await desktopApi.shared.listProjects();
+        setSharedProjects(projects);
+        setSharedProjectName("");
+        setSharedStatus(
+          `Imported ${created.importedFileCount} files into ${created.project.name}${
+            created.skippedFilePaths.length === 0
+              ? "."
+              : `; skipped ${created.skippedFilePaths.length} unsupported files.`
+          }`
+        );
+      } finally {
+        setSharedBusy(false);
+      }
+    });
+  }, [runProjectOperation, sharedConnection.connected, sharedProjectName]);
+
+  const openSharedProject = useCallback(
+    (projectId: string) => {
+      void runProjectOperation(async () => {
+        setSharedBusy(true);
+        try {
+          const result = await desktopApi.shared.openProject(projectId);
+          setActiveSharedProject({
+            id: result.sharedProjectId,
+            localCachePath: result.localCachePath,
+            role: result.role,
+            ...(result.compiler === undefined ? {} : { compiler: result.compiler })
+          });
+          if (result.compiler !== undefined) {
+            setSelectedCompiler(result.compiler);
+          }
+          await applyProjectResult(result, result.project.mainFilePath);
+          setProjectState({ recentProjects: result.recentProjects });
+          setSharedStatus(`Opened ${result.project.displayName} from shared cache.`);
+        } finally {
+          setSharedBusy(false);
+        }
+      });
+    },
+    [applyProjectResult, runProjectOperation]
+  );
+
+  const deleteSharedProject = useCallback(
+    (project: SharedProjectSummary) => {
+      void runProjectOperation(async () => {
+        if (project.role !== "owner") {
+          setSharedStatus("Only owners can delete shared projects.");
+          return;
+        }
+
+        if (
+          !window.confirm(
+            `Delete shared project "${project.name}" from the server for all collaborators?`
+          )
+        ) {
+          return;
+        }
+
+        setSharedBusy(true);
+        try {
+          const deletedProject = await desktopApi.shared.deleteProject({
+            projectId: project.id
+          });
+          setSharedProjects((projects) =>
+            projects.filter((candidate) => candidate.id !== project.id)
+          );
+          if (activeSharedProject?.id === project.id) {
+            setActiveSharedProject(null);
+          }
+          setSharedStatus(`Deleted shared project ${deletedProject.name}.`);
+        } finally {
+          setSharedBusy(false);
+        }
+      });
+    },
+    [activeSharedProject?.id, runProjectOperation]
+  );
+
+  const exportSharedProjectSourceZip = useCallback(
+    (project: SharedProjectSummary) => {
+      void runProjectOperation(async () => {
+        if (project.role !== "owner") {
+          setSharedStatus("Only owners can export shared projects.");
+          return;
+        }
+
+        setSharedBusy(true);
+        try {
+          const result = await desktopApi.shared.exportSourceZip({
+            projectId: project.id
+          });
+          setSharedStatus(
+            result === undefined
+              ? "Shared source export cancelled."
+              : `Exported ${result.fileCount} shared source files.`
+          );
+        } finally {
+          setSharedBusy(false);
+        }
+      });
+    },
+    [runProjectOperation]
+  );
+
+  const inviteToActiveSharedProject = useCallback(() => {
+    void runProjectOperation(async () => {
+      const email = sharedInviteEmail.trim();
+
+      if (activeSharedProject === null) {
+        setSharedStatus("Open a shared project before inviting collaborators.");
+        return;
+      }
+
+      if (activeSharedProject.role !== "owner") {
+        setSharedStatus("Only shared project owners can invite collaborators.");
+        return;
+      }
+
+      if (email.length === 0) {
+        setSharedStatus("Enter an email address to invite.");
+        return;
+      }
+
+      setSharedBusy(true);
+      try {
+        const invitation = await desktopApi.shared.invite({
+          projectId: activeSharedProject.id,
+          email,
+          role: sharedInviteRole
+        });
+        setSharedInviteEmail("");
+        setSharedStatus(`Invited ${invitation.email} as ${invitation.role}.`);
+      } finally {
+        setSharedBusy(false);
+      }
+    });
+  }, [activeSharedProject, runProjectOperation, sharedInviteEmail, sharedInviteRole]);
+
+  const updateSharedMemberRole = useCallback(
+    (userId: string, role: Exclude<SharedProjectRole, "owner">) => {
+      void runProjectOperation(async () => {
+        if (activeSharedProject === null) {
+          setSharedStatus("Open a shared project before managing collaborators.");
+          return;
+        }
+
+        if (activeSharedProject.role !== "owner") {
+          setSharedStatus("Only shared project owners can manage collaborators.");
+          return;
+        }
+
+        setSharedBusy(true);
+        try {
+          const member = await desktopApi.shared.updateMemberRole({
+            projectId: activeSharedProject.id,
+            userId,
+            role
+          });
+          const members = await desktopApi.shared.listMembers(activeSharedProject.id);
+          setSharedMembers(members);
+          setSharedStatus(
+            `Updated ${member.email ?? member.userId} to ${formatSharedProjectRole(
+              member.role
+            )}.`
+          );
+        } finally {
+          setSharedBusy(false);
+        }
+      });
+    },
+    [activeSharedProject, runProjectOperation]
+  );
+
+  const transferSharedOwnership = useCallback(
+    (member: SharedProjectMemberSummary) => {
+      void runProjectOperation(async () => {
+        if (activeSharedProject === null) {
+          setSharedStatus("Open a shared project before managing collaborators.");
+          return;
+        }
+
+        if (activeSharedProject.role !== "owner") {
+          setSharedStatus("Only shared project owners can transfer ownership.");
+          return;
+        }
+
+        const memberLabel = member.email ?? member.name ?? member.userId;
+        if (
+          !window.confirm(
+            `Transfer ownership to ${memberLabel}? You will become an editor.`
+          )
+        ) {
+          return;
+        }
+
+        setSharedBusy(true);
+        try {
+          const members = await desktopApi.shared.transferOwnership({
+            projectId: activeSharedProject.id,
+            userId: member.userId
+          });
+          const projects = await desktopApi.shared.listProjects();
+          const nextActiveRole =
+            projects.find((project) => project.id === activeSharedProject.id)?.role ??
+            "editor";
+
+          setSharedMembers(members);
+          setSharedProjects(projects);
+          setActiveSharedProject({
+            ...activeSharedProject,
+            role: nextActiveRole
+          });
+          setSharedStatus(`Transferred ownership to ${memberLabel}.`);
+        } finally {
+          setSharedBusy(false);
+        }
+      });
+    },
+    [activeSharedProject, runProjectOperation]
+  );
+
+  const removeSharedMember = useCallback(
+    (userId: string) => {
+      void runProjectOperation(async () => {
+        if (activeSharedProject === null) {
+          setSharedStatus("Open a shared project before managing collaborators.");
+          return;
+        }
+
+        if (activeSharedProject.role !== "owner") {
+          setSharedStatus("Only shared project owners can manage collaborators.");
+          return;
+        }
+
+        setSharedBusy(true);
+        try {
+          const member = await desktopApi.shared.removeMember({
+            projectId: activeSharedProject.id,
+            userId
+          });
+          const members = await desktopApi.shared.listMembers(activeSharedProject.id);
+          setSharedMembers(members);
+          setSharedPresence((presence) =>
+            presence.filter((entry) => entry.userId !== userId)
+          );
+          setSharedStatus(`Removed ${member.email ?? member.userId}.`);
+        } finally {
+          setSharedBusy(false);
+        }
+      });
+    },
+    [activeSharedProject, runProjectOperation]
+  );
+
+  const acceptSharedInvitation = useCallback(() => {
+    void runProjectOperation(async () => {
+      const invitationId = sharedInvitationId.trim();
+
+      if (!sharedConnection.connected) {
+        setSharedStatus("Sign in before accepting an invitation.");
+        return;
+      }
+
+      if (invitationId.length === 0) {
+        setSharedStatus("Enter an invitation id.");
+        return;
+      }
+
+      setSharedBusy(true);
+      try {
+        await desktopApi.shared.acceptInvitation({ invitationId });
+        const projects = await desktopApi.shared.listProjects();
+        setSharedProjects(projects);
+        setSharedInvitationId("");
+        setSharedStatus("Invitation accepted.");
+      } finally {
+        setSharedBusy(false);
+      }
+    });
+  }, [runProjectOperation, sharedConnection.connected, sharedInvitationId]);
 
   const refreshProjectTree = useCallback(() => {
     void runProjectOperation(async () => {
@@ -1269,10 +3104,28 @@ export function App() {
     });
   }, [currentProject, runProjectOperation]);
 
+  useEffect(() => {
+    if (
+      activeSharedProject === null ||
+      currentProject === undefined ||
+      sharedRealtimeTreeVersion === 0
+    ) {
+      return;
+    }
+
+    refreshProjectTree();
+  }, [
+    activeSharedProject,
+    currentProject,
+    refreshProjectTree,
+    sharedRealtimeTreeVersion
+  ]);
+
   const importSourceZip = useCallback(() => {
     void runProjectOperation(async () => {
       const result = await desktopApi.lifecycle.importSourceZip();
       if (result !== undefined) {
+        setActiveSharedProject(null);
         await applyProjectResult(result);
         setStatusMessage(`Imported ${result.project.displayName}`);
       }
@@ -1293,6 +3146,7 @@ export function App() {
         projectName
       });
       if (result !== undefined) {
+        setActiveSharedProject(null);
         await applyProjectResult(result, result.project.mainFilePath);
         setStatusMessage(`Created ${result.project.displayName}`);
       }
@@ -1327,41 +3181,30 @@ export function App() {
 
   const runNoProjectAgentCommand = useCallback(
     async (prompt: string, command: NoProjectAgentCommand) => {
-      const sessionId = `agent-session-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2, 8)}`;
-      const userEvent = buildAgentMessageEvent({
-        content: prompt,
-        role: "user",
-        sessionId
-      });
-      const templateName =
-        projectTemplates.find((template) => template.id === command.templateId)?.name ??
-        command.templateId;
+      const authStatus = agentAuthStatuses[agentProviderId];
+      const providerLabel = getAgentProviderLabel(agentProviderId);
+
+      if (authStatus.state !== "connected") {
+        setStatusMessage(
+          `${providerLabel} is ${formatAgentAuthState(authStatus.state)}. Check AI Providers settings.`
+        );
+        return;
+      }
 
       setAgentRunning(true);
       setAgentLiveStatus({
         detail: `Choose a destination folder for ${command.projectName}.`,
-        title: "Creating project",
+        title: "Preparing agent project",
         tone: "running"
       });
       setStatusMessage(`Creating ${command.projectName}...`);
 
       try {
-        const result = await desktopApi.lifecycle.createFromTemplate({
-          projectName: command.projectName,
-          templateId: command.templateId
+        const projectResult = await desktopApi.lifecycle.createForAgent({
+          projectName: command.projectName
         });
 
-        if (result === undefined) {
-          const assistantEvent = buildAgentMessageEvent({
-            content: "Project creation was cancelled. No project was created.",
-            role: "assistant",
-            sessionId
-          });
-          setAgentEvents((events) =>
-            mergeAgentThreadEvents([...events, userEvent, assistantEvent])
-          );
+        if (projectResult === undefined) {
           setAgentLiveStatus({
             detail: "No folder was selected.",
             title: "Project creation cancelled",
@@ -1371,140 +3214,169 @@ export function App() {
           return;
         }
 
-        await applyProjectResult(result, result.project.mainFilePath);
-
-        const assistantEvent = buildAgentMessageEvent({
-          content: `Created **${result.project.displayName}** from the ${templateName} template and opened the main TeX file.`,
-          role: "assistant",
-          sessionId
-        });
-        setAgentEvents((events) =>
-          mergeAgentThreadEvents([...events, userEvent, assistantEvent])
-        );
-        setAgentLiveStatus({
-          detail: "The new project is open and ready for editing or compilation.",
-          title: "Project created",
-          tone: "success"
-        });
-        setStatusMessage(`Created ${result.project.displayName}`);
-      } catch (error) {
-        const errorMessage = getErrorMessage(error);
-        const assistantEvent = buildAgentMessageEvent({
-          content: `Could not create **${command.projectName}**: ${errorMessage}`,
-          role: "assistant",
-          sessionId
-        });
-        setAgentEvents((events) =>
-          mergeAgentThreadEvents([...events, userEvent, assistantEvent])
-        );
-        setAgentLiveStatus({
-          detail: errorMessage,
-          title: "Project creation failed",
-          tone: "danger"
-        });
-        setStatusMessage("Project creation failed.");
-      } finally {
-        setAgentRunning(false);
-      }
-    },
-    [applyProjectResult, projectTemplates]
-  );
-
-  const runExternalTemplateAgentCommand = useCallback(
-    async (prompt: string, command: ExternalTemplateAgentCommand) => {
-      const sessionId = `agent-session-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2, 8)}`;
-      const userEvent = buildAgentMessageEvent({
-        content: prompt,
-        role: "user",
-        sessionId
-      });
-
-      setAgentRunning(true);
-      setAgentEvents((events) => mergeAgentThreadEvents([...events, userEvent]));
-      setAgentLiveStatus({
-        detail:
-          "Preparing the project name, template source, and destination workflow.",
-        title: "Understanding request",
-        tone: "running"
-      });
-      setStatusMessage(`Creating ${command.projectName} from external template...`);
-
-      try {
+        setActiveSharedProject(null);
+        await applyProjectResult(projectResult);
+        let seededWordDocument: WordDocumentModel | undefined;
+        if (command.documentKind === "word") {
+          const wordPath = command.wordPath ?? "document.docx";
+          await desktopApi.word.save({
+            projectRoot: projectResult.project.rootPath,
+            path: wordPath,
+            blocks: []
+          });
+          seededWordDocument = await desktopApi.word.read({
+            projectRoot: projectResult.project.rootPath,
+            path: wordPath
+          });
+          const wordFile = createEditorFileStateFromWordDocument(seededWordDocument);
+          setOpenFiles((files) => upsertOpenFile(files, wordFile));
+          setActiveFilePath(wordFile.path);
+          setSelectedProjectEntryPath(wordFile.path);
+          setSelectedProjectDirectoryPath(getProjectDirectoryPath(wordFile.path));
+          setStatusMessage(`Created ${wordFile.path}`);
+        }
         setAgentLiveStatus({
           detail:
-            "Fetching the IEEEtran journal skeleton from the official CTAN mirror redirect.",
-          title: "Searching official sources",
+            command.documentKind === "word"
+              ? "Passing the project request to the agent with the blank Word document open."
+              : "Passing the project request to the agent with a scoped empty project root.",
+          title: `${providerLabel} is setting up the project`,
           tone: "running"
         });
-        const result = await desktopApi.lifecycle.createFromExternalTemplate({
-          projectName: command.projectName,
-          templateId: command.templateId
+        setAgentEvents([]);
+
+        const agentResult = await desktopApi.agent.start({
+          providerId: agentProviderId,
+          mode: "apply-with-review",
+          projectRoot: projectResult.project.rootPath,
+          maxTurns: appSettings.agentPermissions.maxTurns,
+          prompt,
+          ...(seededWordDocument === undefined
+            ? {}
+            : {
+                activeFilePath: seededWordDocument.path,
+                activeDocument: {
+                  kind: "word" as const,
+                  path: seededWordDocument.path,
+                  plainText: seededWordDocument.plainText,
+                  blocks: seededWordDocument.blocks,
+                  warnings: seededWordDocument.warnings
+                }
+              }),
+          compiler: selectedCompiler
         });
 
-        if (result === undefined) {
-          const assistantEvent = buildAgentMessageEvent({
-            content: "Project creation was cancelled. No project was created.",
-            role: "assistant",
-            sessionId
-          });
-          setAgentEvents((events) =>
-            mergeAgentThreadEvents([...events, assistantEvent])
+        setAgentSessionId(agentResult.sessionId);
+        setAgentSessionProjectRoot(projectResult.project.rootPath);
+        setAgentSessionProviderId(agentProviderId);
+        const displayResultEvents = prepareAgentDisplayEvents(agentResult.events);
+        const summaryEvent = buildAgentCompletionSummaryEvent(agentResult, {
+          wordChangesAutoApply: agentMode === "autonomous-local"
+        });
+        setAgentEvents(
+          mergeAgentThreadEvents([
+            ...displayResultEvents,
+            ...(summaryEvent === undefined ? [] : [summaryEvent])
+          ])
+        );
+
+        const proposedChangeSets = agentResult.changesets ?? [];
+        const proposedChangeSet = agentResult.changeset;
+        if (proposedChangeSet !== undefined) {
+          setSelectedChangeSetId(proposedChangeSet.id);
+          setHistoryMessage(
+            proposedChangeSets.length > 1
+              ? `Agent proposed ${proposedChangeSets.length} project setup changes`
+              : `Agent proposed ${proposedChangeSet.summary}`
           );
-          setAgentLiveStatus({
-            detail: "No destination folder was selected.",
-            title: "Project creation cancelled",
-            tone: "warning"
-          });
-          setStatusMessage("Project creation cancelled.");
-          return;
+          setChangeSetVerifications((verifications) => ({
+            ...verifications,
+            ...Object.fromEntries(
+              (proposedChangeSets.length > 0
+                ? proposedChangeSets
+                : [proposedChangeSet]
+              ).map((changeset) => [
+                changeset.id,
+                {
+                  status: "pending",
+                  summary:
+                    "Review the generated project files, then approve the patch to run compile verification."
+                }
+              ])
+            )
+          }));
+          setActiveBottomTab("History");
+          const [changeSets, auditLog] = await Promise.all([
+            desktopApi.history.listChangeSets({
+              projectRoot: projectResult.project.rootPath
+            }),
+            desktopApi.history.listAuditEvents({
+              projectRoot: projectResult.project.rootPath
+            })
+          ]);
+          setHistoryChangeSets(changeSets);
+          setAuditEvents(auditLog);
         }
 
-        setAgentLiveStatus({
-          detail:
-            "Opening the new project and selecting the generated IEEE-style main file.",
-          title: "Comparing with project",
-          tone: "running"
+        const proposedWordChangeSets = getAgentResultWordChangeSets(agentResult);
+        await handleAgentWordChangeSets(proposedWordChangeSets, {
+          autoApply: agentMode === "autonomous-local",
+          appliedLabel: "Agent",
+          proposedLabel: "Agent proposed"
         });
-        await applyProjectResult(result, result.project.mainFilePath);
 
-        const assistantEvent = buildAgentMessageEvent({
-          content: [
-            `Created **${result.project.displayName}** from the IEEE Systems Journal template workflow.`,
-            `Opened **${result.project.mainFilePath}** in the project explorer and wrote the fetched IEEEtran journal skeleton into it.`,
-            "Source used: https://mirrors.ctan.org/macros/latex/contrib/IEEEtran/bare_jrnl.tex"
-          ].join("\n\n"),
-          role: "assistant",
-          sessionId
-        });
-        setAgentEvents((events) => mergeAgentThreadEvents([...events, assistantEvent]));
+        const agentBuildResult = agentResult.buildResult;
+        if (agentBuildResult !== undefined) {
+          setBuildResult(agentBuildResult);
+          setActiveBottomTab("Log");
+          if (agentBuildResult.status !== "succeeded") {
+            setBottomPanelOpen(true);
+          }
+        }
+
+        const approvalToolName = getRequestedApprovalToolName(agentResult.events);
+        const refreshedProject = await desktopApi.project.refresh(
+          projectResult.project.rootPath
+        );
+        setProjectResult(refreshedProject);
+        setProjectState({ recentProjects: refreshedProject.recentProjects });
         setAgentLiveStatus({
           detail:
-            "The new project is open with the external IEEE template in main.tex.",
-          title: "Final response",
-          tone: "success"
+            agentResult.status === "awaiting-approval"
+              ? "Review the generated files in History before applying them."
+              : "The agent response is ready in the transcript.",
+          title:
+            agentResult.status === "awaiting-approval"
+              ? createAwaitingApprovalLiveStatus(approvalToolName).title
+              : `${providerLabel} completed project setup`,
+          tone: agentResult.status === "failed" ? "danger" : "success"
         });
-        setStatusMessage(`Created ${result.project.displayName}`);
+        setStatusMessage(
+          agentResult.status === "awaiting-approval"
+            ? `${providerLabel} is waiting for patch approval.`
+            : `${providerLabel} completed.`
+        );
       } catch (error) {
         const errorMessage = getErrorMessage(error);
-        const assistantEvent = buildAgentMessageEvent({
-          content: `Could not create **${command.projectName}** from the external template: ${errorMessage}`,
-          role: "assistant",
-          sessionId
-        });
-        setAgentEvents((events) => mergeAgentThreadEvents([...events, assistantEvent]));
         setAgentLiveStatus({
           detail: errorMessage,
-          title: "Template project failed",
+          title: "Agent project setup failed",
           tone: "danger"
         });
-        setStatusMessage("External template project creation failed.");
+        setStatusMessage("Agent project setup failed.");
       } finally {
         setAgentRunning(false);
       }
     },
-    [applyProjectResult]
+    [
+      agentAuthStatuses,
+      agentProviderId,
+      appSettings.agentPermissions.maxTurns,
+      applyProjectResult,
+      agentMode,
+      handleAgentWordChangeSets,
+      selectedCompiler
+    ]
   );
 
   const exportCurrentPdf = useCallback(() => {
@@ -1649,10 +3521,45 @@ export function App() {
     [createManualSaveVerification]
   );
 
+  const clearSharedDocumentConflictState = useCallback((path: string) => {
+    setSharedDocumentConflictPaths((paths) => {
+      if (!paths.has(path)) {
+        return paths;
+      }
+
+      const nextPaths = new Set(paths);
+      nextPaths.delete(path);
+      return nextPaths;
+    });
+    setSharedDocumentOperationFailedPaths((paths) => {
+      if (!paths.has(path)) {
+        return paths;
+      }
+
+      const nextPaths = new Set(paths);
+      nextPaths.delete(path);
+      return nextPaths;
+    });
+    setSharedDocumentPendingOperations((operations) => {
+      if (operations[path] === undefined) {
+        return operations;
+      }
+
+      const { [path]: _clearedOperations, ...nextOperations } = operations;
+      return nextOperations;
+    });
+  }, []);
+
   const saveEditorFileWithLocalHistory = useCallback(
     async (file: EditorFileState): Promise<SavedEditorFile> => {
       if (currentProject === undefined) {
         throw new Error("Open a project before saving.");
+      }
+
+      if (!sharedProjectCanEdit) {
+        throw new Error(
+          "Shared viewers can read and compile this project, but cannot edit it."
+        );
       }
 
       const editorContents =
@@ -1665,57 +3572,75 @@ export function App() {
       };
 
       if (fileToSave.documentKind === "word") {
-        const wordBlocks =
-          fileToSave.wordBlocks ??
-          fileToSave.contents.split(/\n{2,}/u).map((text, index) => ({
-            id: `p-${index + 1}`,
-            kind: "paragraph" as const,
-            text
-          }));
-
-        let result: Awaited<ReturnType<typeof desktopApi.word.save>>;
-        try {
-          result = await desktopApi.word.save({
-            projectRoot: currentProject.rootPath,
-            path: fileToSave.path,
-            blocks: wordBlocks
-          });
-        } catch (error) {
-          throw new Error(`Could not save ${file.path}: ${getErrorMessage(error)}`);
-        }
-
-        return {
-          file: {
-            ...fileToSave,
-            contents: getWordBlocksPlainText(wordBlocks),
-            savedContents: getWordBlocksPlainText(wordBlocks),
-            mtimeMs: result.mtimeMs,
-            stale: false,
-            wordBlocks,
-            savedWordBlocks: wordBlocks
-          }
-        };
+        throw new Error("Word documents are saved through ONLYOFFICE.");
       }
 
-      let result: Awaited<ReturnType<typeof desktopApi.files.write>>;
+      const activeSharedSaveProject =
+        activeSharedProject?.localCachePath === currentProject.rootPath
+          ? activeSharedProject
+          : null;
+      let savedContents = fileToSave.contents;
+      let result: { readonly mtimeMs: number };
       try {
-        result = await desktopApi.files.write({
-          projectRoot: currentProject.rootPath,
-          path: fileToSave.path,
-          contents: fileToSave.contents
-        });
+        if (activeSharedSaveProject !== null) {
+          const pendingOperations =
+            sharedDocumentPendingOperations[fileToSave.path] ?? [];
+          if (pendingOperations.length > 0) {
+            throw new Error(
+              "Wait for queued shared operations to finish before saving."
+            );
+          }
+          if (sharedDocumentConflictPaths.has(fileToSave.path)) {
+            throw new Error("Resolve the shared document conflict before saving.");
+          }
+
+          const operations = createSharedTextOperations(
+            file.savedContents,
+            fileToSave.contents
+          );
+          if (operations.length === 0) {
+            result = { mtimeMs: file.mtimeMs };
+          } else {
+            const sharedResult = await desktopApi.shared.applyDocumentTextOperations({
+              projectId: activeSharedSaveProject.id,
+              path: fileToSave.path,
+              operations,
+              clientOperationId: crypto.randomUUID()
+            });
+            if (sharedResult.lastUpdateId !== undefined) {
+              setSharedDocumentUpdateCursors((cursors) =>
+                cursors[sharedResult.path] === sharedResult.lastUpdateId
+                  ? cursors
+                  : {
+                      ...cursors,
+                      [sharedResult.path]: sharedResult.lastUpdateId ?? ""
+                    }
+              );
+            }
+            clearSharedDocumentConflictState(sharedResult.path);
+            savedContents = sharedResult.contents;
+            result = { mtimeMs: sharedResult.mtimeMs };
+          }
+        } else {
+          result = await desktopApi.files.write({
+            projectRoot: currentProject.rootPath,
+            path: fileToSave.path,
+            contents: fileToSave.contents
+          });
+        }
       } catch (error) {
         throw new Error(`Could not save ${file.path}: ${getErrorMessage(error)}`);
       }
 
       const savedFile = {
         ...fileToSave,
-        savedContents: fileToSave.contents,
+        contents: savedContents,
+        savedContents,
         mtimeMs: result.mtimeMs,
         stale: false
       };
 
-      if (fileToSave.contents === file.savedContents) {
+      if (savedContents === file.savedContents) {
         return { file: savedFile };
       }
 
@@ -1724,7 +3649,7 @@ export function App() {
           projectRoot: currentProject.rootPath,
           filePath: file.path,
           beforeContents: file.savedContents,
-          afterContents: fileToSave.contents,
+          afterContents: savedContents,
           summary: `Manual save: ${file.path}`
         });
         return { file: savedFile, changeset };
@@ -1735,7 +3660,15 @@ export function App() {
         return { file: savedFile };
       }
     },
-    [activeFilePath, currentProject]
+    [
+      activeFilePath,
+      activeSharedProject,
+      clearSharedDocumentConflictState,
+      currentProject,
+      sharedDocumentConflictPaths,
+      sharedDocumentPendingOperations,
+      sharedProjectCanEdit
+    ]
   );
 
   const saveActiveFile = useCallback(() => {
@@ -1744,9 +3677,57 @@ export function App() {
         return;
       }
 
+      if (!sharedProjectCanEdit) {
+        setStatusMessage(
+          "Shared viewers can read and compile this project, but cannot save edits."
+        );
+        return;
+      }
+
+      if (activeFile.documentKind === "word") {
+        const sessionId = onlyOfficeWordFileStates[activeFile.path]?.sessionId;
+        if (sessionId === undefined) {
+          setStatusMessage("ONLYOFFICE session is not ready for this Word document.");
+          return;
+        }
+
+        const result = await desktopApi.onlyOffice.forceSave({ sessionId });
+        setStatusMessage(result.message);
+        if (result.requested) {
+          setOnlyOfficeWordFileStates((states) => ({
+            ...states,
+            [activeFile.path]: {
+              ...states[activeFile.path],
+              sessionId,
+              dirty: false
+            }
+          }));
+          appWrittenProjectPathsRef.current.add(normalizeProjectPath(activeFile.path));
+        }
+        return;
+      }
+
       const saved = await saveEditorFileWithLocalHistory(activeFile);
 
       setOpenFiles((files) => replaceOpenFile(files, saved.file));
+      setSharedDocumentConflictPaths((paths) => {
+        if (!paths.has(activeFile.path)) {
+          return paths;
+        }
+
+        const nextPaths = new Set(paths);
+        nextPaths.delete(activeFile.path);
+        return nextPaths;
+      });
+      setSharedDocumentOperationFailedPaths((paths) => {
+        if (!paths.has(activeFile.path)) {
+          return paths;
+        }
+
+        const nextPaths = new Set(paths);
+        nextPaths.delete(activeFile.path);
+        return nextPaths;
+      });
       appWrittenProjectPathsRef.current.add(normalizeProjectPath(activeFile.path));
       if (saved.changeset !== undefined) {
         rememberManualSaveChangeSets([saved.changeset]);
@@ -1765,17 +3746,126 @@ export function App() {
   }, [
     activeFile,
     currentProject,
+    onlyOfficeWordFileStates,
     pdfArtifactData,
     pdfStale,
     refreshHistory,
     refreshReferences,
     rememberManualSaveChangeSets,
     runProjectOperation,
-    saveEditorFileWithLocalHistory
+    saveEditorFileWithLocalHistory,
+    sharedProjectCanEdit
+  ]);
+
+  const acceptSharedRemoteDocumentChanges = useCallback(() => {
+    if (
+      activeFile === null ||
+      activeFile.documentKind !== "text" ||
+      !sharedDocumentConflictPaths.has(activeFile.path)
+    ) {
+      return;
+    }
+
+    const acceptedFile = {
+      ...activeFile,
+      contents: activeFile.savedContents,
+      stale: false
+    };
+    setOpenFiles((files) => replaceOpenFile(files, acceptedFile));
+    clearSharedDocumentConflictState(activeFile.path);
+    if (pdfArtifactData !== null) {
+      setPdfStale(true);
+      setPdfStaleReason("saved");
+    }
+    setSharedDocumentSyncStatus(`Accepted remote changes for ${activeFile.path}.`);
+  }, [
+    activeFile,
+    clearSharedDocumentConflictState,
+    pdfArtifactData,
+    sharedDocumentConflictPaths
+  ]);
+
+  const keepLocalSharedDocumentChanges = useCallback(() => {
+    void runProjectOperation(async () => {
+      if (
+        activeSharedProject === null ||
+        activeFile === null ||
+        activeFile.documentKind !== "text" ||
+        !sharedDocumentConflictPaths.has(activeFile.path)
+      ) {
+        return;
+      }
+
+      if (!sharedProjectCanEdit) {
+        setSharedDocumentSyncStatus(
+          `Shared viewers can read ${activeFile.path}, but cannot publish local conflict changes.`
+        );
+        return;
+      }
+
+      const localContents =
+        activeFile.path === activeFilePath
+          ? (editorRef.current?.getValue() ?? activeFile.contents)
+          : activeFile.contents;
+
+      setSharedDocumentSyncStatus(`Publishing local changes for ${activeFile.path}...`);
+      const result = await desktopApi.shared.syncDocumentContents({
+        projectId: activeSharedProject.id,
+        path: activeFile.path,
+        contents: localContents
+      });
+      if (result.lastUpdateId !== undefined) {
+        setSharedDocumentUpdateCursors((cursors) =>
+          cursors[result.path] === result.lastUpdateId
+            ? cursors
+            : { ...cursors, [result.path]: result.lastUpdateId ?? "" }
+        );
+      }
+      appWrittenProjectPathsRef.current.add(normalizeProjectPath(result.path));
+      setOpenFiles((files) =>
+        files.map((candidate) => {
+          if (candidate.path !== result.path || candidate.documentKind !== "text") {
+            return candidate;
+          }
+
+          return {
+            ...candidate,
+            contents: result.contents,
+            savedContents: result.contents,
+            mtimeMs: result.mtimeMs,
+            stale: false
+          };
+        })
+      );
+      clearSharedDocumentConflictState(result.path);
+      if (pdfArtifactData !== null) {
+        setPdfStale(true);
+        setPdfStaleReason("saved");
+      }
+      setSharedDocumentSyncStatus(`Published local changes for ${result.path}.`);
+      await refreshReferences();
+    });
+  }, [
+    activeFile,
+    activeFilePath,
+    activeSharedProject,
+    clearSharedDocumentConflictState,
+    pdfArtifactData,
+    refreshReferences,
+    runProjectOperation,
+    sharedDocumentConflictPaths,
+    sharedProjectCanEdit
   ]);
 
   const saveDirtyFiles = useCallback(async () => {
     if (currentProject === undefined || dirtyFiles.length === 0) {
+      return 0;
+    }
+
+    if (!sharedProjectCanEdit) {
+      setStatusMessage(
+        "Shared viewers can read and compile this project, but cannot save edits."
+      );
       return 0;
     }
 
@@ -1814,7 +3904,8 @@ export function App() {
     refreshHistory,
     refreshReferences,
     rememberManualSaveChangeSets,
-    saveEditorFileWithLocalHistory
+    saveEditorFileWithLocalHistory,
+    sharedProjectCanEdit
   ]);
 
   const exportSourceArchive = useCallback(() => {
@@ -1844,12 +3935,21 @@ export function App() {
     void runProjectOperation(async () => {
       const savedCount = await saveDirtyFiles();
       if (savedCount === 0) {
+        if (dirtyWordFileCount > 0) {
+          setStatusMessage(
+            "Word documents are saved from the active ONLYOFFICE editor."
+          );
+        }
         return;
       }
 
-      setStatusMessage(`Saved ${savedCount} files`);
+      setStatusMessage(
+        dirtyWordFileCount > 0
+          ? `Saved ${savedCount} text files; Word documents stay in ONLYOFFICE.`
+          : `Saved ${savedCount} files`
+      );
     });
-  }, [runProjectOperation, saveDirtyFiles]);
+  }, [dirtyWordFileCount, runProjectOperation, saveDirtyFiles]);
 
   const snapshotActiveFile = useCallback(() => {
     void runProjectOperation(async () => {
@@ -1909,7 +4009,11 @@ export function App() {
   ]);
 
   const verifyChangeSet = useCallback(
-    async (changeset: HistoryChangeSet, operation: "apply" | "rollback" = "apply") => {
+    async (
+      changeset: HistoryChangeSet,
+      operation: "apply" | "rollback" = "apply",
+      sharedAgentRunIdOverride?: string
+    ) => {
       const actionLabel = operation === "apply" ? "applying" : "rolling back";
       const statusLabel = operation === "apply" ? "Agent patch" : "Rollback";
 
@@ -2044,12 +4148,62 @@ export function App() {
             ? `${statusLabel} compile verification passed.`
             : `${statusLabel} compile verification failed.`
         );
+
+        const sharedAgentRunId =
+          sharedAgentRunIdOverride ??
+          (operation === "apply"
+            ? sharedAgentRunIdsByLocalChangeSetId[changeset.id]
+            : undefined);
+        if (
+          activeSharedProject !== null &&
+          sharedConnection.connected &&
+          activeSharedProject.role !== "viewer" &&
+          sharedAgentRunId !== undefined
+        ) {
+          try {
+            const artifact = await desktopApi.shared.publishBuildArtifact({
+              projectId: activeSharedProject.id,
+              projectRoot: currentProject.rootPath,
+              mainFilePath: currentProject.mainFilePath,
+              buildResult: result
+            });
+            const updatedRun = await desktopApi.shared.attachAgentRunBuildArtifact({
+              projectId: activeSharedProject.id,
+              agentRunId: sharedAgentRunId,
+              artifactId: artifact.id
+            });
+            setSharedBuildArtifacts((artifacts) =>
+              [
+                artifact,
+                ...artifacts.filter((candidate) => candidate.id !== artifact.id)
+              ].slice(0, 5)
+            );
+            setSharedAgentRuns((runs) =>
+              [
+                updatedRun,
+                ...runs.filter((candidate) => candidate.id !== updatedRun.id)
+              ].slice(0, 5)
+            );
+            const [activity, auditEvents] = await Promise.all([
+              desktopApi.shared.listActivity(activeSharedProject.id),
+              desktopApi.shared.listAuditEvents(activeSharedProject.id)
+            ]);
+            setSharedActivity(activity.slice(0, 6));
+            setSharedAuditEvents(auditEvents.slice(0, 6));
+            setSharedStatus("Attached shared compile verification to agent run.");
+          } catch (error) {
+            setSharedStatus(
+              `Could not attach shared compile verification: ${getErrorMessage(error)}`
+            );
+          }
+        }
       } finally {
         setActiveBuildJobId(null);
         setBuildRunning(false);
       }
     },
     [
+      activeSharedProject,
       appSettings.agentPermissions.compileAfterPatch,
       currentProject,
       pdfArtifactData,
@@ -2059,7 +4213,91 @@ export function App() {
       showErrorInTerminal,
       saveDirtyFiles,
       selectedCompiler,
+      sharedAgentRunIdsByLocalChangeSetId,
+      sharedConnection.connected,
       toolchainStatus
+    ]
+  );
+
+  const updateSharedAgentChangeSetStatus = useCallback(
+    async (
+      localChangeSetId: string,
+      status: "applied" | "rejected"
+    ): Promise<string | undefined> => {
+      if (
+        activeSharedProject === null ||
+        !sharedConnection.connected ||
+        activeSharedProject.role === "viewer"
+      ) {
+        return undefined;
+      }
+
+      const sharedChangeSetId = sharedAgentChangeSetIdsByLocalId[localChangeSetId];
+      if (sharedChangeSetId === undefined) {
+        return undefined;
+      }
+
+      try {
+        let sharedAgentRunId: string;
+        if (status === "applied") {
+          const applied = await desktopApi.shared.applyAgentChangeSet({
+            projectId: activeSharedProject.id,
+            changesetId: sharedChangeSetId
+          });
+          appWrittenProjectPathsRef.current.add(
+            normalizeProjectPath(applied.fileRevision.path)
+          );
+          setOpenFiles((files) =>
+            files.map((file) =>
+              file.path === applied.fileRevision.path && file.documentKind === "text"
+                ? {
+                    ...file,
+                    contents: applied.fileRevision.contents,
+                    savedContents: applied.fileRevision.contents,
+                    mtimeMs: applied.fileRevision.mtimeMs,
+                    stale: false
+                  }
+                : file
+            )
+          );
+          clearSharedDocumentConflictState(applied.fileRevision.path);
+          setSharedAgentRunIdsByLocalChangeSetId((idsByChangeSetId) => ({
+            ...idsByChangeSetId,
+            [localChangeSetId]: applied.changeset.agentRunId
+          }));
+          sharedAgentRunId = applied.changeset.agentRunId;
+        } else {
+          const rejected = await desktopApi.shared.rejectAgentChangeSet({
+            projectId: activeSharedProject.id,
+            changesetId: sharedChangeSetId
+          });
+          setSharedAgentRunIdsByLocalChangeSetId((idsByChangeSetId) => ({
+            ...idsByChangeSetId,
+            [localChangeSetId]: rejected.agentRunId
+          }));
+          sharedAgentRunId = rejected.agentRunId;
+        }
+        const activity = await desktopApi.shared.listActivity(activeSharedProject.id);
+        const agentRuns = await desktopApi.shared.listAgentRuns(activeSharedProject.id);
+        const changesets = await desktopApi.shared.listAgentChangeSets(
+          activeSharedProject.id
+        );
+        setSharedActivity(activity.slice(0, 6));
+        setSharedAgentRuns(agentRuns.slice(0, 5));
+        setSharedAgentChangeSets(changesets.slice(0, 5));
+        return sharedAgentRunId;
+      } catch (error) {
+        setSharedStatus(
+          `Could not mark shared changeset ${status}: ${getErrorMessage(error)}`
+        );
+        return undefined;
+      }
+    },
+    [
+      activeSharedProject,
+      clearSharedDocumentConflictState,
+      sharedAgentChangeSetIdsByLocalId,
+      sharedConnection.connected
     ]
   );
 
@@ -2099,7 +4337,11 @@ export function App() {
         setActiveBottomTab("History");
         await readProjectFile(changeset.filePath);
         await refreshHistory();
-        await verifyChangeSet(changeset);
+        const sharedAgentRunId = await updateSharedAgentChangeSetStatus(
+          changeset.id,
+          "applied"
+        );
+        await verifyChangeSet(changeset, "apply", sharedAgentRunId);
       });
     },
     [
@@ -2108,6 +4350,7 @@ export function App() {
       readProjectFile,
       refreshHistory,
       runProjectOperation,
+      updateSharedAgentChangeSetStatus,
       verifyChangeSet
     ]
   );
@@ -2126,9 +4369,10 @@ export function App() {
           }
         }));
         await refreshHistory();
+        await updateSharedAgentChangeSetStatus(changeset.id, "rejected");
       });
     },
-    [refreshHistory, runProjectOperation]
+    [refreshHistory, runProjectOperation, updateSharedAgentChangeSetStatus]
   );
 
   const applyWordChangeSet = useCallback(
@@ -2140,6 +4384,13 @@ export function App() {
 
         if (changeset === undefined) {
           setHistoryMessage("Select a Word changeset before applying.");
+          return;
+        }
+
+        if (onlyOfficeWordFileStates[changeset.filePath]?.dirty === true) {
+          setHistoryMessage(
+            "Save or sync the open ONLYOFFICE document before applying this Word edit."
+          );
           return;
         }
 
@@ -2163,7 +4414,7 @@ export function App() {
         await refreshHistory();
       });
     },
-    [refreshHistory, runProjectOperation, wordChangeSets]
+    [onlyOfficeWordFileStates, refreshHistory, runProjectOperation, wordChangeSets]
   );
 
   const rejectWordChangeSet = useCallback(
@@ -2277,6 +4528,522 @@ export function App() {
     [readProjectFile, refreshHistory, runProjectOperation, verifyChangeSet]
   );
 
+  const publishSharedBuildArtifact = useCallback(
+    async (
+      result: BuildResult,
+      sourceRevisionId?: string
+    ): Promise<SharedProjectBuildArtifactSummary | undefined> => {
+      if (
+        activeSharedProject === null ||
+        !sharedConnection.connected ||
+        activeSharedProject.role === "viewer" ||
+        currentProject?.mainFilePath === undefined
+      ) {
+        return undefined;
+      }
+
+      try {
+        const artifact = await desktopApi.shared.publishBuildArtifact({
+          projectId: activeSharedProject.id,
+          projectRoot: currentProject.rootPath,
+          mainFilePath: currentProject.mainFilePath,
+          ...(sourceRevisionId === undefined ? {} : { sourceRevisionId }),
+          buildResult: result
+        });
+        setSharedBuildArtifacts((artifacts) =>
+          [
+            artifact,
+            ...artifacts.filter((candidate) => candidate.id !== artifact.id)
+          ].slice(0, 5)
+        );
+        setSharedStatus(
+          `Published local ${artifact.status} compile to shared history.`
+        );
+        return artifact;
+      } catch (error) {
+        setSharedStatus(`Could not publish shared compile: ${getErrorMessage(error)}`);
+        return undefined;
+      }
+    },
+    [activeSharedProject, currentProject, sharedConnection.connected]
+  );
+
+  const inspectSharedBuildArtifact = useCallback(
+    (artifactId: string) => {
+      void runProjectOperation(async () => {
+        if (activeSharedProject === null || !sharedConnection.connected) {
+          setSharedStatus("Open a shared project before inspecting compile history.");
+          return;
+        }
+
+        const artifact = await desktopApi.shared.getBuildArtifact(
+          activeSharedProject.id,
+          artifactId
+        );
+        const result = createBuildResultFromSharedArtifact(artifact, selectedCompiler);
+
+        setBuildResult(result);
+        setActiveBottomTab("Log");
+        setBottomPanelOpen(true);
+        setStatusMessage(
+          `Opened shared ${artifact.status} ${artifact.compiler} compile from ${formatSharedArtifactCreatedAt(artifact)}.`
+        );
+
+        if (artifact.pdfBase64 !== undefined && artifact.pdfByteLength !== undefined) {
+          setPdfArtifactData({
+            pdfPath: `shared-build-artifact:${artifact.id}.pdf`,
+            updatedAt: artifact.createdAt,
+            byteLength: artifact.pdfByteLength,
+            dataUrl: `data:application/pdf;base64,${artifact.pdfBase64}`
+          });
+          setPdfStale(false);
+          setPdfStaleReason(null);
+          setPdfPageNumber(1);
+          setSyncTexMessage("SyncTeX unavailable for shared compile artifact");
+        }
+      });
+    },
+    [
+      activeSharedProject,
+      runProjectOperation,
+      selectedCompiler,
+      sharedConnection.connected
+    ]
+  );
+
+  const inspectSharedFileRevision = useCallback(
+    (revisionId: string) => {
+      void runProjectOperation(async () => {
+        if (activeSharedProject === null || !sharedConnection.connected) {
+          setSharedStatus("Open a shared project before inspecting file revisions.");
+          return;
+        }
+
+        const revision = await desktopApi.shared.getFileRevisionDetails({
+          projectId: activeSharedProject.id,
+          revisionId
+        });
+        setSelectedSharedFileRevision(revision);
+        setSharedStatus(
+          `Opened revision ${formatSharedRevisionLabel(revision.id)} for ${revision.path}.`
+        );
+      });
+    },
+    [activeSharedProject, runProjectOperation, sharedConnection.connected]
+  );
+
+  const restoreSharedFileRevision = useCallback(
+    (revisionId: string) => {
+      void runProjectOperation(async () => {
+        if (
+          activeSharedProject === null ||
+          !sharedConnection.connected ||
+          activeSharedProject.role === "viewer"
+        ) {
+          setSharedStatus("Shared revision restore requires Editor access.");
+          return;
+        }
+
+        const restored = await desktopApi.shared.restoreFileRevision({
+          projectId: activeSharedProject.id,
+          revisionId
+        });
+        appWrittenProjectPathsRef.current.add(normalizeProjectPath(restored.path));
+        setOpenFiles((files) =>
+          files.map((file) =>
+            file.path === restored.path && file.documentKind === "text"
+              ? {
+                  ...file,
+                  contents: restored.contents,
+                  savedContents: restored.contents,
+                  mtimeMs: restored.mtimeMs,
+                  stale: false
+                }
+              : file
+          )
+        );
+        clearSharedDocumentConflictState(restored.path);
+        await readProjectFile(restored.path);
+        await refreshSharedFileRevisions();
+        const activity = await desktopApi.shared.listActivity(activeSharedProject.id);
+        setSharedActivity(activity.slice(0, 6));
+        setSelectedSharedFileRevision(null);
+        setSharedStatus(
+          `Restored ${restored.path} as revision ${formatSharedRevisionLabel(restored.revisionId)}.`
+        );
+      });
+    },
+    [
+      activeSharedProject,
+      clearSharedDocumentConflictState,
+      readProjectFile,
+      refreshSharedFileRevisions,
+      runProjectOperation,
+      sharedConnection.connected
+    ]
+  );
+
+  const createSharedComment = useCallback(() => {
+    void runProjectOperation(async () => {
+      const body = sharedCommentDraft.trim();
+
+      if (activeSharedProject === null || !sharedConnection.connected) {
+        setSharedStatus("Open a shared project before commenting.");
+        return;
+      }
+
+      if (body.length === 0) {
+        setSharedStatus("Write a comment before posting.");
+        return;
+      }
+
+      const comment = await desktopApi.shared.createComment({
+        projectId: activeSharedProject.id,
+        body,
+        ...(activeFilePath === null ? {} : { filePath: activeFilePath })
+      });
+      const [comments, activity] = await Promise.all([
+        desktopApi.shared.listComments(activeSharedProject.id),
+        desktopApi.shared.listActivity(activeSharedProject.id)
+      ]);
+      setSharedComments(comments.slice(0, 12));
+      setSharedActivity(activity.slice(0, 6));
+      setSharedCommentDraft("");
+      setSharedStatus(
+        comment.filePath === undefined
+          ? "Posted project comment."
+          : `Posted comment on ${comment.filePath}.`
+      );
+    });
+  }, [
+    activeFilePath,
+    activeSharedProject,
+    runProjectOperation,
+    sharedCommentDraft,
+    sharedConnection.connected
+  ]);
+
+  const resolveSharedComment = useCallback(
+    (commentId: string) => {
+      void runProjectOperation(async () => {
+        if (activeSharedProject === null || !sharedConnection.connected) {
+          setSharedStatus("Open a shared project before resolving comments.");
+          return;
+        }
+
+        const comment = await desktopApi.shared.resolveComment({
+          projectId: activeSharedProject.id,
+          commentId
+        });
+        const [comments, activity] = await Promise.all([
+          desktopApi.shared.listComments(activeSharedProject.id),
+          desktopApi.shared.listActivity(activeSharedProject.id)
+        ]);
+        setSharedComments(comments.slice(0, 12));
+        setSharedActivity(activity.slice(0, 6));
+        setSharedStatus(`Resolved comment ${formatSharedRevisionLabel(comment.id)}.`);
+      });
+    },
+    [activeSharedProject, runProjectOperation, sharedConnection.connected]
+  );
+
+  const publishSharedAgentRun = useCallback(
+    async (
+      result: AgentSessionResult,
+      prompt: string,
+      mode: AgentMode,
+      buildArtifactIds: readonly string[] = [],
+      existingAgentRunId?: string
+    ) => {
+      if (
+        activeSharedProject === null ||
+        !sharedConnection.connected ||
+        activeSharedProject.role === "viewer"
+      ) {
+        return undefined;
+      }
+
+      try {
+        const published = await desktopApi.shared.publishAgentRun({
+          projectId: activeSharedProject.id,
+          ...(existingAgentRunId === undefined
+            ? {}
+            : { agentRunId: existingAgentRunId }),
+          providerId: result.providerId,
+          mode,
+          prompt,
+          status: toSharedProjectAgentRunStatus(result.status),
+          changesetIds: getAgentResultChangeSets(result).map(
+            (changeset) => changeset.id
+          ),
+          ...(buildArtifactIds.length === 0 ? {} : { buildArtifactIds })
+        });
+        setSharedAgentRunIdsBySessionId((idsBySessionId) => ({
+          ...idsBySessionId,
+          [result.sessionId]: published.agentRun.id
+        }));
+        if (published.changesets.length > 0) {
+          setSharedAgentChangeSetIdsByLocalId((currentIds) => ({
+            ...currentIds,
+            ...Object.fromEntries(
+              published.changesets.map((changeset) => [
+                changeset.localChangeSetId,
+                changeset.id
+              ])
+            )
+          }));
+          setSharedAgentRunIdsByLocalChangeSetId((currentIds) => ({
+            ...currentIds,
+            ...Object.fromEntries(
+              published.changesets.map((changeset) => [
+                changeset.localChangeSetId,
+                published.agentRun.id
+              ])
+            )
+          }));
+        }
+        const activity = await desktopApi.shared.listActivity(activeSharedProject.id);
+        const agentRuns = await desktopApi.shared.listAgentRuns(activeSharedProject.id);
+        const changesets = await desktopApi.shared.listAgentChangeSets(
+          activeSharedProject.id
+        );
+        setSharedActivity(activity.slice(0, 6));
+        setSharedAgentRuns(agentRuns.slice(0, 5));
+        setSharedAgentChangeSets(changesets.slice(0, 5));
+        return published;
+      } catch (error) {
+        setSharedStatus(
+          `Could not publish shared agent run: ${getErrorMessage(error)}`
+        );
+        return undefined;
+      }
+    },
+    [activeSharedProject, sharedConnection.connected]
+  );
+
+  const applySharedAgentChangeSetFromPanel = useCallback(
+    (changeset: SharedProjectAgentChangeSetSummary) => {
+      void runProjectOperation(async () => {
+        if (
+          activeSharedProject === null ||
+          !sharedConnection.connected ||
+          activeSharedProject.role === "viewer"
+        ) {
+          setSharedStatus("Shared agent changesets require Editor access.");
+          return;
+        }
+
+        if (currentProject?.mainFilePath === undefined) {
+          setSharedStatus(
+            "Choose a main .tex file before applying a shared agent changeset."
+          );
+          return;
+        }
+
+        const applied = await desktopApi.shared.applyAgentChangeSet({
+          projectId: activeSharedProject.id,
+          changesetId: changeset.id
+        });
+        appWrittenProjectPathsRef.current.add(
+          normalizeProjectPath(applied.fileRevision.path)
+        );
+        setOpenFiles((files) =>
+          files.map((file) =>
+            file.path === applied.fileRevision.path && file.documentKind === "text"
+              ? {
+                  ...file,
+                  contents: applied.fileRevision.contents,
+                  savedContents: applied.fileRevision.contents,
+                  mtimeMs: applied.fileRevision.mtimeMs,
+                  stale: false
+                }
+              : file
+          )
+        );
+        clearSharedDocumentConflictState(applied.fileRevision.path);
+        await readProjectFile(applied.fileRevision.path);
+
+        const [activity, agentRuns, changesets] = await Promise.all([
+          desktopApi.shared.listActivity(activeSharedProject.id),
+          desktopApi.shared.listAgentRuns(activeSharedProject.id),
+          desktopApi.shared.listAgentChangeSets(activeSharedProject.id)
+        ]);
+        setSharedActivity(activity.slice(0, 6));
+        setSharedAgentRuns(agentRuns.slice(0, 5));
+        setSharedAgentChangeSets(changesets.slice(0, 5));
+        setSharedStatus(`Applied shared agent changeset for ${changeset.filePath}.`);
+
+        if (!appSettings.agentPermissions.compileAfterPatch) {
+          setSharedStatus(
+            "Applied shared agent changeset; compile-after-patch is disabled."
+          );
+          return;
+        }
+
+        const jobId = crypto.randomUUID();
+        const currentToolchain = toolchainStatus ?? (await refreshToolchainStatus());
+        const setupIssue = getToolchainSetupIssue(currentToolchain, selectedCompiler);
+
+        if (setupIssue !== undefined) {
+          const setupResult = createSetupFailureBuildResult(
+            jobId,
+            selectedCompiler,
+            setupIssue
+          );
+          setBuildResult(setupResult);
+          setActiveBottomTab("Log");
+          setBottomPanelOpen(true);
+          setSharedStatus(setupIssue);
+          showErrorInTerminal(setupIssue);
+          return;
+        }
+
+        await saveDirtyFiles();
+        setBuildRunning(true);
+        setActiveBuildJobId(jobId);
+        setBuildResult(null);
+        const buildStartPreview = startPdfPreviewBuild({
+          artifactData: pdfArtifactData,
+          stale: pdfStale
+        });
+        setPdfArtifactData(buildStartPreview.artifactData);
+        setPdfStale(buildStartPreview.stale);
+        setStatusMessage("Compiling shared agent changeset...");
+
+        try {
+          const result = await desktopApi.build.run({
+            jobId,
+            projectRoot: currentProject.rootPath,
+            mainFilePath: currentProject.mainFilePath,
+            compiler: selectedCompiler
+          });
+          setBuildResult(result);
+
+          const artifact = await desktopApi.shared.publishBuildArtifact({
+            projectId: activeSharedProject.id,
+            projectRoot: currentProject.rootPath,
+            mainFilePath: currentProject.mainFilePath,
+            buildResult: result
+          });
+          const updatedRun = await desktopApi.shared.attachAgentRunBuildArtifact({
+            projectId: activeSharedProject.id,
+            agentRunId: applied.changeset.agentRunId,
+            artifactId: artifact.id
+          });
+          setSharedBuildArtifacts((artifacts) =>
+            [
+              artifact,
+              ...artifacts.filter((candidate) => candidate.id !== artifact.id)
+            ].slice(0, 5)
+          );
+          setSharedAgentRuns((runs) =>
+            [
+              updatedRun,
+              ...runs.filter((candidate) => candidate.id !== updatedRun.id)
+            ].slice(0, 5)
+          );
+          const [nextActivity, auditEvents] = await Promise.all([
+            desktopApi.shared.listActivity(activeSharedProject.id),
+            desktopApi.shared.listAuditEvents(activeSharedProject.id)
+          ]);
+          setSharedActivity(nextActivity.slice(0, 6));
+          setSharedAuditEvents(auditEvents.slice(0, 6));
+          setSharedStatus(
+            `Applied and compiled shared agent changeset for ${changeset.filePath}.`
+          );
+
+          setActiveBottomTab("Log");
+          if (result.status !== "succeeded") {
+            setBottomPanelOpen(true);
+          }
+
+          if (result.artifact !== undefined && result.status === "succeeded") {
+            const artifactData = await desktopApi.pdf.readArtifact({
+              projectRoot: currentProject.rootPath,
+              pdfPath: result.artifact.pdfPath
+            });
+            const previewState = finishPdfPreviewBuild({
+              state: buildStartPreview,
+              result,
+              artifactData
+            });
+            setPdfArtifactData(previewState.artifactData);
+            setPdfStale(previewState.stale);
+            setPdfStaleReason(null);
+            setPdfPageNumber(1);
+            setSyncTexMessage(
+              result.artifact.synctexPath === undefined
+                ? "SyncTeX unavailable for this build"
+                : "SyncTeX ready"
+            );
+          } else {
+            const previewState = finishPdfPreviewBuild({
+              state: buildStartPreview,
+              result
+            });
+            setPdfArtifactData(previewState.artifactData);
+            setPdfStale(previewState.stale);
+            if (previewState.stale && pdfStaleReason === null) {
+              setPdfStaleReason("saved");
+            }
+          }
+        } finally {
+          setActiveBuildJobId(null);
+          setBuildRunning(false);
+        }
+      });
+    },
+    [
+      activeSharedProject,
+      appSettings.agentPermissions.compileAfterPatch,
+      clearSharedDocumentConflictState,
+      currentProject,
+      pdfArtifactData,
+      pdfStale,
+      pdfStaleReason,
+      readProjectFile,
+      refreshToolchainStatus,
+      runProjectOperation,
+      saveDirtyFiles,
+      selectedCompiler,
+      sharedConnection.connected,
+      showErrorInTerminal,
+      toolchainStatus
+    ]
+  );
+
+  const rejectSharedAgentChangeSetFromPanel = useCallback(
+    (changeset: SharedProjectAgentChangeSetSummary) => {
+      void runProjectOperation(async () => {
+        if (
+          activeSharedProject === null ||
+          !sharedConnection.connected ||
+          activeSharedProject.role === "viewer"
+        ) {
+          setSharedStatus("Shared agent changesets require Editor access.");
+          return;
+        }
+
+        await desktopApi.shared.rejectAgentChangeSet({
+          projectId: activeSharedProject.id,
+          changesetId: changeset.id
+        });
+        const [activity, agentRuns, changesets, auditEvents] = await Promise.all([
+          desktopApi.shared.listActivity(activeSharedProject.id),
+          desktopApi.shared.listAgentRuns(activeSharedProject.id),
+          desktopApi.shared.listAgentChangeSets(activeSharedProject.id),
+          desktopApi.shared.listAuditEvents(activeSharedProject.id)
+        ]);
+        setSharedActivity(activity.slice(0, 6));
+        setSharedAgentRuns(agentRuns.slice(0, 5));
+        setSharedAgentChangeSets(changesets.slice(0, 5));
+        setSharedAuditEvents(auditEvents.slice(0, 6));
+        setSharedStatus(`Rejected shared agent changeset for ${changeset.filePath}.`);
+      });
+    },
+    [activeSharedProject, runProjectOperation, sharedConnection.connected]
+  );
+
   const runBuild = useCallback(() => {
     void runProjectOperation(async () => {
       if (currentProject?.mainFilePath === undefined) {
@@ -2298,6 +5065,23 @@ export function App() {
       }
 
       await saveDirtyFiles();
+      const sharedBuildSourceRevisionId =
+        activeSharedProject === null ||
+        !sharedConnection.connected ||
+        activeSharedProject.role === "viewer"
+          ? undefined
+          : await desktopApi.shared
+              .getFileRevision({
+                projectId: activeSharedProject.id,
+                path: currentProject.mainFilePath
+              })
+              .then((revision) => revision.revisionId)
+              .catch((error: unknown) => {
+                setSharedStatus(
+                  `Could not capture shared source revision before compile: ${getErrorMessage(error)}`
+                );
+                return undefined;
+              });
       setBuildRunning(true);
       setActiveBuildJobId(jobId);
       setBuildResult(null);
@@ -2318,6 +5102,7 @@ export function App() {
         });
 
         setBuildResult(result);
+        await publishSharedBuildArtifact(result, sharedBuildSourceRevisionId);
         setActiveBottomTab("Log");
         if (result.status !== "succeeded") {
           setBottomPanelOpen(true);
@@ -2362,14 +5147,17 @@ export function App() {
     });
   }, [
     currentProject,
+    activeSharedProject,
     pdfArtifactData,
     pdfStale,
     pdfStaleReason,
+    publishSharedBuildArtifact,
     showErrorInTerminal,
     refreshToolchainStatus,
     runProjectOperation,
     saveDirtyFiles,
     selectedCompiler,
+    sharedConnection.connected,
     toolchainStatus
   ]);
 
@@ -2399,20 +5187,6 @@ export function App() {
 
         if (prompt.length === 0) {
           setStatusMessage("Enter an agent prompt first.");
-          return;
-        }
-
-        const externalTemplateCommand = parseExternalTemplateAgentCommand(
-          prompt,
-          agentEvents
-        );
-
-        if (externalTemplateCommand !== undefined) {
-          await runExternalTemplateAgentCommand(prompt, externalTemplateCommand);
-          if (options?.prompt === undefined) {
-            setAgentPrompt("");
-            setAgentImageAttachments([]);
-          }
           return;
         }
 
@@ -2480,7 +5254,14 @@ export function App() {
           options?.selectedText ??
           agentSelectedText ??
           undefined;
-        const effectiveAgentMode = options?.mode ?? agentMode;
+        const requestedAgentMode = options?.mode ?? agentMode;
+        const effectiveAgentMode = getEffectiveSharedAgentMode(
+          requestedAgentMode,
+          activeSharedProject
+        );
+        const sharedViewerAgentModeRestricted =
+          requestedAgentMode !== effectiveAgentMode &&
+          activeSharedProject?.role === "viewer";
         const authStatus = agentAuthStatuses[agentProviderId];
         const providerLabel = getAgentProviderLabel(agentProviderId);
         const requestSessionId =
@@ -2505,6 +5286,17 @@ export function App() {
           return;
         }
 
+        if (dirtyOnlyOfficeWordPath !== undefined) {
+          const message = `Save or sync ${dirtyOnlyOfficeWordPath} in ONLYOFFICE before asking the agent to inspect or edit it.`;
+          setStatusMessage(message);
+          setAgentLiveStatus({
+            detail: message,
+            title: "Word document has unsaved changes",
+            tone: "warning"
+          });
+          return;
+        }
+
         setAgentRunning(true);
         setAgentLiveStatus(
           createStartingAgentLiveStatus(transcriptPrompt, providerLabel)
@@ -2517,7 +5309,49 @@ export function App() {
           setAgentPrompt("");
           setAgentImageAttachments([]);
         }
-        setStatusMessage(`${providerLabel} is preparing the request...`);
+        setStatusMessage(
+          sharedViewerAgentModeRestricted
+            ? `${providerLabel} is preparing a read-only request because shared viewers cannot propose or apply project edits.`
+            : `${providerLabel} is preparing the request...`
+        );
+
+        let sharedAgentRunIdForRequest: string | undefined;
+        if (
+          activeSharedProject !== null &&
+          sharedConnection.connected &&
+          activeSharedProject.role !== "viewer"
+        ) {
+          try {
+            const published = await desktopApi.shared.publishAgentRun({
+              projectId: activeSharedProject.id,
+              providerId: agentProviderId,
+              mode: effectiveAgentMode,
+              prompt,
+              status: "running",
+              changesetIds: []
+            });
+            sharedAgentRunIdForRequest = published.agentRun.id;
+            setSharedAgentRunIdsBySessionId((idsBySessionId) => ({
+              ...idsBySessionId,
+              [requestSessionId]: published.agentRun.id
+            }));
+            setSharedAgentRuns((runs) =>
+              [
+                published.agentRun,
+                ...runs.filter((candidate) => candidate.id !== published.agentRun.id)
+              ].slice(0, 5)
+            );
+            const activity = await desktopApi.shared.listActivity(
+              activeSharedProject.id
+            );
+            setSharedActivity(activity.slice(0, 6));
+            setSharedStatus("Published running shared agent run.");
+          } catch (error) {
+            setSharedStatus(
+              `Could not publish running shared agent run: ${getErrorMessage(error)}`
+            );
+          }
+        }
 
         try {
           const activeDocument =
@@ -2540,6 +5374,16 @@ export function App() {
             providerId: agentProviderId,
             mode: effectiveAgentMode,
             projectRoot: currentProject.rootPath,
+            ...(activeSharedProject === null
+              ? {}
+              : {
+                  projectContext: {
+                    backend: "shared" as const,
+                    sharedProjectId: activeSharedProject.id,
+                    localCachePath: activeSharedProject.localCachePath,
+                    role: activeSharedProject.role
+                  }
+                }),
             maxTurns: appSettings.agentPermissions.maxTurns,
             ...(continuationSessionId === undefined
               ? {}
@@ -2567,13 +5411,22 @@ export function App() {
           setAgentSessionId(result.sessionId);
           setAgentSessionProjectRoot(currentProject.rootPath);
           setAgentSessionProviderId(agentProviderId);
+          if (sharedAgentRunIdForRequest !== undefined) {
+            setSharedAgentRunIdsBySessionId((idsBySessionId) => ({
+              ...idsBySessionId,
+              [requestSessionId]: sharedAgentRunIdForRequest,
+              [result.sessionId]: sharedAgentRunIdForRequest
+            }));
+          }
           const displayResultEvents = prepareAgentDisplayEvents(result.events).filter(
             (event) =>
               event.type !== "message" ||
               event.role !== "user" ||
               event.content !== prompt
           );
-          const summaryEvent = buildAgentCompletionSummaryEvent(result);
+          const summaryEvent = buildAgentCompletionSummaryEvent(result, {
+            wordChangesAutoApply: effectiveAgentMode === "autonomous-local"
+          });
           setAgentEvents((events) => {
             const normalizedEvents = events.map((event) =>
               event.sessionId === requestSessionId
@@ -2620,14 +5473,14 @@ export function App() {
           }
 
           const proposedWordChangeSets = getAgentResultWordChangeSets(result);
-          if (proposedWordChangeSets.length > 0) {
-            await rememberWordChangeSets(proposedWordChangeSets);
-            setHistoryMessage(
-              proposedWordChangeSets.length === 1
-                ? `Agent proposed ${proposedWordChangeSets[0]!.summary}`
-                : `Agent proposed ${proposedWordChangeSets.length} Word changes`
-            );
-          }
+          const wordChangeOutcome = await handleAgentWordChangeSets(
+            proposedWordChangeSets,
+            {
+              autoApply: effectiveAgentMode === "autonomous-local",
+              appliedLabel: "Agent",
+              proposedLabel: "Agent proposed"
+            }
+          );
 
           if (agentSetMainFile(result.events)) {
             const refreshedProject = await desktopApi.project.refresh(
@@ -2638,8 +5491,12 @@ export function App() {
           }
 
           const agentBuildResult = result.buildResult;
+          let sharedAgentBuildArtifactId: string | undefined;
           if (agentBuildResult !== undefined) {
             setBuildResult(agentBuildResult);
+            const sharedBuildArtifact =
+              await publishSharedBuildArtifact(agentBuildResult);
+            sharedAgentBuildArtifactId = sharedBuildArtifact?.id;
             setActiveBottomTab("Log");
             if (agentBuildResult.status !== "succeeded") {
               setBottomPanelOpen(true);
@@ -2667,6 +5524,15 @@ export function App() {
               setPdfPageNumber(1);
             }
           }
+          await publishSharedAgentRun(
+            result,
+            prompt,
+            effectiveAgentMode,
+            sharedAgentBuildArtifactId === undefined
+              ? []
+              : [sharedAgentBuildArtifactId],
+            sharedAgentRunIdForRequest
+          );
 
           const approvalToolName = getRequestedApprovalToolName(result.events);
           setStatusMessage(
@@ -2693,9 +5559,11 @@ export function App() {
                 ? createAwaitingApprovalLiveStatus(approvalToolName)
                 : {
                     detail:
-                      proposedChangeSet === undefined
+                      proposedChangeSet === undefined && !wordChangeOutcome.applied
                         ? "The response is ready in the transcript."
-                        : "A reviewable patch is ready in History.",
+                        : wordChangeOutcome.applied
+                          ? "Word document changes were applied and ONLYOFFICE was refreshed."
+                          : "A reviewable patch is ready in History.",
                     title:
                       isExternalResearchPrompt(prompt) &&
                       proposedChangeSet === undefined
@@ -2739,6 +5607,35 @@ export function App() {
             title: `${providerLabel} stopped with an error`,
             tone: "danger"
           });
+          if (
+            sharedAgentRunIdForRequest !== undefined &&
+            activeSharedProject !== null &&
+            sharedConnection.connected
+          ) {
+            try {
+              const updatedRun = await desktopApi.shared.updateAgentRunStatus({
+                projectId: activeSharedProject.id,
+                agentRunId: sharedAgentRunIdForRequest,
+                status: "failed"
+              });
+              setSharedAgentRuns((runs) =>
+                [
+                  updatedRun,
+                  ...runs.filter((candidate) => candidate.id !== updatedRun.id)
+                ].slice(0, 5)
+              );
+              const [activity, auditEvents] = await Promise.all([
+                desktopApi.shared.listActivity(activeSharedProject.id),
+                desktopApi.shared.listAuditEvents(activeSharedProject.id)
+              ]);
+              setSharedActivity(activity.slice(0, 6));
+              setSharedAuditEvents(auditEvents.slice(0, 6));
+            } catch (sharedError) {
+              setSharedStatus(
+                `Could not mark shared agent run failed: ${getErrorMessage(sharedError)}`
+              );
+            }
+          }
           throw error;
         } finally {
           setAgentRunning(false);
@@ -2748,7 +5645,6 @@ export function App() {
     [
       activeFile,
       agentAuthStatuses,
-      agentEvents,
       agentImageAttachments,
       agentMode,
       agentPrompt,
@@ -2758,15 +5654,19 @@ export function App() {
       agentSessionProviderId,
       agentSelectedText,
       activeAgentSelectionContext,
+      activeSharedProject,
       currentProject,
+      dirtyOnlyOfficeWordPath,
       pdfArtifactData,
       pdfStale,
+      publishSharedBuildArtifact,
+      publishSharedAgentRun,
       refreshHistory,
-      rememberWordChangeSets,
+      handleAgentWordChangeSets,
       runProjectOperation,
-      runExternalTemplateAgentCommand,
       runNoProjectAgentCommand,
-      selectedCompiler
+      selectedCompiler,
+      sharedConnection.connected
     ]
   );
 
@@ -3112,7 +6012,8 @@ export function App() {
         });
         const displayResultEvents = prepareAgentDisplayEvents(result.events);
         const summaryEvent = buildAgentCompletionSummaryEvent(result, {
-          decision
+          decision,
+          wordChangesAutoApply: decision === "allowed"
         });
 
         setAgentEvents((events) =>
@@ -3130,6 +6031,7 @@ export function App() {
 
         const approvedChangeSets = result.changesets ?? [];
         const approvedChangeSet = result.changeset;
+        let resolvedSharedAgentRunId: string | undefined;
         if (approvedChangeSet !== undefined) {
           setHistoryMessage(
             approvedChangeSets.length > 1
@@ -3160,22 +6062,68 @@ export function App() {
           }));
           if (decision === "allowed") {
             await readProjectFile(approvedChangeSet.filePath);
+            if (currentProject !== undefined) {
+              const refreshedProject = await desktopApi.project.refresh(
+                currentProject.rootPath
+              );
+              setProjectResult(refreshedProject);
+              setProjectState({ recentProjects: refreshedProject.recentProjects });
+            }
           }
+          resolvedSharedAgentRunId = await updateSharedAgentChangeSetStatus(
+            approvedChangeSet.id,
+            decision === "allowed" ? "applied" : "rejected"
+          );
         }
 
         const approvedWordChangeSets = getAgentResultWordChangeSets(result);
-        if (approvedWordChangeSets.length > 0) {
-          await rememberWordChangeSets(approvedWordChangeSets);
-          setHistoryMessage(
-            approvedWordChangeSets.length === 1
-              ? `${decision === "allowed" ? "Reviewed" : "Rejected"} ${approvedWordChangeSets[0]!.summary}`
-              : `${decision === "allowed" ? "Reviewed" : "Rejected"} ${approvedWordChangeSets.length} Word changes`
-          );
-        }
+        const approvedWordOutcome = await handleAgentWordChangeSets(
+          approvedWordChangeSets,
+          {
+            autoApply: decision === "allowed",
+            appliedLabel: "Agent",
+            proposedLabel: decision === "allowed" ? "Reviewed" : "Rejected"
+          }
+        );
 
         const approvalBuildResult = result.buildResult;
         if (approvalBuildResult !== undefined) {
           setBuildResult(approvalBuildResult);
+          const sharedApprovalBuildArtifact =
+            await publishSharedBuildArtifact(approvalBuildResult);
+          const sharedAgentRunId =
+            resolvedSharedAgentRunId ?? sharedAgentRunIdsBySessionId[sessionId];
+          if (
+            activeSharedProject !== null &&
+            sharedConnection.connected &&
+            sharedApprovalBuildArtifact !== undefined &&
+            sharedAgentRunId !== undefined
+          ) {
+            try {
+              const updatedRun = await desktopApi.shared.attachAgentRunBuildArtifact({
+                projectId: activeSharedProject.id,
+                agentRunId: sharedAgentRunId,
+                artifactId: sharedApprovalBuildArtifact.id
+              });
+              setSharedAgentRuns((runs) =>
+                [
+                  updatedRun,
+                  ...runs.filter((candidate) => candidate.id !== updatedRun.id)
+                ].slice(0, 5)
+              );
+              const [activity, auditEvents] = await Promise.all([
+                desktopApi.shared.listActivity(activeSharedProject.id),
+                desktopApi.shared.listAuditEvents(activeSharedProject.id)
+              ]);
+              setSharedActivity(activity.slice(0, 6));
+              setSharedAuditEvents(auditEvents.slice(0, 6));
+              setSharedStatus("Attached approval compile to shared agent run.");
+            } catch (error) {
+              setSharedStatus(
+                `Could not attach approval compile to shared agent run: ${getErrorMessage(error)}`
+              );
+            }
+          }
           if (approvalBuildResult.status !== "succeeded") {
             setBottomPanelOpen(true);
             setActiveBottomTab("Log");
@@ -3254,9 +6202,11 @@ export function App() {
               ? decision === "allowed"
                 ? "Agent delete completed."
                 : "Agent delete denied."
-              : decision === "allowed"
-                ? "Agent patch applied and verified."
-                : "Agent approval denied."
+              : approvedWordOutcome.applied
+                ? "Agent Word edit applied."
+                : decision === "allowed"
+                  ? "Agent patch applied and verified."
+                  : "Agent approval denied."
         );
         setAgentLiveStatus({
           detail:
@@ -3268,9 +6218,11 @@ export function App() {
                 ? decision === "allowed"
                   ? "The approved project entry was deleted and the file tree was refreshed."
                   : "No project files were deleted."
-                : decision === "allowed"
-                  ? "Patch handling finished; check History for verification details."
-                  : "No files were changed.",
+                : approvedWordOutcome.applied
+                  ? "Word document changes were applied and ONLYOFFICE was refreshed."
+                  : decision === "allowed"
+                    ? "Patch handling finished; check History for verification details."
+                    : "No files were changed.",
           title:
             resultApprovalToolName === "network-fetch"
               ? decision === "allowed"
@@ -3289,10 +6241,15 @@ export function App() {
     },
     [
       currentProject,
+      activeSharedProject,
+      handleAgentWordChangeSets,
+      publishSharedBuildArtifact,
       readProjectFile,
       refreshHistory,
-      rememberWordChangeSets,
-      runProjectOperation
+      runProjectOperation,
+      sharedAgentRunIdsBySessionId,
+      sharedConnection.connected,
+      updateSharedAgentChangeSetStatus
     ]
   );
 
@@ -3426,19 +6383,33 @@ export function App() {
 
   const setTreeFileAsMain = useCallback(
     (path: string) => {
+      if (!sharedProjectCanEdit) {
+        setStatusMessage(
+          "Shared viewers can read and compile this project, but cannot change project files."
+        );
+        return;
+      }
+
       if (!path.toLowerCase().endsWith(".tex")) {
         return;
       }
 
       setProjectMainFile(path);
     },
-    [setProjectMainFile]
+    [setProjectMainFile, sharedProjectCanEdit]
   );
 
   const createEntry = useCallback(
     (kind: "directory" | "file") => {
       void runProjectOperation(async () => {
         if (currentProject === undefined) {
+          return;
+        }
+
+        if (!sharedProjectCanEdit) {
+          setStatusMessage(
+            "Shared viewers can read and compile this project, but cannot create files."
+          );
           return;
         }
 
@@ -3475,13 +6446,21 @@ export function App() {
       applyProjectResult,
       currentProject,
       runProjectOperation,
-      selectedProjectDirectoryPath
+      selectedProjectDirectoryPath,
+      sharedProjectCanEdit
     ]
   );
 
   const renameActiveFile = useCallback(() => {
     void runProjectOperation(async () => {
       if (currentProject === undefined || selectedProjectEntryPath === null) {
+        return;
+      }
+
+      if (!sharedProjectCanEdit) {
+        setStatusMessage(
+          "Shared viewers can read and compile this project, but cannot rename files."
+        );
         return;
       }
 
@@ -3517,12 +6496,20 @@ export function App() {
     applyProjectResult,
     currentProject,
     runProjectOperation,
-    selectedProjectEntryPath
+    selectedProjectEntryPath,
+    sharedProjectCanEdit
   ]);
 
   const moveActiveFile = useCallback(() => {
     void runProjectOperation(async () => {
       if (currentProject === undefined || selectedProjectEntryPath === null) {
+        return;
+      }
+
+      if (!sharedProjectCanEdit) {
+        setStatusMessage(
+          "Shared viewers can read and compile this project, but cannot move files."
+        );
         return;
       }
 
@@ -3552,7 +6539,8 @@ export function App() {
     applyProjectResult,
     currentProject,
     runProjectOperation,
-    selectedProjectEntryPath
+    selectedProjectEntryPath,
+    sharedProjectCanEdit
   ]);
 
   const searchProjectForQuery = useCallback(
@@ -3590,6 +6578,13 @@ export function App() {
         return;
       }
 
+      if (!sharedProjectCanEdit) {
+        setStatusMessage(
+          "Shared viewers can read and compile this project, but cannot delete files."
+        );
+        return;
+      }
+
       if (!window.confirm(`Delete ${selectedProjectEntryPath}?`)) {
         return;
       }
@@ -3619,7 +6614,8 @@ export function App() {
     currentProject,
     runProjectOperation,
     searchProjectForQuery,
-    selectedProjectEntryPath
+    selectedProjectEntryPath,
+    sharedProjectCanEdit
   ]);
 
   const closeFile = useCallback(
@@ -3628,7 +6624,7 @@ export function App() {
 
       if (
         file !== undefined &&
-        file.contents !== file.savedContents &&
+        isFileDirty(file) &&
         !window.confirm(`Discard unsaved changes in ${path}?`)
       ) {
         return;
@@ -3636,16 +6632,29 @@ export function App() {
 
       const remainingFiles = removeOpenFile(openFiles, path);
       setOpenFiles(remainingFiles);
+      setOnlyOfficeWordFileStates((states) => {
+        const { [path]: _removed, ...remainingStates } = states;
+        return remainingStates;
+      });
       setActiveFilePath((currentPath) =>
         currentPath === path ? (remainingFiles.at(-1)?.path ?? null) : currentPath
       );
     },
-    [openFiles]
+    [isFileDirty, openFiles]
   );
 
   const updateActiveFileContents = useCallback(
-    (contents: string) => {
+    (contents: string, changes: readonly MonacoEditorApi.IModelContentChange[]) => {
       if (activeFile === null) {
+        return;
+      }
+      const filePath = activeFile.path;
+      const applyingSharedRemoteEdit = sharedRemoteEditPathsRef.current.has(filePath);
+
+      if (!applyingSharedRemoteEdit && !sharedProjectCanEdit) {
+        setSharedDocumentSyncStatus(
+          `Shared viewers can read and compile ${filePath}, but cannot edit it.`
+        );
         return;
       }
 
@@ -3655,30 +6664,207 @@ export function App() {
           contents
         })
       );
+      if (applyingSharedRemoteEdit) {
+        return;
+      }
+
       if (pdfArtifactData !== null) {
         setPdfStale(true);
         setPdfStaleReason("unsaved");
       }
+
+      if (
+        activeSharedProject !== null &&
+        activeFile.documentKind === "text" &&
+        !sharedDocumentConflictPaths.has(filePath)
+      ) {
+        if (changes.length === 0) {
+          setSharedDocumentOperationFailedPaths((paths) =>
+            paths.has(filePath) ? paths : new Set(paths).add(filePath)
+          );
+          setSharedDocumentSyncStatus(
+            `Shared operation fallback queued for ${filePath}.`
+          );
+          return;
+        }
+
+        const operations = changes.map((change) => ({
+          rangeOffset: change.rangeOffset,
+          rangeLength: change.rangeLength,
+          text: change.text
+        }));
+        const pendingOperation: SharedDocumentPendingOperation = {
+          id: crypto.randomUUID(),
+          operations,
+          contents
+        };
+        const pendingOperations = sharedDocumentPendingOperations[filePath] ?? [];
+        if (!sharedConnection.connected || pendingOperations.length > 0) {
+          setSharedDocumentPendingOperations((currentOperations) => ({
+            ...currentOperations,
+            [filePath]: [...(currentOperations[filePath] ?? []), pendingOperation]
+          }));
+          setSharedDocumentOperationFailedPaths((paths) =>
+            paths.has(filePath) ? paths : new Set(paths).add(filePath)
+          );
+          setSharedDocumentSyncStatus(
+            `Queued shared operation for ${filePath}; waiting to reconnect.`
+          );
+          return;
+        }
+
+        void (async () => {
+          try {
+            const result = await desktopApi.shared.applyDocumentTextOperations({
+              projectId: activeSharedProject.id,
+              path: filePath,
+              operations,
+              clientOperationId: pendingOperation.id
+            });
+            if (result.lastUpdateId !== undefined) {
+              setSharedDocumentUpdateCursors((cursors) =>
+                cursors[result.path] === result.lastUpdateId
+                  ? cursors
+                  : { ...cursors, [result.path]: result.lastUpdateId ?? "" }
+              );
+            }
+            appWrittenProjectPathsRef.current.add(normalizeProjectPath(result.path));
+            setOpenFiles((files) =>
+              files.map((candidate) => {
+                if (
+                  candidate.path !== result.path ||
+                  candidate.documentKind !== "text"
+                ) {
+                  return candidate;
+                }
+
+                return {
+                  ...candidate,
+                  contents:
+                    candidate.contents === contents
+                      ? result.contents
+                      : candidate.contents,
+                  savedContents: result.contents,
+                  mtimeMs: result.mtimeMs,
+                  stale: false
+                };
+              })
+            );
+            setSharedDocumentOperationFailedPaths((paths) => {
+              if (!paths.has(result.path)) {
+                return paths;
+              }
+
+              const nextPaths = new Set(paths);
+              nextPaths.delete(result.path);
+              return nextPaths;
+            });
+            setSharedDocumentSyncStatus(`Synced ${result.path}.`);
+          } catch (error) {
+            setSharedDocumentPendingOperations((currentOperations) => ({
+              ...currentOperations,
+              [filePath]: [...(currentOperations[filePath] ?? []), pendingOperation]
+            }));
+            setSharedDocumentOperationFailedPaths((paths) =>
+              paths.has(filePath) ? paths : new Set(paths).add(filePath)
+            );
+            setSharedDocumentSyncStatus(
+              `Shared text operation failed: ${getErrorMessage(error)}`
+            );
+          }
+        })();
+      }
     },
-    [activeFile, pdfArtifactData]
+    [
+      activeFile,
+      activeSharedProject,
+      pdfArtifactData,
+      sharedConnection.connected,
+      sharedDocumentConflictPaths,
+      sharedDocumentPendingOperations,
+      sharedProjectCanEdit
+    ]
   );
 
-  const updateActiveWordBlocks = useCallback(
-    (blocks: readonly WordDocumentBlock[]) => {
-      if (activeFile === null || activeFile.documentKind !== "word") {
-        return;
+  const handleOnlyOfficeDirtyStateChange = useCallback(
+    (filePath: string, dirty: boolean) => {
+      setOnlyOfficeWordFileStates((states) => ({
+        ...states,
+        [filePath]: {
+          ...states[filePath],
+          dirty
+        }
+      }));
+    },
+    []
+  );
+
+  const handleOnlyOfficeSessionStateChange = useCallback(
+    (filePath: string, sessionId: string | null) => {
+      setOnlyOfficeWordFileStates((states) => {
+        const currentState = states[filePath];
+        if (sessionId === null) {
+          if (currentState === undefined) {
+            return states;
+          }
+
+          const { sessionId: _removedSessionId, ...remainingState } = currentState;
+          return {
+            ...states,
+            [filePath]: remainingState
+          };
+        }
+
+        return {
+          ...states,
+          [filePath]: {
+            ...currentState,
+            dirty: currentState?.dirty ?? false,
+            sessionId
+          }
+        };
+      });
+    },
+    []
+  );
+
+  const handleOnlyOfficeExportPdf = useCallback(
+    async (filePath: string, sessionId: string) => {
+      if (currentProject === undefined) {
+        throw new Error("Open a project before converting Word documents to PDF.");
       }
 
-      setOpenFiles((files) =>
-        replaceOpenFile(files, {
-          ...activeFile,
-          contents: getWordBlocksPlainText(blocks),
-          wordBlocks: blocks
-        })
+      setStatusMessage("Converting Word document to PDF...");
+      const result = await desktopApi.onlyOffice.exportPdf({ sessionId });
+      appWrittenProjectPathsRef.current.add(
+        getProjectRelativePath(currentProject.rootPath, result.pdfPath)
       );
+      const artifactData = await desktopApi.pdf.readArtifact({
+        projectRoot: currentProject.rootPath,
+        pdfPath: result.pdfPath
+      });
+      setPdfArtifactData(artifactData);
+      setPdfStale(false);
+      setPdfStaleReason(null);
+      setPdfPageNumber(1);
+      setSyncTexMessage("SyncTeX unavailable for Word PDF");
+      setOnlyOfficeWordFileStates((states) => ({
+        ...states,
+        [filePath]: {
+          ...states[filePath],
+          dirty: false,
+          sessionId
+        }
+      }));
+      setStatusMessage(result.message);
     },
-    [activeFile]
+    [currentProject]
   );
+
+  const openWordSettings = useCallback(() => {
+    setActiveSettingsTab("Word");
+    setSettingsOpen(true);
+  }, []);
 
   const jumpToFileLine = useCallback(
     (path: string, line: number) => {
@@ -4452,28 +7638,84 @@ export function App() {
         {activeSidebarTab === "files" && (
           <ProjectSidebar
             activeFilePath={activeFile?.path}
+            activeSharedProject={activeSharedProject}
             mainFilePath={currentProject?.mainFilePath}
             project={currentProject}
             recentProjects={projectState.recentProjects}
             selectedDirectoryPath={selectedProjectDirectoryPath}
             selectedEntryPath={selectedProjectEntryPath}
+            sharedBusy={sharedBusy}
+            sharedActivity={sharedActivity}
+            sharedAuditEvents={sharedAuditEvents}
+            sharedAgentChangeSets={sharedAgentChangeSets}
+            sharedAgentRuns={sharedAgentRuns}
+            sharedBuildArtifacts={sharedBuildArtifacts}
+            sharedCommentDraft={sharedCommentDraft}
+            sharedComments={sharedComments}
+            sharedFileRevisions={sharedFileRevisions}
+            selectedSharedFileRevision={selectedSharedFileRevision}
+            sharedConnection={sharedConnection}
+            sharedDocumentSyncStatus={sharedDocumentSyncStatus}
+            sharedEmail={sharedEmail}
+            sharedInvitationId={sharedInvitationId}
+            sharedInviteEmail={sharedInviteEmail}
+            sharedInviteRole={sharedInviteRole}
+            sharedMembers={sharedMembers}
+            sharedName={sharedName}
+            sharedPresence={sharedPresence}
+            sharedProjectName={sharedProjectName}
+            sharedProjects={sharedProjects}
+            sharedServerUrl={sharedServerUrl}
+            sharedSessions={sharedSessions}
+            sharedStatus={sharedStatus}
             submissionCheckResult={submissionCheckResult}
             tree={projectResult?.tree ?? []}
+            onApplySharedAgentChangeSet={applySharedAgentChangeSetFromPanel}
             onAskAgentSubmissionChecklist={askAgentForSubmissionChecklist}
             onAskAgentNumberingMismatch={askAgentForFigureNumberingMismatch}
             onCreateEntry={createEntry}
+            onCreateSharedComment={createSharedComment}
             onDeleteActiveFile={deleteActiveFile}
             onExportSourceArchive={exportSourceArchive}
+            onInspectSharedBuildArtifact={inspectSharedBuildArtifact}
+            onInspectSharedFileRevision={inspectSharedFileRevision}
             onMoveActiveFile={moveActiveFile}
             onCloseProject={closeProject}
             onOpenProject={openProject}
             onOpenRecentProject={openRecentProject}
+            onClearRecentProjects={clearRecentProjects}
             onRefreshProject={refreshProjectTree}
+            onRejectSharedAgentChangeSet={rejectSharedAgentChangeSetFromPanel}
+            onRestoreSharedFileRevision={restoreSharedFileRevision}
             onRenameActiveFile={renameActiveFile}
             onRunSubmissionCheck={runSubmissionCheck}
             onSelectDirectory={selectProjectDirectory}
             onSelectFile={selectFile}
             onSetMainFile={setTreeFileAsMain}
+            onSharedCreateFromLocalProject={createSharedProjectFromLocalProject}
+            onSharedCreateFromSourceZip={createSharedProjectFromSourceZip}
+            onSharedCreateProject={createSharedProject}
+            onSharedEmailChange={setSharedEmail}
+            onSharedInvitationIdChange={setSharedInvitationId}
+            onSharedInviteEmailChange={setSharedInviteEmail}
+            onSharedInviteRoleChange={setSharedInviteRole}
+            onSharedInviteToActiveProject={inviteToActiveSharedProject}
+            onSharedMemberRoleChange={updateSharedMemberRole}
+            onSharedMemberRemove={removeSharedMember}
+            onSharedOwnershipTransfer={transferSharedOwnership}
+            onSharedNameChange={setSharedName}
+            onSharedDeleteProject={deleteSharedProject}
+            onSharedExportSourceZip={exportSharedProjectSourceZip}
+            onSharedOpenProject={openSharedProject}
+            onSharedProjectNameChange={setSharedProjectName}
+            onSharedRefreshProjects={refreshSharedProjects}
+            onSharedServerUrlChange={setSharedServerUrl}
+            onSharedSessionRevoke={revokeSharedSession}
+            onSharedSignIn={signInToSharedProjects}
+            onSharedSignOut={signOutFromSharedProjects}
+            onSharedAcceptInvitation={acceptSharedInvitation}
+            onResolveSharedComment={resolveSharedComment}
+            onSharedCommentDraftChange={setSharedCommentDraft}
           />
         )}
         {activeSidebarTab === "search" && (
@@ -4544,15 +7786,25 @@ export function App() {
               activeFile={activeFile}
               activeFilePath={activeFilePath}
               dirty={activeFileDirty}
-              dirtyFileCount={dirtyFiles.length}
+              dirtyFileCount={dirtyFileCount}
               editorSettings={appSettings.editor}
               mainFilePath={currentProject?.mainFilePath}
               openFiles={openFiles}
+              projectRoot={currentProject?.rootPath}
+              isFileDirty={isFileDirty}
+              canEditProject={sharedProjectCanEdit}
               onActiveFileChange={setActiveFilePath}
               onCloseFile={closeFile}
               onContentsChange={updateActiveFileContents}
               onFind={() => focusMonacoFind(editorRef.current)}
-              onWordBlocksChange={updateActiveWordBlocks}
+              onAcceptSharedRemoteChanges={acceptSharedRemoteDocumentChanges}
+              onKeepLocalSharedChanges={keepLocalSharedDocumentChanges}
+              onOnlyOfficeDirtyStateChange={handleOnlyOfficeDirtyStateChange}
+              onOnlyOfficeExportPdf={handleOnlyOfficeExportPdf}
+              onlyOfficeWordReloadVersions={onlyOfficeWordReloadVersions}
+              onOnlyOfficeSessionStateChange={handleOnlyOfficeSessionStateChange}
+              onOpenWordSettings={openWordSettings}
+              onStatusMessage={setStatusMessage}
               onMount={(editor) => {
                 editorRef.current = editor;
                 editorResizeObserverRef.current?.disconnect();
@@ -4632,10 +7884,13 @@ export function App() {
               onSaveAll={saveAllFiles}
               onStopBuild={stopBuild}
               selectedCompiler={selectedCompiler}
+              sharedCurrentUserId={sharedConnection.user?.id}
               syncTexMessage={syncTexMessage}
+              sharedPresence={sharedPresence}
               compileUnavailable={compileUnavailable}
               buildRunning={buildRunning}
-              onCompilerChange={updateSelectedCompiler}
+              onCompilerChange={updateProjectCompiler}
+              sharedDocumentConflict={activeSharedDocumentConflict}
             />
             <PaneResizer
               label="Resize PDF preview"
@@ -5013,60 +8268,203 @@ function TemplateSidebar({
 
 function ProjectSidebar({
   activeFilePath,
+  activeSharedProject,
   mainFilePath,
   selectedDirectoryPath,
   selectedEntryPath,
+  selectedSharedFileRevision,
   submissionCheckResult,
+  onApplySharedAgentChangeSet,
   onAskAgentSubmissionChecklist,
   onAskAgentNumberingMismatch,
   onCreateEntry,
+  onCreateSharedComment,
   onDeleteActiveFile,
   onExportSourceArchive,
+  onInspectSharedBuildArtifact,
+  onInspectSharedFileRevision,
   onMoveActiveFile,
   onCloseProject,
   onOpenProject,
   onOpenRecentProject,
+  onClearRecentProjects,
   onRefreshProject,
+  onRejectSharedAgentChangeSet,
+  onRestoreSharedFileRevision,
   onRenameActiveFile,
   onRunSubmissionCheck,
   onSelectDirectory,
   onSelectFile,
   onSetMainFile,
+  onSharedCreateFromLocalProject,
+  onSharedCreateFromSourceZip,
+  onSharedCreateProject,
+  onSharedEmailChange,
+  onSharedInvitationIdChange,
+  onSharedInviteEmailChange,
+  onSharedInviteRoleChange,
+  onSharedInviteToActiveProject,
+  onSharedMemberRoleChange,
+  onSharedMemberRemove,
+  onSharedOwnershipTransfer,
+  onSharedNameChange,
+  onSharedDeleteProject,
+  onSharedExportSourceZip,
+  onSharedOpenProject,
+  onSharedProjectNameChange,
+  onSharedRefreshProjects,
+  onSharedServerUrlChange,
+  onSharedSessionRevoke,
+  onSharedSignIn,
+  onSharedSignOut,
+  onSharedAcceptInvitation,
+  onResolveSharedComment,
+  onSharedCommentDraftChange,
   project,
   recentProjects,
+  sharedBusy,
+  sharedActivity,
+  sharedAuditEvents,
+  sharedAgentChangeSets,
+  sharedAgentRuns,
+  sharedBuildArtifacts,
+  sharedCommentDraft,
+  sharedComments,
+  sharedFileRevisions,
+  sharedConnection,
+  sharedDocumentSyncStatus,
+  sharedEmail,
+  sharedInvitationId,
+  sharedInviteEmail,
+  sharedInviteRole,
+  sharedMembers,
+  sharedName,
+  sharedPresence,
+  sharedProjectName,
+  sharedProjects,
+  sharedServerUrl,
+  sharedSessions,
+  sharedStatus,
   tree
 }: {
   readonly activeFilePath: string | undefined;
+  readonly activeSharedProject: ActiveSharedProject | null;
   readonly mainFilePath: string | undefined;
   readonly selectedDirectoryPath: string;
   readonly selectedEntryPath: string | null;
+  readonly selectedSharedFileRevision: SharedProjectFileRevisionDetails | null;
   readonly submissionCheckResult: SubmissionCheckResult | null;
+  readonly onApplySharedAgentChangeSet: (
+    changeset: SharedProjectAgentChangeSetSummary
+  ) => void;
   readonly onAskAgentSubmissionChecklist: () => void;
   readonly onAskAgentNumberingMismatch: () => void;
   readonly onCreateEntry: (kind: "directory" | "file") => void;
+  readonly onCreateSharedComment: () => void;
   readonly onDeleteActiveFile: () => void;
   readonly onExportSourceArchive: () => void;
+  readonly onInspectSharedBuildArtifact: (artifactId: string) => void;
+  readonly onInspectSharedFileRevision: (revisionId: string) => void;
   readonly onMoveActiveFile: () => void;
   readonly onCloseProject: () => void;
   readonly onOpenProject: () => void;
   readonly onOpenRecentProject: (rootPath: string) => void;
+  readonly onClearRecentProjects: () => void;
   readonly onRefreshProject: () => void;
+  readonly onRejectSharedAgentChangeSet: (
+    changeset: SharedProjectAgentChangeSetSummary
+  ) => void;
+  readonly onRestoreSharedFileRevision: (revisionId: string) => void;
   readonly onRenameActiveFile: () => void;
   readonly onRunSubmissionCheck: () => void;
   readonly onSelectDirectory: (path: string) => void;
   readonly onSelectFile: (path: string) => void;
   readonly onSetMainFile: (path: string) => void;
+  readonly onSharedCreateFromLocalProject: () => void;
+  readonly onSharedCreateFromSourceZip: () => void;
+  readonly onSharedCreateProject: () => void;
+  readonly onSharedEmailChange: (email: string) => void;
+  readonly onSharedInvitationIdChange: (invitationId: string) => void;
+  readonly onSharedInviteEmailChange: (email: string) => void;
+  readonly onSharedInviteRoleChange: (
+    role: Exclude<SharedProjectRole, "owner">
+  ) => void;
+  readonly onSharedInviteToActiveProject: () => void;
+  readonly onSharedMemberRoleChange: (
+    userId: string,
+    role: Exclude<SharedProjectRole, "owner">
+  ) => void;
+  readonly onSharedMemberRemove: (userId: string) => void;
+  readonly onSharedOwnershipTransfer: (member: SharedProjectMemberSummary) => void;
+  readonly onSharedNameChange: (name: string) => void;
+  readonly onSharedDeleteProject: (project: SharedProjectSummary) => void;
+  readonly onSharedExportSourceZip: (project: SharedProjectSummary) => void;
+  readonly onSharedOpenProject: (projectId: string) => void;
+  readonly onSharedProjectNameChange: (name: string) => void;
+  readonly onSharedRefreshProjects: () => void;
+  readonly onSharedServerUrlChange: (serverUrl: string) => void;
+  readonly onSharedSessionRevoke: (sessionId: string) => void;
+  readonly onSharedSignIn: () => void;
+  readonly onSharedSignOut: () => void;
+  readonly onSharedAcceptInvitation: () => void;
+  readonly onResolveSharedComment: (commentId: string) => void;
+  readonly onSharedCommentDraftChange: (draft: string) => void;
   readonly project: ProjectOpenResult["project"] | undefined;
   readonly recentProjects: readonly RecentProject[];
+  readonly sharedBusy: boolean;
+  readonly sharedActivity: readonly SharedProjectActivitySummary[];
+  readonly sharedAuditEvents: readonly SharedProjectAuditEventSummary[];
+  readonly sharedAgentChangeSets: readonly SharedProjectAgentChangeSetSummary[];
+  readonly sharedAgentRuns: readonly SharedProjectAgentRunSummary[];
+  readonly sharedBuildArtifacts: readonly SharedProjectBuildArtifactSummary[];
+  readonly sharedCommentDraft: string;
+  readonly sharedComments: readonly SharedProjectCommentSummary[];
+  readonly sharedFileRevisions: readonly SharedProjectFileRevisionSummary[];
+  readonly sharedConnection: SharedProjectConnection;
+  readonly sharedDocumentSyncStatus: string;
+  readonly sharedEmail: string;
+  readonly sharedInvitationId: string;
+  readonly sharedInviteEmail: string;
+  readonly sharedInviteRole: Exclude<SharedProjectRole, "owner">;
+  readonly sharedMembers: readonly SharedProjectMemberSummary[];
+  readonly sharedName: string;
+  readonly sharedPresence: readonly SharedProjectPresenceSummary[];
+  readonly sharedProjectName: string;
+  readonly sharedProjects: readonly SharedProjectSummary[];
+  readonly sharedServerUrl: string;
+  readonly sharedSessions: readonly SharedProjectSessionSummary[];
+  readonly sharedStatus: string;
   readonly tree: readonly ProjectFileTreeNode[];
 }) {
   const [collapsedDirectoryPaths, setCollapsedDirectoryPaths] = useState<
     ReadonlySet<string>
   >(() => new Set());
+  const [selectedSharedAgentChangeSetId, setSelectedSharedAgentChangeSetId] = useState<
+    string | null
+  >(null);
 
   useEffect(() => {
     setCollapsedDirectoryPaths(new Set());
   }, [project?.rootPath]);
+
+  useEffect(() => {
+    setSelectedSharedAgentChangeSetId(null);
+  }, [activeSharedProject?.id]);
+
+  useEffect(() => {
+    if (
+      selectedSharedAgentChangeSetId !== null &&
+      !sharedAgentChangeSets.some(
+        (changeset) => changeset.id === selectedSharedAgentChangeSetId
+      )
+    ) {
+      setSelectedSharedAgentChangeSetId(null);
+    }
+  }, [selectedSharedAgentChangeSetId, sharedAgentChangeSets]);
+
+  const sharedProjectCanEdit =
+    activeSharedProject === null || activeSharedProject.role !== "viewer";
+  const sharedProjectCanInvite = activeSharedProject?.role === "owner";
 
   const toggleDirectory = useCallback((path: string) => {
     setCollapsedDirectoryPaths((currentPaths) => {
@@ -5088,6 +8486,18 @@ function ProjectSidebar({
         <div>
           <span className="eyebrow">Project</span>
           <h2>{project?.displayName ?? "No Project"}</h2>
+          {project !== undefined && (
+            <span
+              className="project-origin-badge"
+              title={
+                activeSharedProject === null
+                  ? project.rootPath
+                  : activeSharedProject.localCachePath
+              }
+            >
+              {activeSharedProject === null ? "Local project" : "Shared project"}
+            </span>
+          )}
         </div>
         <IconButton label="Open project" onClick={onOpenProject}>
           <FolderOpen size={16} />
@@ -5102,36 +8512,492 @@ function ProjectSidebar({
       {project === undefined ? (
         <RecentProjects
           recentProjects={recentProjects}
+          sharedBusy={sharedBusy}
+          sharedConnection={sharedConnection}
+          sharedEmail={sharedEmail}
+          sharedInvitationId={sharedInvitationId}
+          sharedName={sharedName}
+          sharedProjectName={sharedProjectName}
+          sharedProjects={sharedProjects}
+          sharedServerUrl={sharedServerUrl}
+          sharedSessions={sharedSessions}
+          sharedStatus={sharedStatus}
           onOpenProject={onOpenProject}
           onOpenRecentProject={onOpenRecentProject}
+          onClearRecentProjects={onClearRecentProjects}
+          onSharedCreateProject={onSharedCreateProject}
+          onSharedCreateFromSourceZip={onSharedCreateFromSourceZip}
+          onSharedEmailChange={onSharedEmailChange}
+          onSharedInvitationIdChange={onSharedInvitationIdChange}
+          onSharedNameChange={onSharedNameChange}
+          onSharedDeleteProject={onSharedDeleteProject}
+          onSharedExportSourceZip={onSharedExportSourceZip}
+          onSharedOpenProject={onSharedOpenProject}
+          onSharedProjectNameChange={onSharedProjectNameChange}
+          onSharedRefreshProjects={onSharedRefreshProjects}
+          onSharedServerUrlChange={onSharedServerUrlChange}
+          onSharedSessionRevoke={onSharedSessionRevoke}
+          onSharedSignIn={onSharedSignIn}
+          onSharedSignOut={onSharedSignOut}
+          onSharedAcceptInvitation={onSharedAcceptInvitation}
         />
       ) : (
         <>
+          {activeSharedProject !== null && (
+            <div className="shared-projects shared-projects--active">
+              <div>
+                <span className="eyebrow">Share</span>
+                <strong>{activeSharedProject.id}</strong>
+                <span className="project-origin-badge">
+                  {formatSharedProjectRole(activeSharedProject.role)}
+                </span>
+                <span className="shared-projects__status">
+                  {activeSharedProject.role === "viewer"
+                    ? "Read-only shared project. Local compile remains available."
+                    : sharedDocumentSyncStatus}
+                </span>
+                <IconButton
+                  label="Sign out of shared projects"
+                  disabled={sharedBusy}
+                  onClick={onSharedSignOut}
+                >
+                  <X size={14} />
+                </IconButton>
+              </div>
+              <div className="shared-projects__create">
+                <label className="template-picker__field">
+                  <span className="eyebrow">Collaborator email</span>
+                  <input
+                    type="email"
+                    value={sharedInviteEmail}
+                    disabled={sharedBusy || !sharedProjectCanInvite}
+                    onChange={(event) => onSharedInviteEmailChange(event.target.value)}
+                  />
+                </label>
+                <select
+                  className="compact-select"
+                  aria-label="Collaborator role"
+                  value={sharedInviteRole}
+                  disabled={sharedBusy || !sharedProjectCanInvite}
+                  onChange={(event) =>
+                    onSharedInviteRoleChange(
+                      event.target.value === "viewer" ? "viewer" : "editor"
+                    )
+                  }
+                >
+                  <option value="editor">Editor</option>
+                  <option value="viewer">Viewer</option>
+                </select>
+              </div>
+              <button
+                className="text-button"
+                type="button"
+                disabled={sharedBusy || !sharedProjectCanInvite}
+                onClick={onSharedInviteToActiveProject}
+              >
+                <Plus aria-hidden="true" size={14} />
+                Invite
+              </button>
+              <div className="shared-presence" aria-label="Shared members">
+                <span className="eyebrow">Members</span>
+                {sharedMembers.length === 0 ? (
+                  <p className="empty-state">No project members loaded.</p>
+                ) : (
+                  sharedMembers.map((member) => (
+                    <div className="shared-presence__row" key={member.userId}>
+                      <span>{member.name ?? member.email ?? member.userId}</span>
+                      <span className="shared-member-controls">
+                        {sharedProjectCanInvite && member.role !== "owner" ? (
+                          <>
+                            <select
+                              className="compact-select shared-member-role-select"
+                              aria-label={`Role for ${member.email ?? member.userId}`}
+                              value={member.role}
+                              disabled={sharedBusy}
+                              onChange={(event) =>
+                                onSharedMemberRoleChange(
+                                  member.userId,
+                                  event.target.value === "viewer" ? "viewer" : "editor"
+                                )
+                              }
+                            >
+                              <option value="editor">Editor</option>
+                              <option value="viewer">Viewer</option>
+                            </select>
+                            <button
+                              className="inline-text-button"
+                              type="button"
+                              disabled={sharedBusy}
+                              onClick={() => onSharedOwnershipTransfer(member)}
+                            >
+                              Transfer ownership
+                            </button>
+                            <button
+                              className="inline-text-button"
+                              type="button"
+                              disabled={sharedBusy}
+                              onClick={() => onSharedMemberRemove(member.userId)}
+                            >
+                              Remove
+                            </button>
+                          </>
+                        ) : (
+                          formatSharedProjectRole(member.role)
+                        )}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Active shared collaborators">
+                <span className="eyebrow">Active now</span>
+                {sharedPresence.length === 0 ? (
+                  <p className="empty-state">No active collaborators.</p>
+                ) : (
+                  sharedPresence.map((presence) => (
+                    <div className="shared-presence__row" key={presence.userId}>
+                      <span>{presence.displayName}</span>
+                      <span>{presence.filePath ?? "Project"}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared comments">
+                <span className="eyebrow">Comments</span>
+                <label className="template-picker__field">
+                  <span className="eyebrow">
+                    {activeFilePath === undefined
+                      ? "Project comment"
+                      : `Comment on ${activeFilePath}`}
+                  </span>
+                  <textarea
+                    rows={3}
+                    value={sharedCommentDraft}
+                    disabled={sharedBusy || activeSharedProject === null}
+                    onChange={(event) => onSharedCommentDraftChange(event.target.value)}
+                  />
+                </label>
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={
+                    sharedBusy ||
+                    activeSharedProject === null ||
+                    sharedCommentDraft.trim().length === 0
+                  }
+                  onClick={onCreateSharedComment}
+                >
+                  <Plus aria-hidden="true" size={14} />
+                  Comment
+                </button>
+                {sharedComments.length === 0 ? (
+                  <p className="empty-state">No shared comments yet.</p>
+                ) : (
+                  sharedComments.map((comment) => (
+                    <div className="shared-presence__row" key={comment.id}>
+                      <span>{formatSharedCommentTitle(comment)}</span>
+                      <span>
+                        {formatSharedCommentDetails(comment)}
+                        {comment.resolved ? null : (
+                          <button
+                            className="inline-text-button"
+                            type="button"
+                            disabled={sharedBusy}
+                            onClick={() => onResolveSharedComment(comment.id)}
+                          >
+                            Resolve
+                          </button>
+                        )}
+                      </span>
+                      <pre className="shared-agent-changeset-preview">
+                        {comment.body}
+                      </pre>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared file revisions">
+                <span className="eyebrow">File revisions</span>
+                {activeFilePath === null ? (
+                  <p className="empty-state">Open a shared file to see revisions.</p>
+                ) : sharedFileRevisions.length === 0 ? (
+                  <p className="empty-state">No revision history loaded.</p>
+                ) : (
+                  sharedFileRevisions.map((revision) => (
+                    <div className="shared-presence__row" key={revision.id}>
+                      <span>{formatSharedRevisionLabel(revision.id)}</span>
+                      <span>
+                        {formatSharedFileRevisionDetails(revision)}
+                        <button
+                          className="inline-text-button"
+                          type="button"
+                          onClick={() => onInspectSharedFileRevision(revision.id)}
+                        >
+                          Inspect
+                        </button>
+                        <button
+                          className="inline-text-button"
+                          type="button"
+                          disabled={sharedBusy || !sharedProjectCanEdit}
+                          onClick={() => onRestoreSharedFileRevision(revision.id)}
+                        >
+                          Restore
+                        </button>
+                      </span>
+                    </div>
+                  ))
+                )}
+                {selectedSharedFileRevision === null ? null : (
+                  <pre className="shared-agent-changeset-preview">
+                    {formatSharedFileRevisionPreview(selectedSharedFileRevision)}
+                  </pre>
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared compile history">
+                <span className="eyebrow">Recent local compiles</span>
+                {sharedBuildArtifacts.length === 0 ? (
+                  <p className="empty-state">No shared compile history yet.</p>
+                ) : (
+                  sharedBuildArtifacts.map((artifact) => (
+                    <div className="shared-presence__row" key={artifact.id}>
+                      <span>
+                        {artifact.compiler} {artifact.status}
+                      </span>
+                      <span>
+                        {formatSharedBuildArtifactDetails(artifact)}
+                        <button
+                          className="inline-text-button"
+                          type="button"
+                          onClick={() => onInspectSharedBuildArtifact(artifact.id)}
+                        >
+                          Inspect
+                        </button>
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared agent runs">
+                <span className="eyebrow">Agent runs</span>
+                {sharedAgentRuns.length === 0 ? (
+                  <p className="empty-state">No shared agent runs yet.</p>
+                ) : (
+                  sharedAgentRuns.map((agentRun) => (
+                    <div className="shared-presence__row" key={agentRun.id}>
+                      <span>{formatSharedAgentRunTitle(agentRun)}</span>
+                      <span>
+                        {formatSharedAgentRunDetails(agentRun)}
+                        {agentRun.changesetIds.map((changesetId, index) => (
+                          <button
+                            className="inline-text-button"
+                            disabled={
+                              !sharedAgentChangeSets.some(
+                                (changeset) => changeset.id === changesetId
+                              )
+                            }
+                            key={changesetId}
+                            type="button"
+                            onClick={() =>
+                              setSelectedSharedAgentChangeSetId(changesetId)
+                            }
+                          >
+                            {formatSharedAgentChangeSetLinkLabel(
+                              index,
+                              agentRun.changesetIds.length
+                            )}
+                          </button>
+                        ))}
+                        {agentRun.buildArtifactIds.map((artifactId, index) => (
+                          <button
+                            className="inline-text-button"
+                            key={artifactId}
+                            type="button"
+                            onClick={() => onInspectSharedBuildArtifact(artifactId)}
+                          >
+                            {formatSharedAgentRunBuildArtifactLabel(
+                              index,
+                              agentRun.buildArtifactIds.length
+                            )}
+                          </button>
+                        ))}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared agent changesets">
+                <span className="eyebrow">Agent changesets</span>
+                {sharedAgentChangeSets.length === 0 ? (
+                  <p className="empty-state">No shared agent changesets yet.</p>
+                ) : (
+                  sharedAgentChangeSets.map((changeset) => {
+                    const isSelected = changeset.id === selectedSharedAgentChangeSetId;
+
+                    return (
+                      <div
+                        aria-current={isSelected ? "true" : undefined}
+                        className={`shared-presence__row${isSelected ? " shared-presence__row--selected" : ""}`}
+                        key={changeset.id}
+                      >
+                        <span>{formatSharedAgentChangeSetTitle(changeset)}</span>
+                        <span>
+                          {formatSharedAgentChangeSetDetails(changeset)}
+                          {changeset.status === "proposed" ? (
+                            <>
+                              <button
+                                className="inline-text-button"
+                                type="button"
+                                disabled={sharedBusy || !sharedProjectCanEdit}
+                                onClick={() => onApplySharedAgentChangeSet(changeset)}
+                              >
+                                Apply
+                              </button>
+                              <button
+                                className="inline-text-button"
+                                type="button"
+                                disabled={sharedBusy || !sharedProjectCanEdit}
+                                onClick={() => onRejectSharedAgentChangeSet(changeset)}
+                              >
+                                Reject
+                              </button>
+                            </>
+                          ) : null}
+                        </span>
+                        <pre className="shared-agent-changeset-preview">
+                          {changeset.patchPreview}
+                        </pre>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared agent audit">
+                <span className="eyebrow">Agent audit</span>
+                {sharedAuditEvents.length === 0 ? (
+                  <p className="empty-state">No shared agent audit events yet.</p>
+                ) : (
+                  sharedAuditEvents.map((event) => (
+                    <div className="shared-presence__row" key={event.id}>
+                      <span>{formatSharedAgentAuditTitle(event)}</span>
+                      <span>
+                        {formatSharedAgentAuditDetails(event)}
+                        {event.changesetId === undefined ? null : (
+                          <button
+                            className="inline-text-button"
+                            disabled={
+                              !sharedAgentChangeSets.some(
+                                (changeset) => changeset.id === event.changesetId
+                              )
+                            }
+                            type="button"
+                            onClick={() =>
+                              event.changesetId === undefined
+                                ? undefined
+                                : setSelectedSharedAgentChangeSetId(event.changesetId)
+                            }
+                          >
+                            Show changeset
+                          </button>
+                        )}
+                        {(event.buildArtifactIds ?? []).map((artifactId, index) => (
+                          <button
+                            className="inline-text-button"
+                            key={artifactId}
+                            type="button"
+                            onClick={() => onInspectSharedBuildArtifact(artifactId)}
+                          >
+                            {formatSharedAgentRunBuildArtifactLabel(
+                              index,
+                              event.buildArtifactIds?.length ?? 0
+                            )}
+                          </button>
+                        ))}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared activity">
+                <span className="eyebrow">Shared activity</span>
+                {sharedActivity.length === 0 ? (
+                  <p className="empty-state">No shared activity yet.</p>
+                ) : (
+                  sharedActivity.map((activity) => (
+                    <div className="shared-presence__row" key={activity.id}>
+                      <span>{formatSharedActivityTitle(activity)}</span>
+                      <span>{formatSharedActivityDetails(activity)}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+          {activeSharedProject === null && (
+            <div className="shared-projects shared-projects--active">
+              <div>
+                <span className="eyebrow">Share</span>
+                <strong>Local project</strong>
+                <span className="shared-projects__status">{sharedStatus}</span>
+              </div>
+              <div className="shared-projects__create">
+                <label className="template-picker__field">
+                  <span className="eyebrow">Shared name</span>
+                  <input
+                    type="text"
+                    value={sharedProjectName}
+                    disabled={sharedBusy}
+                    onChange={(event) => onSharedProjectNameChange(event.target.value)}
+                  />
+                </label>
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={
+                    sharedBusy ||
+                    !sharedConnection.connected ||
+                    sharedProjectName.trim().length === 0
+                  }
+                  onClick={onSharedCreateFromLocalProject}
+                >
+                  <Plus aria-hidden="true" size={14} />
+                  Share project
+                </button>
+              </div>
+            </div>
+          )}
           <div className="file-actions" aria-label="File actions">
-            <IconButton label="New file" onClick={() => onCreateEntry("file")}>
+            <IconButton
+              label="New file"
+              disabled={!sharedProjectCanEdit}
+              onClick={() => onCreateEntry("file")}
+            >
               <Plus size={15} />
             </IconButton>
-            <IconButton label="New folder" onClick={() => onCreateEntry("directory")}>
+            <IconButton
+              label="New folder"
+              disabled={!sharedProjectCanEdit}
+              onClick={() => onCreateEntry("directory")}
+            >
               <FolderPlus size={15} />
             </IconButton>
             <IconButton
               label="Rename selected entry"
               onClick={onRenameActiveFile}
-              disabled={selectedEntryPath === null}
+              disabled={!sharedProjectCanEdit || selectedEntryPath === null}
             >
               <Pencil size={15} />
             </IconButton>
             <IconButton
               label="Move selected entry"
               onClick={onMoveActiveFile}
-              disabled={selectedEntryPath === null}
+              disabled={!sharedProjectCanEdit || selectedEntryPath === null}
             >
               <ChevronRight size={15} />
             </IconButton>
             <IconButton
               label="Delete selected entry"
               onClick={onDeleteActiveFile}
-              disabled={selectedEntryPath === null}
+              disabled={!sharedProjectCanEdit || selectedEntryPath === null}
             >
               <Trash2 size={15} />
             </IconButton>
@@ -5198,6 +9064,7 @@ function ProjectSidebar({
                   onSelectDirectory={onSelectDirectory}
                   onSelectFile={onSelectFile}
                   onSetMainFile={onSetMainFile}
+                  canEditProject={sharedProjectCanEdit}
                 />
               ))
             )}
@@ -5209,14 +9076,71 @@ function ProjectSidebar({
 }
 
 function RecentProjects({
+  onClearRecentProjects,
   onOpenProject,
   onOpenRecentProject,
-  recentProjects
+  onSharedAcceptInvitation,
+  onSharedCreateProject,
+  onSharedCreateFromSourceZip,
+  onSharedEmailChange,
+  onSharedInvitationIdChange,
+  onSharedNameChange,
+  onSharedDeleteProject,
+  onSharedExportSourceZip,
+  onSharedOpenProject,
+  onSharedProjectNameChange,
+  onSharedRefreshProjects,
+  onSharedServerUrlChange,
+  onSharedSessionRevoke,
+  onSharedSignIn,
+  onSharedSignOut,
+  recentProjects,
+  sharedBusy,
+  sharedConnection,
+  sharedEmail,
+  sharedInvitationId,
+  sharedName,
+  sharedProjectName,
+  sharedProjects,
+  sharedServerUrl,
+  sharedSessions,
+  sharedStatus
 }: {
+  readonly onClearRecentProjects: () => void;
   readonly onOpenProject: () => void;
   readonly onOpenRecentProject: (rootPath: string) => void;
+  readonly onSharedAcceptInvitation: () => void;
+  readonly onSharedCreateProject: () => void;
+  readonly onSharedCreateFromSourceZip: () => void;
+  readonly onSharedEmailChange: (email: string) => void;
+  readonly onSharedInvitationIdChange: (invitationId: string) => void;
+  readonly onSharedNameChange: (name: string) => void;
+  readonly onSharedDeleteProject: (project: SharedProjectSummary) => void;
+  readonly onSharedExportSourceZip: (project: SharedProjectSummary) => void;
+  readonly onSharedOpenProject: (projectId: string) => void;
+  readonly onSharedProjectNameChange: (name: string) => void;
+  readonly onSharedRefreshProjects: () => void;
+  readonly onSharedServerUrlChange: (serverUrl: string) => void;
+  readonly onSharedSessionRevoke: (sessionId: string) => void;
+  readonly onSharedSignIn: () => void;
+  readonly onSharedSignOut: () => void;
   readonly recentProjects: readonly RecentProject[];
+  readonly sharedBusy: boolean;
+  readonly sharedConnection: SharedProjectConnection;
+  readonly sharedEmail: string;
+  readonly sharedInvitationId: string;
+  readonly sharedName: string;
+  readonly sharedProjectName: string;
+  readonly sharedProjects: readonly SharedProjectSummary[];
+  readonly sharedServerUrl: string;
+  readonly sharedSessions: readonly SharedProjectSessionSummary[];
+  readonly sharedStatus: string;
 }) {
+  const sharedConnectionLabel =
+    sharedConnection.connected && sharedConnection.user !== undefined
+      ? sharedConnection.user.email
+      : "Not connected";
+
   return (
     <div className="recent-projects">
       <section className="recent-header">
@@ -5236,8 +9160,216 @@ function RecentProjects({
         </button>
       </div>
 
+      <section className="shared-projects" aria-label="Shared projects">
+        <div className="recent-list__header">
+          <div>
+            <span className="eyebrow">Shared Projects</span>
+            <strong>{sharedConnectionLabel}</strong>
+          </div>
+          <IconButton
+            label="Refresh shared projects"
+            disabled={!sharedConnection.connected || sharedBusy}
+            onClick={onSharedRefreshProjects}
+          >
+            <RefreshCw size={14} />
+          </IconButton>
+        </div>
+
+        <div className="shared-projects__fields">
+          <label className="template-picker__field">
+            <span className="eyebrow">Server URL</span>
+            <input
+              type="url"
+              value={sharedServerUrl}
+              disabled={sharedBusy}
+              onChange={(event) => onSharedServerUrlChange(event.target.value)}
+            />
+          </label>
+          <label className="template-picker__field">
+            <span className="eyebrow">Email</span>
+            <input
+              type="email"
+              value={sharedEmail}
+              disabled={sharedBusy}
+              onChange={(event) => onSharedEmailChange(event.target.value)}
+            />
+          </label>
+          <label className="template-picker__field">
+            <span className="eyebrow">Name</span>
+            <input
+              type="text"
+              value={sharedName}
+              disabled={sharedBusy}
+              onChange={(event) => onSharedNameChange(event.target.value)}
+            />
+          </label>
+        </div>
+
+        <button
+          className="primary-button"
+          type="button"
+          disabled={sharedBusy}
+          onClick={onSharedSignIn}
+        >
+          <Check aria-hidden="true" size={15} />
+          Sign In
+        </button>
+
+        {sharedConnection.connected && (
+          <button
+            className="text-button"
+            type="button"
+            disabled={sharedBusy}
+            onClick={onSharedSignOut}
+          >
+            <X aria-hidden="true" size={14} />
+            Sign Out
+          </button>
+        )}
+
+        {sharedConnection.connected && (
+          <div className="shared-presence" aria-label="Shared sessions">
+            <span className="eyebrow">Sessions</span>
+            {sharedSessions.length === 0 ? (
+              <p className="empty-state">No active sessions loaded.</p>
+            ) : (
+              sharedSessions.map((session) => (
+                <div className="shared-presence__row" key={session.id}>
+                  <span>{formatSharedSessionLabel(session)}</span>
+                  <span>{formatSharedSessionDetails(session)}</span>
+                  {!session.current && (
+                    <button
+                      className="inline-text-button"
+                      type="button"
+                      disabled={sharedBusy}
+                      onClick={() => onSharedSessionRevoke(session.id)}
+                    >
+                      Revoke
+                    </button>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {sharedConnection.connected && (
+          <div className="shared-projects__create">
+            <label className="template-picker__field">
+              <span className="eyebrow">Project name</span>
+              <input
+                type="text"
+                value={sharedProjectName}
+                disabled={sharedBusy}
+                onChange={(event) => onSharedProjectNameChange(event.target.value)}
+              />
+            </label>
+            <button
+              className="text-button"
+              type="button"
+              disabled={sharedBusy}
+              onClick={onSharedCreateProject}
+            >
+              <Plus aria-hidden="true" size={14} />
+              Create
+            </button>
+            <button
+              className="text-button"
+              type="button"
+              disabled={sharedBusy}
+              onClick={onSharedCreateFromSourceZip}
+            >
+              <FolderOpen aria-hidden="true" size={14} />
+              Import ZIP
+            </button>
+          </div>
+        )}
+
+        {sharedConnection.connected && (
+          <div className="shared-projects__create">
+            <label className="template-picker__field">
+              <span className="eyebrow">Invitation id</span>
+              <input
+                type="text"
+                value={sharedInvitationId}
+                disabled={sharedBusy}
+                onChange={(event) => onSharedInvitationIdChange(event.target.value)}
+              />
+            </label>
+            <button
+              className="text-button"
+              type="button"
+              disabled={sharedBusy}
+              onClick={onSharedAcceptInvitation}
+            >
+              <Check aria-hidden="true" size={14} />
+              Accept
+            </button>
+          </div>
+        )}
+
+        <p className="shared-projects__status">{sharedStatus}</p>
+
+        {sharedConnection.connected && (
+          <div className="recent-list" aria-label="Shared project list">
+            {sharedProjects.length === 0 ? (
+              <p className="empty-state">No shared projects yet.</p>
+            ) : (
+              sharedProjects.map((project) => (
+                <div className="shared-project-row" key={project.id}>
+                  <button
+                    className="recent-row shared-project-row__open"
+                    type="button"
+                    disabled={sharedBusy}
+                    onClick={() => onSharedOpenProject(project.id)}
+                  >
+                    <span className="recent-row__title">{project.name}</span>
+                    <span className="recent-row__path">{project.id}</span>
+                    <span className="recent-row__meta">
+                      {formatSharedProjectRole(project.role)} ·{" "}
+                      {formatSharedProjectDetails(project)}
+                    </span>
+                  </button>
+                  <IconButton
+                    label={
+                      project.role === "owner"
+                        ? `Export shared source ZIP for ${project.name}`
+                        : "Only owners can export shared projects"
+                    }
+                    disabled={sharedBusy || project.role !== "owner"}
+                    onClick={() => onSharedExportSourceZip(project)}
+                  >
+                    <Download size={14} />
+                  </IconButton>
+                  <IconButton
+                    label={
+                      project.role === "owner"
+                        ? `Delete shared project ${project.name}`
+                        : "Only owners can delete shared projects"
+                    }
+                    disabled={sharedBusy || project.role !== "owner"}
+                    onClick={() => onSharedDeleteProject(project)}
+                  >
+                    <Trash2 size={14} />
+                  </IconButton>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </section>
+
       <div className="recent-list" aria-label="Recent projects">
-        <span className="eyebrow">Recent</span>
+        <div className="recent-list__header">
+          <span className="eyebrow">Recent</span>
+          <IconButton
+            label="Clear recent projects"
+            disabled={recentProjects.length === 0}
+            onClick={onClearRecentProjects}
+          >
+            <Trash2 size={14} />
+          </IconButton>
+        </div>
         {recentProjects.length === 0 ? (
           <p className="empty-state">No recent projects yet. Open a folder to start.</p>
         ) : (
@@ -5263,6 +9395,7 @@ function RecentProjects({
 
 function FileTreeNode({
   activeFilePath,
+  canEditProject,
   collapsedDirectoryPaths,
   depth,
   mainFilePath,
@@ -5275,6 +9408,7 @@ function FileTreeNode({
   onSetMainFile
 }: {
   readonly activeFilePath: string | undefined;
+  readonly canEditProject: boolean;
   readonly collapsedDirectoryPaths: ReadonlySet<string>;
   readonly depth: number;
   readonly mainFilePath: string | undefined;
@@ -5338,6 +9472,7 @@ function FileTreeNode({
             type="button"
             aria-label={`Set ${node.path} as main file`}
             title={`Set ${node.path} as main file`}
+            disabled={!canEditProject}
             onClick={() => onSetMainFile(node.path)}
           >
             <Check aria-hidden="true" size={13} />
@@ -5349,6 +9484,7 @@ function FileTreeNode({
         : node.children?.map((child) => (
             <FileTreeNode
               activeFilePath={activeFilePath}
+              canEditProject={canEditProject}
               collapsedDirectoryPaths={collapsedDirectoryPaths}
               depth={depth + 1}
               key={child.path}
@@ -5370,60 +9506,106 @@ function EditorPane({
   activeFile,
   activeFilePath,
   buildRunning,
+  canEditProject,
   compileUnavailable,
   dirty,
   dirtyFileCount,
   editorSettings,
   mainFilePath,
   onCompilerChange,
+  onAcceptSharedRemoteChanges,
   onActiveFileChange,
   onCloseFile,
   onContentsChange,
   onFind,
+  onKeepLocalSharedChanges,
   onMount,
-  onWordBlocksChange,
+  onOnlyOfficeDirtyStateChange,
+  onOnlyOfficeExportPdf,
+  onlyOfficeWordReloadVersions,
+  onOnlyOfficeSessionStateChange,
+  onOpenWordSettings,
+  onStatusMessage,
   onRunBuild,
   onSourceToPdf,
   onSave,
   onSaveAll,
   onStopBuild,
   openFiles,
+  projectRoot,
   selectedCompiler,
+  sharedCurrentUserId,
+  sharedDocumentConflict,
+  sharedPresence,
+  isFileDirty,
   syncTexMessage
 }: {
   readonly activeFile: EditorFileState | null;
   readonly activeFilePath: string | null;
   readonly buildRunning: boolean;
+  readonly canEditProject: boolean;
   readonly compileUnavailable: boolean;
   readonly dirty: boolean;
   readonly dirtyFileCount: number;
   readonly editorSettings: AppSettings["editor"];
   readonly mainFilePath: string | undefined;
   readonly onCompilerChange: (compiler: LatexCompiler) => void;
+  readonly onAcceptSharedRemoteChanges: () => void;
   readonly onActiveFileChange: (path: string) => void;
   readonly onCloseFile: (path: string) => void;
-  readonly onContentsChange: (contents: string) => void;
+  readonly onContentsChange: (
+    contents: string,
+    changes: readonly MonacoEditorApi.IModelContentChange[]
+  ) => void;
   readonly onFind: () => void;
+  readonly onKeepLocalSharedChanges: () => void;
   readonly onMount: (editor: MonacoStandaloneEditor) => void;
-  readonly onWordBlocksChange: (blocks: readonly WordDocumentBlock[]) => void;
+  readonly onOnlyOfficeDirtyStateChange: (filePath: string, dirty: boolean) => void;
+  readonly onOnlyOfficeExportPdf: (
+    filePath: string,
+    sessionId: string
+  ) => Promise<void>;
+  readonly onlyOfficeWordReloadVersions: Readonly<Record<string, number>>;
+  readonly onOnlyOfficeSessionStateChange: (
+    filePath: string,
+    sessionId: string | null
+  ) => void;
+  readonly onOpenWordSettings: () => void;
+  readonly onStatusMessage: (message: string) => void;
   readonly onRunBuild: () => void;
   readonly onSourceToPdf: () => void;
   readonly onSave: () => void;
   readonly onSaveAll: () => void;
   readonly onStopBuild: () => void;
   readonly openFiles: readonly EditorFileState[];
+  readonly projectRoot: string | undefined;
   readonly selectedCompiler: LatexCompiler;
+  readonly sharedCurrentUserId: string | undefined;
+  readonly sharedDocumentConflict: boolean;
+  readonly sharedPresence: readonly SharedProjectPresenceSummary[];
+  readonly isFileDirty: (file: EditorFileState) => boolean;
   readonly syncTexMessage: string;
 }) {
+  const isWordEditorActive = activeFile?.documentKind === "word";
+  const showEditorToolbar = !isWordEditorActive;
+  const activeCollaborators = getActiveSharedCollaborators({
+    activeFilePath,
+    currentUserId: sharedCurrentUserId,
+    presence: sharedPresence
+  });
+
   return (
-    <section className="editor-pane" aria-label="Source editor">
+    <section
+      className={`editor-pane${isWordEditorActive ? " editor-pane--word" : ""}`}
+      aria-label="Source editor"
+    >
       <div className="tab-strip" role="tablist" aria-label="Open files">
         {openFiles.length === 0 ? (
           <span className="editor-tab muted">No file</span>
         ) : (
           openFiles.map((file) => {
             const isActive = file.path === activeFilePath;
-            const isDirty = file.contents !== file.savedContents;
+            const isDirty = isFileDirty(file);
 
             return (
               <button
@@ -5462,73 +9644,136 @@ function EditorPane({
           })
         )}
       </div>
-      <div className="editor-toolbar" aria-label="Editor actions">
-        <IconButton
-          label="Save file"
-          disabled={activeFile === null || !dirty}
-          onClick={onSave}
-        >
-          <Save aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton
-          label="Save all files"
-          disabled={dirtyFileCount === 0}
-          onClick={onSaveAll}
-        >
-          <Save aria-hidden="true" size={15} />
-        </IconButton>
-        <select
-          className="compact-select"
-          aria-label="LaTeX compiler"
-          value={selectedCompiler}
-          onChange={(event) => onCompilerChange(event.target.value as LatexCompiler)}
-        >
-          <option value="pdflatex">pdfLaTeX</option>
-          <option value="xelatex">XeLaTeX</option>
-          <option value="lualatex">LuaLaTeX</option>
-        </select>
-        <IconButton
-          label="Compile project"
-          disabled={mainFilePath === undefined || buildRunning || compileUnavailable}
-          onClick={onRunBuild}
-        >
-          <Play aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton label="Stop Build" disabled={!buildRunning} onClick={onStopBuild}>
-          <X aria-hidden="true" size={15} />
-        </IconButton>
-        <span className="toolbar-divider" aria-hidden="true" />
-        <IconButton
-          label="Source to PDF"
-          disabled={activeFile === null}
-          onClick={onSourceToPdf}
-        >
-          <ChevronRight aria-hidden="true" size={15} />
-        </IconButton>
-        <IconButton
-          label="Find in file"
-          disabled={activeFile === null || activeFile.documentKind === "word"}
-          onClick={onFind}
-        >
-          <Search aria-hidden="true" size={15} />
-        </IconButton>
-        <span className="editor-status-group">
-          {buildRunning ? <span className="editor-state">Compiling...</span> : null}
-          {activeFile?.stale === true && (
-            <span className="editor-state">Changed on disk</span>
-          )}
-          {syncTexMessage.length > 0 ? (
-            <span className="editor-state">{syncTexMessage}</span>
+      {showEditorToolbar ? (
+        <div className="editor-toolbar" aria-label="Editor actions">
+          <IconButton
+            label="Save file"
+            disabled={!canEditProject || activeFile === null || !dirty}
+            onClick={onSave}
+          >
+            <Save aria-hidden="true" size={15} />
+          </IconButton>
+          <IconButton
+            label="Save all files"
+            disabled={!canEditProject || dirtyFileCount === 0}
+            onClick={onSaveAll}
+          >
+            <Save aria-hidden="true" size={15} />
+          </IconButton>
+          <select
+            className="compact-select"
+            aria-label="LaTeX compiler"
+            value={selectedCompiler}
+            onChange={(event) => onCompilerChange(event.target.value as LatexCompiler)}
+          >
+            <option value="pdflatex">pdfLaTeX</option>
+            <option value="xelatex">XeLaTeX</option>
+            <option value="lualatex">LuaLaTeX</option>
+          </select>
+          <IconButton
+            label="Compile project"
+            disabled={mainFilePath === undefined || buildRunning || compileUnavailable}
+            onClick={onRunBuild}
+          >
+            <Play aria-hidden="true" size={15} />
+          </IconButton>
+          <IconButton label="Stop Build" disabled={!buildRunning} onClick={onStopBuild}>
+            <X aria-hidden="true" size={15} />
+          </IconButton>
+          <span className="toolbar-divider" aria-hidden="true" />
+          <IconButton
+            label="Source to PDF"
+            disabled={activeFile === null}
+            onClick={onSourceToPdf}
+          >
+            <ChevronRight aria-hidden="true" size={15} />
+          </IconButton>
+          <IconButton
+            label="Find in file"
+            disabled={activeFile === null}
+            onClick={onFind}
+          >
+            <Search aria-hidden="true" size={15} />
+          </IconButton>
+          {sharedDocumentConflict ? (
+            <>
+              <span className="toolbar-divider" aria-hidden="true" />
+              <IconButton
+                label="Accept remote changes"
+                disabled={activeFile === null}
+                onClick={onAcceptSharedRemoteChanges}
+              >
+                <Download aria-hidden="true" size={15} />
+              </IconButton>
+              <IconButton
+                label="Keep local changes"
+                disabled={!canEditProject || activeFile === null}
+                onClick={onKeepLocalSharedChanges}
+              >
+                <UploadCloud aria-hidden="true" size={15} />
+              </IconButton>
+            </>
           ) : null}
-        </span>
-      </div>
+          <span className="editor-status-group">
+            {activeCollaborators.length > 0 ? (
+              <span
+                className="editor-collaborators"
+                aria-label="Active collaborators in this file"
+              >
+                {activeCollaborators.slice(0, 4).map((presence) => (
+                  <span
+                    className="editor-collaborator"
+                    key={presence.userId}
+                    title={formatSharedPresenceLocation(presence)}
+                  >
+                    {getInitials(presence.displayName)}
+                  </span>
+                ))}
+                {activeCollaborators.length > 4 ? (
+                  <span
+                    className="editor-collaborator editor-collaborator--count"
+                    title={`${activeCollaborators.length - 4} more collaborators in this file`}
+                  >
+                    +{activeCollaborators.length - 4}
+                  </span>
+                ) : null}
+              </span>
+            ) : null}
+            {!canEditProject ? (
+              <span className="editor-state">Shared read-only</span>
+            ) : null}
+            {sharedDocumentConflict ? (
+              <span className="editor-state">Shared conflict</span>
+            ) : null}
+            {buildRunning ? <span className="editor-state">Compiling...</span> : null}
+            {activeFile?.stale === true && (
+              <span className="editor-state">Changed on disk</span>
+            )}
+            {syncTexMessage.length > 0 ? (
+              <span className="editor-state">{syncTexMessage}</span>
+            ) : null}
+          </span>
+        </div>
+      ) : null}
       {activeFile === null ? (
         <div className="editor-empty">
           <FileText aria-hidden="true" size={24} />
           <p>Open a project file to edit it.</p>
         </div>
       ) : activeFile.documentKind === "word" ? (
-        <WordEditor file={activeFile} onBlocksChange={onWordBlocksChange} />
+        <OnlyOfficeWordEditorPane
+          key={`${activeFile.path}:${onlyOfficeWordReloadVersions[activeFile.path] ?? 0}`}
+          displayName={getBaseName(activeFile.path)}
+          filePath={activeFile.path}
+          projectRoot={projectRoot}
+          onClose={() => onCloseFile(activeFile.path)}
+          onDirtyStateChange={onOnlyOfficeDirtyStateChange}
+          onExportPdf={onOnlyOfficeExportPdf}
+          onOpenSettings={onOpenWordSettings}
+          readOnly={!canEditProject}
+          onSessionStateChange={onOnlyOfficeSessionStateChange}
+          onStatusMessage={onStatusMessage}
+        />
       ) : (
         <Editor
           beforeMount={(monaco) => configureMonaco(monaco as unknown as Monaco)}
@@ -5544,102 +9789,22 @@ function EditorPane({
             quickSuggestions: editorSettings.autocomplete,
             suggestOnTriggerCharacters: editorSettings.autocomplete,
             renderLineHighlight: "line",
+            readOnly: !canEditProject,
+            readOnlyMessage: {
+              value:
+                "Shared viewers can read and compile this project, but cannot edit it."
+            },
             scrollBeyondLastLine: false,
             wordWrap: "on"
           }}
           path={activeFile.path}
           theme="latex-light"
           value={activeFile.contents}
-          onChange={(value) => onContentsChange(value ?? "")}
+          onChange={(value, event) => onContentsChange(value ?? "", event.changes)}
           onMount={onMount}
         />
       )}
     </section>
-  );
-}
-
-function WordEditor({
-  file,
-  onBlocksChange
-}: {
-  readonly file: EditorFileState;
-  readonly onBlocksChange: (blocks: readonly WordDocumentBlock[]) => void;
-}) {
-  const blocks =
-    file.wordBlocks ??
-    file.contents.split(/\n{2,}/u).map((text, index) => ({
-      id: `p-${index + 1}`,
-      kind: "paragraph" as const,
-      text
-    }));
-  const warnings = file.wordWarnings ?? [];
-
-  const updateBlock = (blockId: string, text: string) => {
-    onBlocksChange(
-      blocks.map((block) => (block.id === blockId ? { ...block, text } : block))
-    );
-  };
-
-  const addParagraph = () => {
-    onBlocksChange([
-      ...blocks,
-      {
-        id: `p-${blocks.length + 1}-${Date.now().toString(36)}`,
-        kind: "paragraph",
-        text: ""
-      }
-    ]);
-  };
-
-  return (
-    <div className="word-editor" aria-label="Word document editor">
-      <div className="word-editor__header">
-        <div>
-          <span className="eyebrow">Word Document</span>
-          <h3>{getBaseName(file.path)}</h3>
-        </div>
-        <button className="secondary-button" type="button" onClick={addParagraph}>
-          <Plus aria-hidden="true" size={14} />
-          Paragraph
-        </button>
-      </div>
-      {warnings.length > 0 ? (
-        <div className="word-editor__warnings" role="status">
-          {warnings.slice(0, 3).map((warning) => (
-            <p key={warning}>{warning}</p>
-          ))}
-        </div>
-      ) : null}
-      <div className="word-editor__page">
-        {blocks.length === 0 ? (
-          <textarea
-            className="word-editor__paragraph"
-            aria-label="Empty Word document paragraph"
-            value=""
-            onChange={(event) =>
-              onBlocksChange([
-                {
-                  id: "p-1",
-                  kind: "paragraph",
-                  text: event.target.value
-                }
-              ])
-            }
-          />
-        ) : (
-          blocks.map((block, index) => (
-            <textarea
-              aria-label={`Word paragraph ${index + 1}`}
-              className="word-editor__paragraph"
-              key={block.id}
-              rows={Math.max(2, Math.ceil(block.text.length / 92))}
-              value={block.text}
-              onChange={(event) => updateBlock(block.id, event.target.value)}
-            />
-          ))
-        )}
-      </div>
-    </div>
   );
 }
 
@@ -7996,6 +12161,32 @@ function SettingsTabPanel({
       ? updateCheckResult.downloadUrl
       : undefined;
   const updateReleaseNotesUrl = updateCheckResult?.releaseNotesUrl;
+  const [onlyOfficeStatus, setOnlyOfficeStatus] = useState<OnlyOfficeStatus | null>(
+    null
+  );
+  const [onlyOfficeStatusRunning, setOnlyOfficeStatusRunning] = useState(false);
+  const refreshOnlyOfficeStatus = useCallback(() => {
+    setOnlyOfficeStatusRunning(true);
+    void desktopApi.onlyOffice
+      .getStatus()
+      .then(setOnlyOfficeStatus)
+      .catch((error) =>
+        setOnlyOfficeStatus({
+          configured: false,
+          bridgeListening: false,
+          documentServerReachable: false,
+          documentServerUrl: settings.onlyOffice.documentServerUrl,
+          message: getErrorMessage(error)
+        })
+      )
+      .finally(() => setOnlyOfficeStatusRunning(false));
+  }, [settings.onlyOffice.documentServerUrl]);
+
+  useEffect(() => {
+    if (tab === "Word") {
+      refreshOnlyOfficeStatus();
+    }
+  }, [refreshOnlyOfficeStatus, settings.onlyOffice, tab]);
 
   return (
     <div className="settings-panel" role="tabpanel">
@@ -8106,6 +12297,96 @@ function SettingsTabPanel({
           <p className="settings-note">
             Shell escape stays disabled by default. Any future shell-escape build path
             must require explicit approval, and the agent cannot enable it.
+          </p>
+        </>
+      )}
+      {tab === "Word" && (
+        <>
+          <Toggle
+            checked={settings.onlyOffice.enabled}
+            label="Use ONLYOFFICE for Word documents"
+            onChange={(enabled) =>
+              onSettingsChange((current) => ({
+                ...current,
+                onlyOffice: { ...current.onlyOffice, enabled }
+              }))
+            }
+          />
+          <TextField
+            label="Document Server URL"
+            value={settings.onlyOffice.documentServerUrl}
+            onChange={(documentServerUrl) =>
+              onSettingsChange((current) => ({
+                ...current,
+                onlyOffice: { ...current.onlyOffice, documentServerUrl }
+              }))
+            }
+          />
+          <TextField
+            label="Bridge callback URL"
+            value={settings.onlyOffice.bridgePublicBaseUrl}
+            onChange={(bridgePublicBaseUrl) =>
+              onSettingsChange((current) => ({
+                ...current,
+                onlyOffice: { ...current.onlyOffice, bridgePublicBaseUrl }
+              }))
+            }
+          />
+          <TextField
+            label="JWT secret"
+            placeholder="Optional"
+            value={settings.onlyOffice.jwtSecret}
+            onChange={(jwtSecret) =>
+              onSettingsChange((current) => ({
+                ...current,
+                onlyOffice: { ...current.onlyOffice, jwtSecret }
+              }))
+            }
+          />
+          <section className="update-status-panel" aria-label="ONLYOFFICE status">
+            <div className="update-status-heading">
+              <div>
+                <strong>{formatOnlyOfficeStatusTitle(onlyOfficeStatus)}</strong>
+                <p>{onlyOfficeStatus?.message ?? "Status has not been checked yet."}</p>
+              </div>
+              <span
+                className={`update-status-pill ${getOnlyOfficeStatusTone(onlyOfficeStatus)}`}
+              >
+                {getOnlyOfficeStatusLabel(onlyOfficeStatus)}
+              </span>
+            </div>
+            <div className="update-version-grid">
+              <Field
+                label="Document Server"
+                value={onlyOfficeStatus?.documentServerUrl ?? "Unknown"}
+              />
+              <Field
+                label="Bridge URL"
+                value={onlyOfficeStatus?.bridgePublicBaseUrl ?? "Not listening"}
+              />
+              <Field
+                label="Bridge port"
+                value={
+                  onlyOfficeStatus?.bridgePort === undefined
+                    ? "Not listening"
+                    : String(onlyOfficeStatus.bridgePort)
+                }
+              />
+            </div>
+          </section>
+          <button
+            className="text-button settings-action"
+            type="button"
+            disabled={onlyOfficeStatusRunning}
+            onClick={refreshOnlyOfficeStatus}
+          >
+            <RefreshCw aria-hidden="true" size={15} />
+            {onlyOfficeStatusRunning ? "Checking ONLYOFFICE" : "Check ONLYOFFICE"}
+          </button>
+          <p className="settings-note">
+            For a local Docker Document Server, run{" "}
+            <code>npm run onlyoffice:start</code>. Keep the callback URL on
+            host.docker.internal so the container can reach ZeroLeaf's local bridge.
           </p>
         </>
       )}
@@ -8557,6 +12838,44 @@ function formatUpdateState(state: AppUpdateCheckResult["state"] | undefined): st
     default:
       return "Idle";
   }
+}
+
+function formatOnlyOfficeStatusTitle(status: OnlyOfficeStatus | null): string {
+  if (status === null) {
+    return "ONLYOFFICE status";
+  }
+
+  if (!status.configured) {
+    return "ONLYOFFICE disabled";
+  }
+
+  return status.documentServerReachable
+    ? "ONLYOFFICE ready"
+    : "Document Server unreachable";
+}
+
+function getOnlyOfficeStatusTone(status: OnlyOfficeStatus | null): string {
+  if (status === null) {
+    return "idle";
+  }
+
+  if (!status.configured) {
+    return "not-configured";
+  }
+
+  return status.documentServerReachable ? "current" : "error";
+}
+
+function getOnlyOfficeStatusLabel(status: OnlyOfficeStatus | null): string {
+  if (status === null) {
+    return "Idle";
+  }
+
+  if (!status.configured) {
+    return "Disabled";
+  }
+
+  return status.documentServerReachable ? "Ready" : "Error";
 }
 
 function formatUpdateCheckedAt(result: AppUpdateCheckResult | null): string {
@@ -9031,6 +13350,18 @@ function installE2EEditorHooks(editor: MonacoStandaloneEditor) {
         line: number,
         column: number
       ) => { readonly ok: boolean; readonly line?: number; readonly column?: number };
+      setEditorValue: (
+        path: string,
+        value: string
+      ) => {
+        readonly ok: boolean;
+        readonly reason?: string;
+      };
+      getEditorValue: (path: string) => {
+        readonly ok: boolean;
+        readonly value?: string;
+        readonly reason?: string;
+      };
       getEditorPosition: (path: string) => {
         readonly ok: boolean;
         readonly line?: number;
@@ -9041,6 +13372,38 @@ function installE2EEditorHooks(editor: MonacoStandaloneEditor) {
   };
 
   targetWindow.__latexAgentE2E = {
+    setEditorValue: (path, value) => {
+      const model = editor.getModel();
+      const uri = model?.uri.toString() ?? "";
+      const activePath = path.split("/").at(-1) ?? path;
+
+      if (model === null) {
+        return { ok: false, reason: "missing model" };
+      }
+
+      if (!uri.includes(path) && !uri.endsWith(activePath)) {
+        return { ok: false, reason: `active model was ${uri}` };
+      }
+
+      model.setValue(value);
+      editor.focus();
+      return { ok: true };
+    },
+    getEditorValue: (path) => {
+      const model = editor.getModel();
+      const uri = model?.uri.toString() ?? "";
+      const activePath = path.split("/").at(-1) ?? path;
+
+      if (model === null) {
+        return { ok: false, reason: "missing model" };
+      }
+
+      if (!uri.includes(path) && !uri.endsWith(activePath)) {
+        return { ok: false, reason: `active model was ${uri}` };
+      }
+
+      return { ok: true, value: model.getValue() };
+    },
     setEditorPosition: (path, line, column) => {
       const model = editor.getModel();
       const uri = model?.uri.toString() ?? "";
@@ -9346,6 +13709,13 @@ function formatAgentModeLabel(mode: AgentMode): string {
   }
 }
 
+function getEffectiveSharedAgentMode(
+  mode: AgentMode,
+  activeSharedProject: ActiveSharedProject | null
+): AgentMode {
+  return activeSharedProject?.role === "viewer" ? "read-only" : mode;
+}
+
 function getAgentModeDescription(mode: AgentMode): string {
   switch (mode) {
     case "suggest":
@@ -9385,136 +13755,6 @@ function formatAgentStatusLabel(status: string): string {
     .join(" ");
 }
 
-function parseNoProjectAgentCommand(prompt: string): NoProjectAgentCommand | undefined {
-  const normalizedPrompt = prompt.trim();
-
-  if (normalizedPrompt.length === 0) {
-    return undefined;
-  }
-
-  const lowerPrompt = normalizedPrompt.toLowerCase();
-  const isCreateProjectIntent =
-    /\b(create|start|make|set up|setup)\b/u.test(lowerPrompt) &&
-    /\b(project|paper|manuscript)\b/u.test(lowerPrompt);
-
-  if (!isCreateProjectIntent) {
-    return undefined;
-  }
-
-  const namePatterns = [
-    /\bname(?:d)?\s+(?:it\s+)?["']?([^"'\n\r]+?)["']?\s*$/iu,
-    /\bcalled\s+["']?([^"'\n\r]+?)["']?\s*$/iu,
-    /\btitled\s+["']?([^"'\n\r]+?)["']?\s*$/iu,
-    /\bproject\s+["']?([^"'\n\r]+?)["']?\s*$/iu
-  ];
-  const matchedName = namePatterns
-    .map((pattern) => normalizedPrompt.match(pattern)?.[1])
-    .find((candidate): candidate is string => candidate !== undefined);
-  const projectName = sanitizeNoProjectAgentProjectName(matchedName ?? "paper");
-
-  if (projectName.length === 0) {
-    return undefined;
-  }
-
-  return {
-    kind: "create-project",
-    projectName,
-    templateId: inferProjectTemplateId(lowerPrompt)
-  };
-}
-
-function parseExternalTemplateAgentCommand(
-  prompt: string,
-  events: readonly AgentEvent[]
-): ExternalTemplateAgentCommand | undefined {
-  const normalizedPrompt = prompt.trim();
-
-  if (normalizedPrompt.length === 0) {
-    return undefined;
-  }
-
-  const lowerPrompt = normalizedPrompt.toLowerCase();
-  const isCreateProjectIntent =
-    /\b(create|start|make|set up|setup)\b/u.test(lowerPrompt) &&
-    /\b(project|paper|manuscript)\b/u.test(lowerPrompt);
-
-  if (!isCreateProjectIntent) {
-    return undefined;
-  }
-
-  const recentContext = getRecentAgentAssistantContext(events);
-  const isIeeeTemplateRequest =
-    (/\bieee\b/u.test(lowerPrompt) &&
-      /\b(template|systems journal)\b/u.test(lowerPrompt)) ||
-    (/\b(that|this|the)\s+template\b/u.test(lowerPrompt) &&
-      /\bieee\b/u.test(recentContext) &&
-      /\b(template|systems journal)\b/u.test(recentContext));
-
-  if (!isIeeeTemplateRequest) {
-    return undefined;
-  }
-
-  return {
-    kind: "create-external-template-project",
-    projectName: inferExternalTemplateProjectName(normalizedPrompt),
-    templateId: "ieee-systems-journal"
-  };
-}
-
-function getRecentAgentAssistantContext(events: readonly AgentEvent[]): string {
-  return events
-    .filter(
-      (event): event is AgentEvent & { readonly type: "message" } =>
-        event.type === "message" && event.role === "assistant"
-    )
-    .slice(-4)
-    .map((event) => event.content)
-    .join("\n")
-    .toLowerCase();
-}
-
-function inferExternalTemplateProjectName(prompt: string): string {
-  const matchedName = [
-    /\bname(?:d)?\s+(?:it\s+)?["']?([^"'\n\r]+?)["']?\s*$/iu,
-    /\bcalled\s+["']?([^"'\n\r]+?)["']?\s*$/iu,
-    /\btitled\s+["']?([^"'\n\r]+?)["']?\s*$/iu
-  ]
-    .map((pattern) => prompt.match(pattern)?.[1])
-    .find((candidate): candidate is string => candidate !== undefined);
-
-  return sanitizeNoProjectAgentProjectName(
-    matchedName ?? "ieee-systems-journal-template"
-  );
-}
-
-function sanitizeNoProjectAgentProjectName(projectName: string): string {
-  return projectName
-    .trim()
-    .replace(/[.?!,;:]+$/u, "")
-    .replace(/^["'`]+|["'`]+$/gu, "")
-    .trim();
-}
-
-function inferProjectTemplateId(prompt: string): ProjectTemplateId {
-  if (/\b(thesis|dissertation)\b/u.test(prompt)) {
-    return "thesis";
-  }
-
-  if (/\b(report|technical report)\b/u.test(prompt)) {
-    return "report";
-  }
-
-  if (/\b(beamer|slides|presentation)\b/u.test(prompt)) {
-    return "beamer";
-  }
-
-  if (/\b(cv|resume|résumé)\b/u.test(prompt)) {
-    return "cv";
-  }
-
-  return "article";
-}
-
 function getDefaultProjectNameForTemplate(
   projectTemplates: readonly ProjectTemplate[],
   templateId: ProjectTemplateId
@@ -9549,7 +13789,10 @@ function buildAgentMessageEvent({
 
 function buildAgentCompletionSummaryEvent(
   result: AgentSessionResult,
-  options: { readonly decision?: "allowed" | "denied" } = {}
+  options: {
+    readonly decision?: "allowed" | "denied";
+    readonly wordChangesAutoApply?: boolean;
+  } = {}
 ): AgentEvent | undefined {
   const content = createAgentCompletionSummary(result, options);
 
@@ -9571,7 +13814,10 @@ function buildAgentCompletionSummaryEvent(
 
 function createAgentCompletionSummary(
   result: AgentSessionResult,
-  options: { readonly decision?: "allowed" | "denied" }
+  options: {
+    readonly decision?: "allowed" | "denied";
+    readonly wordChangesAutoApply?: boolean;
+  }
 ): string | undefined {
   if (result.status === "running") {
     return undefined;
@@ -9602,6 +13848,10 @@ function createAgentCompletionSummary(
 
   if (result.status === "completed") {
     if (wordChangeSets.length > 0) {
+      if (options.wordChangesAutoApply === true) {
+        return `I applied ${wordChangeSets.length} Word ${wordChangeSets.length === 1 ? "edit" : "edits"}${changedFiles} and refreshed ONLYOFFICE.`;
+      }
+
       return `I prepared ${wordChangeSets.length} reviewable Word ${wordChangeSets.length === 1 ? "edit" : "edits"}${changedFiles}. No files were changed yet.`;
     }
 
@@ -11235,10 +15485,6 @@ function isWordDocumentPath(path: string): boolean {
   return path.toLowerCase().endsWith(".docx");
 }
 
-function getWordBlocksPlainText(blocks: readonly WordDocumentBlock[]): string {
-  return blocks.map((block) => block.text).join("\n\n");
-}
-
 function formatWordOperationTitle(operationType: WordBlockOperation["type"]): string {
   switch (operationType) {
     case "replace-block":
@@ -11312,6 +15558,181 @@ function replaceOpenFile(
   return files.map((file) => (file.path === nextFile.path ? nextFile : file));
 }
 
+function createSharedTextOperations(
+  beforeContents: string,
+  afterContents: string
+): readonly SharedProjectDocumentTextOperation[] {
+  if (beforeContents === afterContents) {
+    return [];
+  }
+
+  let sharedPrefixLength = 0;
+  while (
+    sharedPrefixLength < beforeContents.length &&
+    sharedPrefixLength < afterContents.length &&
+    beforeContents.charCodeAt(sharedPrefixLength) ===
+      afterContents.charCodeAt(sharedPrefixLength)
+  ) {
+    sharedPrefixLength += 1;
+  }
+
+  let beforeSuffixOffset = beforeContents.length;
+  let afterSuffixOffset = afterContents.length;
+  while (
+    beforeSuffixOffset > sharedPrefixLength &&
+    afterSuffixOffset > sharedPrefixLength &&
+    beforeContents.charCodeAt(beforeSuffixOffset - 1) ===
+      afterContents.charCodeAt(afterSuffixOffset - 1)
+  ) {
+    beforeSuffixOffset -= 1;
+    afterSuffixOffset -= 1;
+  }
+
+  return [
+    {
+      rangeOffset: sharedPrefixLength,
+      rangeLength: beforeSuffixOffset - sharedPrefixLength,
+      text: afterContents.slice(sharedPrefixLength, afterSuffixOffset)
+    }
+  ];
+}
+
+function applySharedRemoteTextOperationsToEditor(
+  editor: MonacoStandaloneEditor,
+  operations: readonly SharedProjectDocumentTextOperation[]
+): boolean {
+  const model = editor.getModel();
+  if (model === null) {
+    return false;
+  }
+
+  editor.executeEdits(
+    "shared-remote",
+    operations.map((operation) => {
+      const start = model.getPositionAt(operation.rangeOffset);
+      const end = model.getPositionAt(operation.rangeOffset + operation.rangeLength);
+      return {
+        range: {
+          startLineNumber: start.lineNumber,
+          startColumn: start.column,
+          endLineNumber: end.lineNumber,
+          endColumn: end.column
+        },
+        text: operation.text,
+        forceMoveMarkers: true
+      };
+    })
+  );
+  return true;
+}
+
+function createSharedPresenceCursorDecorations({
+  activeFilePath,
+  currentUserId,
+  model,
+  presence
+}: {
+  readonly activeFilePath: string;
+  readonly currentUserId: string | undefined;
+  readonly model: MonacoEditorApi.ITextModel;
+  readonly presence: readonly SharedProjectPresenceSummary[];
+}): MonacoEditorApi.IModelDeltaDecoration[] {
+  return presence.flatMap((entry) => {
+    if (
+      entry.userId === currentUserId ||
+      entry.filePath !== activeFilePath ||
+      entry.cursorLine === undefined ||
+      entry.cursorColumn === undefined
+    ) {
+      return [];
+    }
+
+    const position = model.validatePosition({
+      lineNumber: entry.cursorLine,
+      column: entry.cursorColumn
+    });
+
+    return [
+      {
+        range: {
+          startLineNumber: position.lineNumber,
+          startColumn: position.column,
+          endLineNumber: position.lineNumber,
+          endColumn: position.column
+        },
+        options: {
+          beforeContentClassName: "shared-remote-cursor",
+          hoverMessage: {
+            value: `${entry.displayName} cursor`
+          }
+        }
+      }
+    ];
+  });
+}
+
+function getActiveSharedCollaborators({
+  activeFilePath,
+  currentUserId,
+  presence
+}: {
+  readonly activeFilePath: string | null;
+  readonly currentUserId: string | undefined;
+  readonly presence: readonly SharedProjectPresenceSummary[];
+}): readonly SharedProjectPresenceSummary[] {
+  if (activeFilePath === null) {
+    return [];
+  }
+
+  return presence
+    .filter(
+      (entry) => entry.userId !== currentUserId && entry.filePath === activeFilePath
+    )
+    .sort((left, right) => left.displayName.localeCompare(right.displayName));
+}
+
+function getInitials(displayName: string): string {
+  const words = displayName
+    .trim()
+    .split(/\s+/u)
+    .filter((word) => word.length > 0);
+  if (words.length === 0) {
+    return "?";
+  }
+
+  return words
+    .slice(0, 2)
+    .map((word) => word[0]?.toUpperCase() ?? "")
+    .join("");
+}
+
+function formatSharedPresenceLocation(presence: SharedProjectPresenceSummary): string {
+  const location =
+    presence.cursorLine === undefined || presence.cursorColumn === undefined
+      ? (presence.filePath ?? "Project")
+      : `${presence.filePath ?? "Project"}:${presence.cursorLine}:${presence.cursorColumn}`;
+
+  return `${presence.displayName} · ${location}`;
+}
+
+function upsertSharedPresence(
+  presence: readonly SharedProjectPresenceSummary[],
+  nextPresence: SharedProjectPresenceSummary
+): readonly SharedProjectPresenceSummary[] {
+  const existingIndex = presence.findIndex(
+    (entry) =>
+      entry.projectId === nextPresence.projectId && entry.userId === nextPresence.userId
+  );
+
+  if (existingIndex === -1) {
+    return [...presence, nextPresence];
+  }
+
+  return presence.map((entry, index) =>
+    index === existingIndex ? nextPresence : entry
+  );
+}
+
 function replaceWordChangeSet(
   changesets: readonly WordChangeSet[],
   nextChangeSet: WordChangeSet
@@ -11336,6 +15757,15 @@ function getBaseName(path: string) {
 
 function normalizeProjectPath(path: string) {
   return path.split("\\").join("/").replace(/^\.\//u, "");
+}
+
+function getProjectRelativePath(projectRoot: string, path: string) {
+  const normalizedRoot = normalizeProjectPath(projectRoot).replace(/\/+$/u, "");
+  const normalizedPath = normalizeProjectPath(path);
+  const rootPrefix = `${normalizedRoot}/`;
+  return normalizedPath.startsWith(rootPrefix)
+    ? normalizedPath.slice(rootPrefix.length)
+    : normalizedPath;
 }
 
 function getSiblingProjectPath(path: string, newName: string) {
@@ -11417,6 +15847,44 @@ function createSetupFailureBuildResult(
   };
 }
 
+function createBuildResultFromSharedArtifact(
+  artifact: SharedProjectBuildArtifactDetails,
+  fallbackCompiler: LatexCompiler
+): BuildResult {
+  return {
+    jobId: `shared-build-artifact:${artifact.id}`,
+    status: artifact.status,
+    compiler: toLatexCompiler(artifact.compiler, fallbackCompiler),
+    command: ["shared-build-artifact", artifact.compiler],
+    securityPolicy: createDefaultBuildSecurityPolicy(),
+    startedAt: artifact.createdAt,
+    finishedAt: artifact.createdAt,
+    durationMs: 0,
+    diagnostics: artifact.diagnostics,
+    rawLog: artifact.rawLog,
+    stdout: "",
+    stderr: "",
+    ...(artifact.pdfBase64 === undefined || artifact.pdfByteLength === undefined
+      ? {}
+      : {
+          artifact: {
+            pdfPath: `shared-build-artifact:${artifact.id}.pdf`,
+            updatedAt: artifact.createdAt,
+            byteLength: artifact.pdfByteLength
+          }
+        })
+  };
+}
+
+function toLatexCompiler(
+  value: string,
+  fallbackCompiler: LatexCompiler
+): LatexCompiler {
+  return value === "pdflatex" || value === "xelatex" || value === "lualatex"
+    ? value
+    : fallbackCompiler;
+}
+
 function createDefaultBuildSecurityPolicy(): BuildResult["securityPolicy"] {
   return {
     shellEscape: {
@@ -11456,4 +15924,375 @@ function formatRecentProjectDetails(project: RecentProject) {
   const mainFileLabel = project.mainFilePath === undefined ? "" : project.mainFilePath;
 
   return [mainFileLabel, openedLabel].filter(Boolean).join(" · ");
+}
+
+function formatSharedProjectDetails(project: SharedProjectSummary) {
+  const updatedAt = new Date(project.updatedAt);
+
+  if (Number.isNaN(updatedAt.getTime())) {
+    return "Updated unknown";
+  }
+
+  return `Updated ${updatedAt.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric"
+  })}`;
+}
+
+function formatSharedSessionLabel(session: Pick<SharedProjectSessionSummary, "id">) {
+  const shortId = session.id.length <= 8 ? session.id : session.id.slice(0, 8);
+  return `Session ${shortId}`;
+}
+
+function formatSharedSessionDetails(session: SharedProjectSessionSummary) {
+  const createdAt = new Date(session.createdAt);
+  const refreshExpiresAt = new Date(session.refreshTokenExpiresAt);
+  const createdLabel = Number.isNaN(createdAt.getTime())
+    ? "created unknown"
+    : `created ${createdAt.toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric"
+      })}`;
+  const expiryLabel = Number.isNaN(refreshExpiresAt.getTime())
+    ? "refresh expiry unknown"
+    : `refresh expires ${refreshExpiresAt.toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric"
+      })}`;
+
+  return `${session.current ? "This desktop" : "Remote desktop"} · ${createdLabel} · ${expiryLabel}`;
+}
+
+function formatSharedBuildArtifactDetails(artifact: SharedProjectBuildArtifactSummary) {
+  const createdLabel = formatSharedArtifactCreatedAt(artifact);
+  const diagnosticsLabel =
+    artifact.diagnosticCount === 1
+      ? "1 diagnostic"
+      : `${artifact.diagnosticCount} diagnostics`;
+  const pdfLabel =
+    artifact.pdfByteLength === undefined
+      ? "no PDF"
+      : `${formatBytes(artifact.pdfByteLength)} PDF`;
+  const toolchainLabel =
+    artifact.engineVersion === undefined && artifact.latexmkVersion === undefined
+      ? "toolchain unknown"
+      : [
+          artifact.engineVersion === undefined
+            ? undefined
+            : `engine ${formatSharedToolchainVersion(artifact.engineVersion)}`,
+          artifact.latexmkVersion === undefined
+            ? undefined
+            : `latexmk ${formatSharedToolchainVersion(artifact.latexmkVersion)}`
+        ]
+          .filter((part): part is string => part !== undefined)
+          .join(" · ");
+
+  return `${createdLabel} · ${diagnosticsLabel} · ${pdfLabel} · ${toolchainLabel} · desktop ${formatSharedDesktopClientLabel(
+    artifact.desktopClientId
+  )} · source ${formatSharedRevisionLabel(artifact.sourceRevisionId)}`;
+}
+
+function formatSharedArtifactCreatedAt(artifact: SharedProjectBuildArtifactSummary) {
+  const createdAt = new Date(artifact.createdAt);
+
+  return Number.isNaN(createdAt.getTime())
+    ? "unknown"
+    : createdAt.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      });
+}
+
+function formatSharedRevisionLabel(revisionId: string) {
+  return revisionId.length <= 8 ? revisionId : revisionId.slice(0, 8);
+}
+
+function formatSharedDesktopClientLabel(desktopClientId: string) {
+  return desktopClientId.length <= 16
+    ? desktopClientId
+    : `${desktopClientId.slice(0, 16)}...`;
+}
+
+function formatSharedToolchainVersion(version: string) {
+  const firstLine = version.split(/\r?\n/u)[0]?.trim() ?? version.trim();
+  return firstLine.length <= 48 ? firstLine : `${firstLine.slice(0, 45)}...`;
+}
+
+function formatSharedAgentRunTitle(agentRun: SharedProjectAgentRunSummary) {
+  return `${formatSharedAgentRunStatus(agentRun.status)} · ${agentRun.providerId}`;
+}
+
+function formatSharedAgentRunDetails(agentRun: SharedProjectAgentRunSummary) {
+  const updatedAt = new Date(agentRun.updatedAt);
+  const updatedLabel = Number.isNaN(updatedAt.getTime())
+    ? "unknown"
+    : updatedAt.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      });
+  const changesetLabel =
+    agentRun.changesetIds.length === 1
+      ? "1 changeset"
+      : `${agentRun.changesetIds.length} changesets`;
+  const buildArtifactLabel =
+    agentRun.buildArtifactIds.length === 1
+      ? "1 compile result"
+      : `${agentRun.buildArtifactIds.length} compile results`;
+
+  return `${updatedLabel} · ${agentRun.mode} · ${changesetLabel} · ${buildArtifactLabel}`;
+}
+
+function formatSharedAgentRunBuildArtifactLabel(index: number, total: number) {
+  return total <= 1 ? "Inspect compile" : `Inspect compile ${index + 1}`;
+}
+
+function formatSharedAgentChangeSetLinkLabel(index: number, total: number) {
+  return total <= 1 ? "Show changeset" : `Show changeset ${index + 1}`;
+}
+
+function formatSharedAgentRunStatus(status: SharedProjectAgentRunSummary["status"]) {
+  switch (status) {
+    case "cancelled":
+      return "Cancelled";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "running":
+      return "Running";
+    case "waiting-for-review":
+      return "Waiting for review";
+  }
+}
+
+function formatSharedAgentChangeSetTitle(
+  changeset: SharedProjectAgentChangeSetSummary
+) {
+  return `${changeset.filePath} · ${formatSharedAgentChangeSetStatus(
+    changeset.status
+  )}`;
+}
+
+function formatSharedAgentChangeSetDetails(
+  changeset: SharedProjectAgentChangeSetSummary
+) {
+  const updatedAt = new Date(changeset.updatedAt);
+  const updatedLabel = Number.isNaN(updatedAt.getTime())
+    ? "unknown"
+    : updatedAt.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      });
+
+  return `${updatedLabel} · ${changeset.summary}`;
+}
+
+function formatSharedAgentChangeSetStatus(
+  status: SharedProjectAgentChangeSetSummary["status"]
+) {
+  switch (status) {
+    case "applied":
+      return "Applied";
+    case "failed":
+      return "Failed";
+    case "proposed":
+      return "Proposed";
+    case "rejected":
+      return "Rejected";
+  }
+}
+
+function formatSharedAgentAuditTitle(event: SharedProjectAuditEventSummary) {
+  return formatSharedAgentAuditEventType(event.eventType);
+}
+
+function formatSharedAgentAuditDetails(event: SharedProjectAuditEventSummary) {
+  const createdAt = new Date(event.createdAt);
+  const createdLabel = Number.isNaN(createdAt.getTime())
+    ? "unknown"
+    : createdAt.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      });
+  const linkedIds = [
+    event.agentRunId === undefined
+      ? undefined
+      : `run ${formatSharedRevisionLabel(event.agentRunId)}`,
+    event.changesetId === undefined
+      ? undefined
+      : `changeset ${formatSharedRevisionLabel(event.changesetId)}`,
+    event.buildArtifactIds === undefined || event.buildArtifactIds.length === 0
+      ? undefined
+      : `${event.buildArtifactIds.length} compile ${event.buildArtifactIds.length === 1 ? "artifact" : "artifacts"}`
+  ].filter((part): part is string => part !== undefined);
+
+  return [createdLabel, event.message, ...linkedIds].join(" · ");
+}
+
+function formatSharedAgentAuditEventType(eventType: string) {
+  switch (eventType) {
+    case "agent.changeset.applied":
+      return "Agent changeset applied";
+    case "agent.changeset.proposed":
+      return "Agent changeset proposed";
+    case "agent.changeset.rejected":
+      return "Agent changeset rejected";
+    case "agent.run.cancelled":
+      return "Agent run cancelled";
+    case "agent.run.completed":
+      return "Agent run completed";
+    case "agent.run.created":
+      return "Agent run started";
+    case "agent.run.failed":
+      return "Agent run failed";
+    case "agent.run.waiting-for-review":
+      return "Agent run waiting for review";
+    default:
+      return eventType;
+  }
+}
+
+function formatSharedActivityTitle(activity: SharedProjectActivitySummary) {
+  switch (activity.eventType) {
+    case "agent.changeset.applied":
+      return "Agent changeset applied";
+    case "agent.changeset.proposed":
+      return "Agent changeset proposed";
+    case "agent.changeset.rejected":
+      return "Agent changeset rejected";
+    case "agent.run.cancelled":
+      return "Agent run cancelled";
+    case "agent.run.completed":
+      return "Agent run completed";
+    case "agent.run.created":
+      return "Agent run";
+    case "agent.run.failed":
+      return "Agent run failed";
+    case "agent.run.waiting-for-review":
+      return "Agent run waiting for review";
+    case "build-artifact.created":
+      return "Local compile uploaded";
+    case "entry.deleted":
+      return "Entry deleted";
+    case "entry.moved":
+      return "Entry moved";
+    case "entry.renamed":
+      return "Entry renamed";
+    case "file.created":
+      return "File created";
+    case "file.updated":
+      return "File updated";
+    case "project.created":
+      return "Project created";
+    case "project.invitation.accepted":
+      return "Invitation accepted";
+    case "project.invitation.created":
+      return "Invitation sent";
+    default:
+      return activity.eventType;
+  }
+}
+
+function formatSharedActivityDetails(activity: SharedProjectActivitySummary) {
+  const createdAt = new Date(activity.createdAt);
+  const createdLabel = Number.isNaN(createdAt.getTime())
+    ? "unknown"
+    : createdAt.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      });
+
+  return `${createdLabel} · ${activity.message}`;
+}
+
+function formatSharedCommentTitle(comment: SharedProjectCommentSummary) {
+  const anchor =
+    comment.filePath === undefined
+      ? "Project"
+      : comment.line === undefined
+        ? comment.filePath
+        : `${comment.filePath}:${comment.line}`;
+  return `${comment.resolved ? "Resolved" : "Open"} · ${anchor}`;
+}
+
+function formatSharedCommentDetails(comment: SharedProjectCommentSummary) {
+  const updatedAt = new Date(comment.updatedAt);
+  const updatedLabel = Number.isNaN(updatedAt.getTime())
+    ? "unknown"
+    : updatedAt.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      });
+  const authorLabel = formatSharedRevisionLabel(comment.authorUserId);
+
+  return `${updatedLabel} · ${authorLabel}`;
+}
+
+function formatSharedFileRevisionDetails(revision: SharedProjectFileRevisionSummary) {
+  const createdAt = new Date(revision.createdAt);
+  const createdLabel = Number.isNaN(createdAt.getTime())
+    ? "unknown"
+    : createdAt.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      });
+  const encodingLabel =
+    revision.contentEncoding === undefined || revision.contentEncoding === "utf8"
+      ? "text"
+      : "binary";
+
+  return `${createdLabel} · ${formatBytes(revision.byteLength)} ${encodingLabel} · ${formatSharedRevisionLabel(revision.actorUserId)}`;
+}
+
+function formatSharedFileRevisionPreview(revision: SharedProjectFileRevisionDetails) {
+  if (revision.contentEncoding === "base64") {
+    return `${revision.path}\n${formatBytes(revision.byteLength)} binary revision ${formatSharedRevisionLabel(revision.id)}`;
+  }
+
+  const maxPreviewLength = 1_600;
+  const preview =
+    revision.contents.length > maxPreviewLength
+      ? `${revision.contents.slice(0, maxPreviewLength)}\n...revision preview truncated...`
+      : revision.contents;
+  return `${revision.path} · revision ${formatSharedRevisionLabel(revision.id)}\n\n${preview}`;
+}
+
+function toSharedProjectAgentRunStatus(
+  status: AgentSessionResult["status"]
+): "running" | "waiting-for-review" | "completed" | "failed" | "cancelled" {
+  switch (status) {
+    case "awaiting-approval":
+      return "waiting-for-review";
+    case "cancelled":
+    case "completed":
+    case "failed":
+    case "running":
+      return status;
+  }
+}
+
+function formatSharedProjectRole(role: SharedProjectRole) {
+  switch (role) {
+    case "owner":
+      return "Owner";
+    case "editor":
+      return "Editor";
+    case "viewer":
+      return "Viewer";
+  }
 }

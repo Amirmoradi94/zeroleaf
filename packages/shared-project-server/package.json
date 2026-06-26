@@ -1,0 +1,21 @@
+{
+  "name": "@latex-agent/shared-project-server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx src/dev-server.ts",
+    "typecheck": "tsc -b --pretty",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ws": "^8.21.0",
+    "yjs": "^13.6.31"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}

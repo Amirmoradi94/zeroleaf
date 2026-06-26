@@ -214,3 +214,37 @@ and rejected changesets do not need binary snapshots.
 - Rollback never runs for proposed, rejected, failed, or already reverted Word
   changesets.
 - Manual Word saves remain direct saves and do not create Word changesets.
+
+## Phase 5 ONLYOFFICE Local Setup Plan
+
+Purpose: make the local ONLYOFFICE dependency easy to start, inspect, and verify
+without changing the renderer's security boundary or making the packaged app
+silently manage Docker.
+
+### Scope
+
+- Add root npm commands for local Document Server lifecycle:
+  `onlyoffice:start`, `onlyoffice:stop`, `onlyoffice:restart`,
+  `onlyoffice:status`, and `onlyoffice:logs`.
+- Keep the helper script aligned with the app defaults:
+  `http://127.0.0.1:8082` for Document Server and
+  `JWT_ENABLED=false` for local development.
+- Allow environment overrides for container name, image, host, and port.
+- Show the setup command in Word settings and in unreachable-status diagnostics.
+- Document the local setup workflow under `docs/development`.
+
+### Non-Goals
+
+- Do not add renderer filesystem, shell, Docker, or OS access.
+- Do not auto-start Docker from the desktop app.
+- Do not package a Document Server runtime inside ZeroLeaf yet.
+
+### Acceptance Criteria
+
+- `npm run onlyoffice:status` reports container state and probes
+  `/web-apps/apps/api/documents/api.js`.
+- `npm run onlyoffice:start` creates or starts the local Document Server
+  container.
+- Word settings tell the user to run `npm run onlyoffice:start` when using the
+  local Docker setup.
+- Existing ONLYOFFICE service, IPC, renderer, and build tests continue to pass.

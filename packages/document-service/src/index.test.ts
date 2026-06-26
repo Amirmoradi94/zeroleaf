@@ -1,8 +1,9 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Document, Packer, Paragraph, TextRun } from "docx";
+import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -53,6 +54,28 @@ describe("document-service", () => {
 
     expect(saved.plainText).toContain("Revised introduction.");
     expect(saved.plainText).toContain("Revised conclusion.");
+  });
+
+  it("reads a blank .docx document as one editable paragraph block", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "zeroleaf-docx-blank-"));
+
+    await saveWordDocument(projectRoot, "blank.docx", []);
+
+    const saved = await readWordDocument(projectRoot, "blank.docx");
+    const archive = await JSZip.loadAsync(
+      await readFile(join(projectRoot, "blank.docx"))
+    );
+    const documentXml = await archive.file("word/document.xml")?.async("string");
+
+    expect(saved.path).toBe("blank.docx");
+    expect(saved.plainText).toBe("");
+    expect(saved.blocks).toHaveLength(1);
+    expect(saved.blocks[0]).toMatchObject({
+      kind: "paragraph",
+      text: ""
+    });
+    expect(documentXml).toContain('<w:t xml:space="preserve"> </w:t>');
+    expect(documentXml).not.toContain('<w:t xml:space="preserve"></w:t>');
   });
 
   it("rejects paths outside the project root", async () => {

@@ -1,0 +1,21 @@
+{
+  "createdAt": "2026-06-25T10:26:02.757Z",
+  "baseUrl": "http://127.0.0.1:56003",
+  "reportRoot": "/Users/amirmoradi94/Desktop/Projects/overleaf-clone/docs/qa/real-shared-collaboration-2026-06-25",
+  "passed": true,
+  "result": {
+    "projectId": "5dc12593-90e2-4584-9e95-2b79b6e4e712",
+    "editorInvitationId": "5ff8b6b9-97c6-4c4e-a6b4-aa6ff6b7dcb2",
+    "viewerInvitationId": "7b002ad8-9a21-494a-94ea-da26e6857537",
+    "compiledRevisionId": "557ba66f-68b7-4cde-8cc9-0279f93394c5",
+    "uploadedArtifactId": "b8ba45d6-09b3-4769-9c2e-b0923849d730",
+    "realtimePresenceUser": "Editor",
+    "ownerDocumentUpdateId": "0ede4fe3-538c-4c72-a0f5-fb90be98b99c",
+    "editorDocumentUpdateId": "4313c81f-d2b5-4cdc-ae95-f79ac1192c43",
+    "realtimeDocumentUpdateId": "4313c81f-d2b5-4cdc-ae95-f79ac1192c43",
+    "finalRevisionId": "032f20de-7d6d-48ab-b30d-8de66b9078c0",
+    "resolvedCommentId": "8a7eed19-43d2-499f-8ca3-64f6d0816ab7",
+    "exportedFileCount": 2,
+    "pdfByteLength": 23914
+  }
+}

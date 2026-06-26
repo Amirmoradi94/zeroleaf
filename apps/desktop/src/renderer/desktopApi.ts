@@ -79,9 +79,20 @@ function readFallbackSettings(): AppSettings {
   }
 
   try {
+    const parsed = JSON.parse(storedSettings) as Partial<AppSettings>;
     return {
       ...defaultAppSettings,
-      ...(JSON.parse(storedSettings) as Partial<AppSettings>),
+      ...parsed,
+      editor: { ...defaultAppSettings.editor, ...parsed.editor },
+      compiler: { ...defaultAppSettings.compiler, ...parsed.compiler },
+      agentPermissions: {
+        ...defaultAppSettings.agentPermissions,
+        ...parsed.agentPermissions
+      },
+      appearance: { ...defaultAppSettings.appearance, ...parsed.appearance },
+      updates: { ...defaultAppSettings.updates, ...parsed.updates },
+      onlyOffice: { ...defaultAppSettings.onlyOffice, ...parsed.onlyOffice },
+      privacy: { ...defaultAppSettings.privacy, ...parsed.privacy },
       credentials: defaultAppSettings.credentials
     };
   } catch {
@@ -137,6 +148,7 @@ const fallbackApi: DesktopApi = {
     getState: () => Promise.resolve({ recentProjects: [] }),
     open: () => Promise.resolve(undefined),
     openRecent: () => Promise.reject(new Error("Electron project API unavailable.")),
+    clearRecent: () => Promise.resolve({ recentProjects: [] }),
     refresh: () => Promise.reject(new Error("Electron project API unavailable.")),
     createEntry: () => Promise.reject(new Error("Electron project API unavailable.")),
     renameEntry: () => Promise.reject(new Error("Electron project API unavailable.")),
@@ -144,6 +156,84 @@ const fallbackApi: DesktopApi = {
     deleteEntry: () => Promise.reject(new Error("Electron project API unavailable.")),
     setMainFile: () => Promise.reject(new Error("Electron project API unavailable.")),
     onChanged: () => () => undefined
+  },
+  shared: {
+    getConnection: () => Promise.resolve({ connected: false }),
+    signIn: () => Promise.reject(new Error("Electron shared project API unavailable.")),
+    signOut: () => Promise.resolve({ connected: false }),
+    listSessions: () => Promise.resolve([]),
+    revokeSession: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    listProjects: () => Promise.resolve([]),
+    createProject: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    createFromLocalProject: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    createFromSourceZip: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    updateProjectSettings: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    deleteProject: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    exportSourceZip: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    openProject: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    invite: () => Promise.reject(new Error("Electron shared project API unavailable.")),
+    acceptInvitation: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    listMembers: () => Promise.resolve([]),
+    updateMemberRole: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    transferOwnership: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    removeMember: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    listPresence: () => Promise.resolve([]),
+    updatePresence: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    listActivity: () => Promise.resolve([]),
+    listComments: () => Promise.resolve([]),
+    createComment: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    resolveComment: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    listAuditEvents: () => Promise.resolve([]),
+    publishAgentRun: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    updateAgentRunStatus: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    listAgentRuns: () => Promise.resolve([]),
+    listAgentChangeSets: () => Promise.resolve([]),
+    applyAgentChangeSet: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    rejectAgentChangeSet: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    listBuildArtifacts: () => Promise.resolve([]),
+    getBuildArtifact: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    publishBuildArtifact: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    attachAgentRunBuildArtifact: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    getFileRevision: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    listFileRevisions: () => Promise.resolve([]),
+    getFileRevisionDetails: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    restoreFileRevision: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    syncDocumentContents: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    applyDocumentTextOperations: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    pullDocumentContents: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    startRealtime: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    stopRealtime: () =>
+      Promise.reject(new Error("Electron shared project API unavailable.")),
+    onRealtimeEvent: () => () => undefined
   },
   files: {
     read: () => Promise.reject(new Error("Electron file API unavailable.")),
@@ -158,6 +248,20 @@ const fallbackApi: DesktopApi = {
       Promise.reject(new Error("Electron Word changeset API unavailable.")),
     rollbackChangeSet: () =>
       Promise.reject(new Error("Electron Word changeset API unavailable."))
+  },
+  onlyOffice: {
+    getStatus: () =>
+      Promise.resolve({
+        configured: false,
+        bridgeListening: false,
+        documentServerReachable: false,
+        documentServerUrl: "",
+        message: "Electron ONLYOFFICE API unavailable."
+      }),
+    createSession: () =>
+      Promise.reject(new Error("Electron ONLYOFFICE API unavailable.")),
+    forceSave: () => Promise.reject(new Error("Electron ONLYOFFICE API unavailable.")),
+    exportPdf: () => Promise.reject(new Error("Electron ONLYOFFICE API unavailable."))
   },
   build: {
     detectToolchain: () =>
@@ -252,6 +356,7 @@ const fallbackApi: DesktopApi = {
     exportSourceZip: () => Promise.resolve(undefined),
     exportPdf: () => Promise.resolve(undefined),
     importSourceZip: () => Promise.resolve(undefined),
+    createForAgent: () => Promise.resolve(undefined),
     createFromTemplate: () => Promise.resolve(undefined),
     createFromExternalTemplate: () => Promise.resolve(undefined),
     checkSubmission: () =>
@@ -270,7 +375,10 @@ const fallbackApi: DesktopApi = {
     save: (settings) => {
       window.localStorage.setItem(
         fallbackSettingsKey,
-        JSON.stringify({ ...settings, credentials: defaultAppSettings.credentials })
+        JSON.stringify({
+          ...settings,
+          credentials: defaultAppSettings.credentials
+        })
       );
       return Promise.resolve({
         ...settings,

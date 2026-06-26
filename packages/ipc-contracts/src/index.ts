@@ -10,6 +10,7 @@ export const ipcChannels = {
   projectGetState: "project.getState",
   projectOpen: "project.open",
   projectOpenRecent: "project.openRecent",
+  projectClearRecent: "project.clearRecent",
   projectRefresh: "project.refresh",
   projectCreateEntry: "project.createEntry",
   projectRenameEntry: "project.renameEntry",
@@ -17,6 +18,52 @@ export const ipcChannels = {
   projectDeleteEntry: "project.deleteEntry",
   projectSetMainFile: "project.setMainFile",
   projectChanged: "project.changed",
+  sharedGetConnection: "shared.getConnection",
+  sharedSignIn: "shared.signIn",
+  sharedSignOut: "shared.signOut",
+  sharedListSessions: "shared.listSessions",
+  sharedRevokeSession: "shared.revokeSession",
+  sharedListProjects: "shared.listProjects",
+  sharedCreateProject: "shared.createProject",
+  sharedCreateFromLocalProject: "shared.createFromLocalProject",
+  sharedCreateFromSourceZip: "shared.createFromSourceZip",
+  sharedUpdateProjectSettings: "shared.updateProjectSettings",
+  sharedDeleteProject: "shared.deleteProject",
+  sharedExportSourceZip: "shared.exportSourceZip",
+  sharedOpenProject: "shared.openProject",
+  sharedInvite: "shared.invite",
+  sharedAcceptInvitation: "shared.acceptInvitation",
+  sharedListMembers: "shared.listMembers",
+  sharedUpdateMemberRole: "shared.updateMemberRole",
+  sharedTransferOwnership: "shared.transferOwnership",
+  sharedRemoveMember: "shared.removeMember",
+  sharedListPresence: "shared.listPresence",
+  sharedUpdatePresence: "shared.updatePresence",
+  sharedListActivity: "shared.listActivity",
+  sharedListComments: "shared.listComments",
+  sharedCreateComment: "shared.createComment",
+  sharedResolveComment: "shared.resolveComment",
+  sharedListAuditEvents: "shared.listAuditEvents",
+  sharedPublishAgentRun: "shared.publishAgentRun",
+  sharedUpdateAgentRunStatus: "shared.updateAgentRunStatus",
+  sharedListAgentRuns: "shared.listAgentRuns",
+  sharedListAgentChangeSets: "shared.listAgentChangeSets",
+  sharedApplyAgentChangeSet: "shared.applyAgentChangeSet",
+  sharedRejectAgentChangeSet: "shared.rejectAgentChangeSet",
+  sharedListBuildArtifacts: "shared.listBuildArtifacts",
+  sharedGetBuildArtifact: "shared.getBuildArtifact",
+  sharedPublishBuildArtifact: "shared.publishBuildArtifact",
+  sharedAttachAgentRunBuildArtifact: "shared.attachAgentRunBuildArtifact",
+  sharedGetFileRevision: "shared.getFileRevision",
+  sharedListFileRevisions: "shared.listFileRevisions",
+  sharedGetFileRevisionDetails: "shared.getFileRevisionDetails",
+  sharedRestoreFileRevision: "shared.restoreFileRevision",
+  sharedSyncDocumentContents: "shared.syncDocumentContents",
+  sharedApplyDocumentTextOperations: "shared.applyDocumentTextOperations",
+  sharedPullDocumentContents: "shared.pullDocumentContents",
+  sharedStartRealtime: "shared.startRealtime",
+  sharedStopRealtime: "shared.stopRealtime",
+  sharedRealtimeEvent: "shared.realtimeEvent",
   fileRead: "file.read",
   fileWrite: "file.write",
   wordRead: "word.read",
@@ -24,6 +71,10 @@ export const ipcChannels = {
   wordCreateChangeSet: "word.createChangeSet",
   wordApplyChangeSet: "word.applyChangeSet",
   wordRollbackChangeSet: "word.rollbackChangeSet",
+  onlyOfficeGetStatus: "onlyoffice.getStatus",
+  onlyOfficeCreateSession: "onlyoffice.createSession",
+  onlyOfficeForceSave: "onlyoffice.forceSave",
+  onlyOfficeExportPdf: "onlyoffice.exportPdf",
   buildDetectToolchain: "build.detectToolchain",
   buildRun: "build.run",
   buildStop: "build.stop",
@@ -51,6 +102,7 @@ export const ipcChannels = {
   lifecycleExportSourceZip: "lifecycle.exportSourceZip",
   lifecycleExportPdf: "lifecycle.exportPdf",
   lifecycleImportSourceZip: "lifecycle.importSourceZip",
+  lifecycleCreateForAgent: "lifecycle.createForAgent",
   lifecycleCreateFromTemplate: "lifecycle.createFromTemplate",
   lifecycleCreateFromExternalTemplate: "lifecycle.createFromExternalTemplate",
   lifecycleCheckSubmission: "lifecycle.checkSubmission",
@@ -77,6 +129,13 @@ export type AppInfo = {
 
 export type AppUpdatePreferences = {
   readonly checkOnStartup: boolean;
+};
+
+export type OnlyOfficePreferences = {
+  readonly enabled: boolean;
+  readonly documentServerUrl: string;
+  readonly jwtSecret: string;
+  readonly bridgePublicBaseUrl: string;
 };
 
 export type AppUpdateCheckResult = {
@@ -163,6 +222,456 @@ export type ProjectFileSnapshot = {
   readonly mtimeMs: number;
 };
 
+export type SharedProjectUser = {
+  readonly id: string;
+  readonly email: string;
+  readonly name: string;
+};
+
+export type SharedProjectConnection = {
+  readonly connected: boolean;
+  readonly baseUrl?: string;
+  readonly user?: SharedProjectUser;
+};
+
+export type SharedProjectSessionSummary = {
+  readonly id: string;
+  readonly userId: string;
+  readonly current: boolean;
+  readonly accessTokenExpiresAt: string;
+  readonly refreshTokenExpiresAt: string;
+  readonly createdAt: string;
+};
+
+export type SharedProjectSessionRevokeRequest = {
+  readonly sessionId: string;
+};
+
+export type SharedProjectSessionRevokeResult = {
+  readonly sessionId: string;
+  readonly revoked: boolean;
+};
+
+export type SharedProjectSummary = {
+  readonly id: string;
+  readonly name: string;
+  readonly ownerUserId: string;
+  readonly mainFilePath?: string;
+  readonly compiler?: LatexCompiler;
+  readonly role: SharedProjectRole;
+  readonly updatedAt: string;
+};
+
+export type SharedProjectRole = "owner" | "editor" | "viewer";
+
+export type SharedProjectInvitationSummary = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly email: string;
+  readonly role: Exclude<SharedProjectRole, "owner">;
+  readonly status: "pending" | "accepted";
+};
+
+export type SharedProjectInviteRequest = {
+  readonly projectId: string;
+  readonly email: string;
+  readonly role: Exclude<SharedProjectRole, "owner">;
+};
+
+export type SharedProjectAcceptInvitationRequest = {
+  readonly invitationId: string;
+};
+
+export type SharedProjectMemberSummary = {
+  readonly projectId: string;
+  readonly userId: string;
+  readonly role: SharedProjectRole;
+  readonly email?: string;
+  readonly name?: string;
+  readonly joinedAt?: string;
+};
+
+export type SharedProjectMemberRoleUpdateRequest = {
+  readonly projectId: string;
+  readonly userId: string;
+  readonly role: Exclude<SharedProjectRole, "owner">;
+};
+
+export type SharedProjectOwnershipTransferRequest = {
+  readonly projectId: string;
+  readonly userId: string;
+};
+
+export type SharedProjectMemberRemoveRequest = {
+  readonly projectId: string;
+  readonly userId: string;
+};
+
+export type SharedProjectDeleteRequest = {
+  readonly projectId: string;
+};
+
+export type SharedProjectExportSourceZipRequest = {
+  readonly projectId: string;
+};
+
+export type SharedProjectPresenceSummary = {
+  readonly projectId: string;
+  readonly userId: string;
+  readonly displayName: string;
+  readonly filePath?: string;
+  readonly cursorLine?: number;
+  readonly cursorColumn?: number;
+  readonly updatedAt: string;
+};
+
+export type SharedProjectBuildArtifactSummary = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly sourceRevisionId: string;
+  readonly desktopClientId: string;
+  readonly compiler: string;
+  readonly engineVersion?: string;
+  readonly latexmkVersion?: string;
+  readonly status: BuildStatus;
+  readonly platform: NodeJS.Platform;
+  readonly diagnosticCount: number;
+  readonly pdfByteLength?: number;
+  readonly createdAt: string;
+};
+
+export type SharedProjectBuildArtifactDetails = SharedProjectBuildArtifactSummary & {
+  readonly rawLog: string;
+  readonly diagnostics: readonly LatexDiagnostic[];
+  readonly pdfBase64?: string;
+};
+
+export type SharedProjectBuildArtifactPublishRequest = {
+  readonly projectId: string;
+  readonly projectRoot: string;
+  readonly mainFilePath: string;
+  readonly sourceRevisionId?: string;
+  readonly buildResult: BuildResult;
+};
+
+export type SharedProjectAgentRunBuildArtifactAttachRequest = {
+  readonly projectId: string;
+  readonly agentRunId: string;
+  readonly artifactId: string;
+};
+
+export type SharedProjectFileRevisionLookupRequest = {
+  readonly projectId: string;
+  readonly path: string;
+};
+
+export type SharedProjectFileRevisionLookupResult = {
+  readonly projectId: string;
+  readonly path: string;
+  readonly revisionId: string;
+};
+
+export type SharedProjectFileRevisionSummary = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly path: string;
+  readonly actorUserId: string;
+  readonly createdAt: string;
+  readonly contentEncoding?: "utf8" | "base64";
+  readonly byteLength: number;
+};
+
+export type SharedProjectFileRevisionDetails = SharedProjectFileRevisionSummary & {
+  readonly contents: string;
+};
+
+export type SharedProjectFileRevisionRequest = {
+  readonly projectId: string;
+  readonly revisionId: string;
+};
+
+export type SharedProjectPresenceUpdateRequest = {
+  readonly projectId: string;
+  readonly filePath?: string;
+  readonly cursorLine?: number;
+  readonly cursorColumn?: number;
+};
+
+export type SharedProjectCommentSummary = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly authorUserId: string;
+  readonly body: string;
+  readonly filePath?: string;
+  readonly line?: number;
+  readonly resolved: boolean;
+  readonly resolvedByUserId?: string;
+  readonly resolvedAt?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+export type SharedProjectCommentCreateRequest = {
+  readonly projectId: string;
+  readonly body: string;
+  readonly filePath?: string;
+  readonly line?: number;
+};
+
+export type SharedProjectCommentResolveRequest = {
+  readonly projectId: string;
+  readonly commentId: string;
+};
+
+export type SharedProjectRealtimeSubscriptionRequest = {
+  readonly projectId: string;
+};
+
+export type SharedProjectRealtimeSubscriptionResult = {
+  readonly projectId: string;
+  readonly subscribed: boolean;
+};
+
+export type SharedProjectRealtimeEvent =
+  | {
+      readonly type: "tree.updated";
+      readonly projectId: string;
+    }
+  | {
+      readonly type: "file.updated";
+      readonly projectId: string;
+      readonly path: string;
+      readonly revisionId: string;
+    }
+  | {
+      readonly type: "document.updated";
+      readonly projectId: string;
+      readonly path: string;
+      readonly updateId: string;
+      readonly revisionId: string;
+    }
+  | {
+      readonly type: "presence.updated";
+      readonly projectId: string;
+      readonly presence: SharedProjectPresenceSummary;
+    }
+  | {
+      readonly type: "members.updated";
+      readonly projectId: string;
+    }
+  | {
+      readonly type: "comments.updated";
+      readonly projectId: string;
+    }
+  | {
+      readonly type: "build-artifact.created";
+      readonly projectId: string;
+      readonly artifactId: string;
+    }
+  | {
+      readonly type: "agent.run.updated";
+      readonly projectId: string;
+      readonly agentRunId: string;
+      readonly status: SharedProjectAgentRunStatus;
+    }
+  | {
+      readonly type: "agent.changeset.updated";
+      readonly projectId: string;
+      readonly changesetId: string;
+      readonly status: SharedProjectAgentChangeSetSummary["status"];
+    }
+  | {
+      readonly type: "error";
+      readonly projectId: string;
+      readonly message: string;
+    };
+
+export type SharedProjectActivitySummary = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly actorUserId: string;
+  readonly eventType: string;
+  readonly message: string;
+  readonly createdAt: string;
+};
+
+export type SharedProjectAuditEventSummary = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly actorUserId: string;
+  readonly eventType: string;
+  readonly message: string;
+  readonly agentRunId?: string;
+  readonly changesetId?: string;
+  readonly buildArtifactIds?: readonly string[];
+  readonly createdAt: string;
+};
+
+export type SharedProjectAgentRunStatus =
+  | "running"
+  | "waiting-for-review"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type SharedProjectAgentRunSummary = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly actorUserId: string;
+  readonly providerId: string;
+  readonly mode: string;
+  readonly promptHash: string;
+  readonly status: SharedProjectAgentRunStatus;
+  readonly changesetIds: readonly string[];
+  readonly buildArtifactIds: readonly string[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+export type SharedProjectAgentChangeSetSummary = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly agentRunId: string;
+  readonly actorUserId: string;
+  readonly filePath: string;
+  readonly summary: string;
+  readonly status: "proposed" | "applied" | "rejected" | "failed";
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly patchPreview: string;
+  readonly appliedAt?: string;
+  readonly appliedRevisionId?: string;
+};
+
+export type SharedProjectAppliedAgentChangeSetResult = {
+  readonly changeset: SharedProjectAgentChangeSetSummary;
+  readonly fileRevision: {
+    readonly projectId: string;
+    readonly path: string;
+    readonly revisionId: string;
+    readonly contents: string;
+    readonly mtimeMs: number;
+  };
+};
+
+export type SharedProjectAgentRunPublishRequest = {
+  readonly projectId: string;
+  readonly agentRunId?: string;
+  readonly providerId: AgentProviderId;
+  readonly mode: AgentMode;
+  readonly prompt: string;
+  readonly status: SharedProjectAgentRunStatus;
+  readonly changesetIds: readonly string[];
+  readonly buildArtifactIds?: readonly string[];
+};
+
+export type SharedProjectAgentRunPublishResult = {
+  readonly agentRun: SharedProjectAgentRunSummary;
+  readonly changesets: readonly (SharedProjectAgentChangeSetSummary & {
+    readonly localChangeSetId: string;
+  })[];
+};
+
+export type SharedProjectAgentRunStatusUpdateRequest = {
+  readonly projectId: string;
+  readonly agentRunId: string;
+  readonly status: SharedProjectAgentRunStatus;
+};
+
+export type SharedProjectAgentChangeSetStatusRequest = {
+  readonly projectId: string;
+  readonly changesetId: string;
+};
+
+export type SharedProjectDocumentSyncRequest = {
+  readonly projectId: string;
+  readonly path: string;
+  readonly contents: string;
+};
+
+export type SharedProjectDocumentTextOperation = {
+  readonly rangeOffset: number;
+  readonly rangeLength: number;
+  readonly text: string;
+};
+
+export type SharedProjectDocumentTextOperationRequest = {
+  readonly projectId: string;
+  readonly path: string;
+  readonly operations: readonly SharedProjectDocumentTextOperation[];
+  readonly clientOperationId?: string;
+};
+
+export type SharedProjectDocumentPullRequest = {
+  readonly projectId: string;
+  readonly path: string;
+  readonly afterUpdateId?: string;
+};
+
+export type SharedProjectDocumentSyncResult = {
+  readonly projectId: string;
+  readonly path: string;
+  readonly contents: string;
+  readonly revisionId: string;
+  readonly mtimeMs: number;
+  readonly lastUpdateId?: string;
+  readonly remoteUpdateCount?: number;
+  readonly remoteTextOperations?: readonly SharedProjectDocumentTextOperation[];
+};
+
+export type SharedProjectInitialFile = {
+  readonly path: string;
+  readonly contents: string;
+  readonly contentEncoding?: "utf8" | "base64";
+};
+
+export type SharedProjectInitialDirectory = {
+  readonly path: string;
+};
+
+export type SharedProjectCreateRequest = {
+  readonly name: string;
+  readonly mainFilePath?: string;
+  readonly compiler?: LatexCompiler;
+  readonly directories?: readonly SharedProjectInitialDirectory[];
+  readonly files?: readonly SharedProjectInitialFile[];
+};
+
+export type SharedProjectCreateFromLocalProjectRequest = {
+  readonly projectRoot: string;
+  readonly name: string;
+};
+
+export type SharedProjectCreateFromSourceZipRequest = {
+  readonly name?: string;
+};
+
+export type SharedProjectCreateFromLocalProjectResult = {
+  readonly project: SharedProjectSummary;
+  readonly importedFileCount: number;
+  readonly importedDirectoryCount: number;
+  readonly skippedFilePaths: readonly string[];
+};
+
+export type SharedProjectSignInRequest = {
+  readonly baseUrl: string;
+  readonly email: string;
+  readonly name?: string;
+};
+
+export type SharedProjectSettingsUpdateRequest = {
+  readonly projectId: string;
+  readonly mainFilePath?: string;
+  readonly compiler?: LatexCompiler;
+};
+
+export type SharedProjectOpenResult = ProjectOpenResult & {
+  readonly sharedProjectId: string;
+  readonly localCachePath: string;
+  readonly role: SharedProjectRole;
+  readonly compiler?: LatexCompiler;
+};
+
 export type WordDocumentBlockKind = "paragraph";
 
 export type WordDocumentBlock = {
@@ -243,6 +752,68 @@ export type WordChangeSetApplyResult = {
   readonly document: WordDocumentModel;
 };
 
+export type OnlyOfficeStatus = {
+  readonly configured: boolean;
+  readonly bridgeListening: boolean;
+  readonly documentServerReachable: boolean;
+  readonly documentServerUrl: string;
+  readonly bridgePublicBaseUrl?: string;
+  readonly bridgePort?: number;
+  readonly message: string;
+};
+
+export type OnlyOfficeEditorSession = {
+  readonly sessionId: string;
+  readonly documentServerUrl: string;
+  readonly config: OnlyOfficeEditorConfig;
+  readonly expiresAt: string;
+};
+
+export type OnlyOfficeEditorConfig = {
+  readonly type: "desktop";
+  readonly documentType: "word";
+  readonly width: "100%";
+  readonly height: "100%";
+  readonly document: {
+    readonly fileType: "docx";
+    readonly key: string;
+    readonly title: string;
+    readonly url: string;
+    readonly permissions: {
+      readonly edit: boolean;
+      readonly download: boolean;
+      readonly print: boolean;
+    };
+  };
+  readonly editorConfig: {
+    readonly mode: "edit";
+    readonly callbackUrl: string;
+    readonly lang: string;
+    readonly user: {
+      readonly id: string;
+      readonly name: string;
+    };
+    readonly customization: {
+      readonly autosave: boolean;
+      readonly forcesave: boolean;
+    };
+  };
+  readonly token?: string;
+};
+
+export type OnlyOfficeForceSaveResult = {
+  readonly requested: boolean;
+  readonly error?: number;
+  readonly message: string;
+};
+
+export type OnlyOfficeExportPdfResult = {
+  readonly filePath: string;
+  readonly pdfPath: string;
+  readonly byteLength: number;
+  readonly message: string;
+};
+
 export type AgentActiveDocument =
   | {
       readonly kind: "text";
@@ -270,6 +841,7 @@ export type LatexToolchainStatus = {
   readonly latexmkAvailable: boolean;
   readonly synctexAvailable: boolean;
   readonly latexmkVersion?: string;
+  readonly compilerVersions?: Readonly<Partial<Record<LatexCompiler, string>>>;
   readonly availableCompilers: readonly LatexCompiler[];
 };
 
@@ -641,10 +1213,18 @@ export type AgentImageAttachment = {
   readonly dataUrl: string;
 };
 
+export type AgentProjectContext = {
+  readonly backend: "shared";
+  readonly sharedProjectId: string;
+  readonly localCachePath: string;
+  readonly role: SharedProjectRole;
+};
+
 export type AgentStartRequest = {
   readonly providerId: AgentProviderId;
   readonly mode: AgentMode;
   readonly projectRoot: string;
+  readonly projectContext?: AgentProjectContext;
   readonly sessionId?: string;
   readonly networkContext?: AgentNetworkFetchResult;
   readonly maxTurns?: number;
@@ -2134,6 +2714,7 @@ export type AppSettings = {
   readonly agentPermissions: AgentPermissionPreferences;
   readonly appearance: AppearancePreferences;
   readonly updates: AppUpdatePreferences;
+  readonly onlyOffice: OnlyOfficePreferences;
   readonly privacy: PrivacyPreferences;
   readonly credentials: readonly CredentialStorageStatus[];
 };
@@ -2167,6 +2748,12 @@ export const defaultAppSettings: AppSettings = {
   },
   updates: {
     checkOnStartup: true
+  },
+  onlyOffice: {
+    enabled: true,
+    documentServerUrl: "http://127.0.0.1:8082",
+    jwtSecret: "",
+    bridgePublicBaseUrl: "http://host.docker.internal:27170"
   },
   privacy: {
     storeAgentTranscripts: true,
@@ -2223,6 +2810,7 @@ export type IpcRequestMap = {
   readonly [ipcChannels.projectGetState]: undefined;
   readonly [ipcChannels.projectOpen]: undefined;
   readonly [ipcChannels.projectOpenRecent]: { readonly rootPath: string };
+  readonly [ipcChannels.projectClearRecent]: undefined;
   readonly [ipcChannels.projectRefresh]: { readonly projectRoot: string };
   readonly [ipcChannels.projectCreateEntry]: {
     readonly projectRoot: string;
@@ -2249,6 +2837,55 @@ export type IpcRequestMap = {
     readonly path: string;
   };
   readonly [ipcChannels.projectChanged]: ProjectChangeEvent;
+  readonly [ipcChannels.sharedGetConnection]: undefined;
+  readonly [ipcChannels.sharedSignIn]: SharedProjectSignInRequest;
+  readonly [ipcChannels.sharedSignOut]: undefined;
+  readonly [ipcChannels.sharedListSessions]: undefined;
+  readonly [ipcChannels.sharedRevokeSession]: SharedProjectSessionRevokeRequest;
+  readonly [ipcChannels.sharedListProjects]: undefined;
+  readonly [ipcChannels.sharedCreateProject]: SharedProjectCreateRequest;
+  readonly [ipcChannels.sharedCreateFromLocalProject]: SharedProjectCreateFromLocalProjectRequest;
+  readonly [ipcChannels.sharedCreateFromSourceZip]: SharedProjectCreateFromSourceZipRequest;
+  readonly [ipcChannels.sharedUpdateProjectSettings]: SharedProjectSettingsUpdateRequest;
+  readonly [ipcChannels.sharedDeleteProject]: SharedProjectDeleteRequest;
+  readonly [ipcChannels.sharedExportSourceZip]: SharedProjectExportSourceZipRequest;
+  readonly [ipcChannels.sharedOpenProject]: { readonly projectId: string };
+  readonly [ipcChannels.sharedInvite]: SharedProjectInviteRequest;
+  readonly [ipcChannels.sharedAcceptInvitation]: SharedProjectAcceptInvitationRequest;
+  readonly [ipcChannels.sharedListMembers]: { readonly projectId: string };
+  readonly [ipcChannels.sharedUpdateMemberRole]: SharedProjectMemberRoleUpdateRequest;
+  readonly [ipcChannels.sharedTransferOwnership]: SharedProjectOwnershipTransferRequest;
+  readonly [ipcChannels.sharedRemoveMember]: SharedProjectMemberRemoveRequest;
+  readonly [ipcChannels.sharedListPresence]: { readonly projectId: string };
+  readonly [ipcChannels.sharedUpdatePresence]: SharedProjectPresenceUpdateRequest;
+  readonly [ipcChannels.sharedListActivity]: { readonly projectId: string };
+  readonly [ipcChannels.sharedListComments]: { readonly projectId: string };
+  readonly [ipcChannels.sharedCreateComment]: SharedProjectCommentCreateRequest;
+  readonly [ipcChannels.sharedResolveComment]: SharedProjectCommentResolveRequest;
+  readonly [ipcChannels.sharedListAuditEvents]: { readonly projectId: string };
+  readonly [ipcChannels.sharedPublishAgentRun]: SharedProjectAgentRunPublishRequest;
+  readonly [ipcChannels.sharedUpdateAgentRunStatus]: SharedProjectAgentRunStatusUpdateRequest;
+  readonly [ipcChannels.sharedListAgentRuns]: { readonly projectId: string };
+  readonly [ipcChannels.sharedListAgentChangeSets]: { readonly projectId: string };
+  readonly [ipcChannels.sharedApplyAgentChangeSet]: SharedProjectAgentChangeSetStatusRequest;
+  readonly [ipcChannels.sharedRejectAgentChangeSet]: SharedProjectAgentChangeSetStatusRequest;
+  readonly [ipcChannels.sharedListBuildArtifacts]: { readonly projectId: string };
+  readonly [ipcChannels.sharedGetBuildArtifact]: {
+    readonly projectId: string;
+    readonly artifactId: string;
+  };
+  readonly [ipcChannels.sharedPublishBuildArtifact]: SharedProjectBuildArtifactPublishRequest;
+  readonly [ipcChannels.sharedAttachAgentRunBuildArtifact]: SharedProjectAgentRunBuildArtifactAttachRequest;
+  readonly [ipcChannels.sharedGetFileRevision]: SharedProjectFileRevisionLookupRequest;
+  readonly [ipcChannels.sharedListFileRevisions]: SharedProjectFileRevisionLookupRequest;
+  readonly [ipcChannels.sharedGetFileRevisionDetails]: SharedProjectFileRevisionRequest;
+  readonly [ipcChannels.sharedRestoreFileRevision]: SharedProjectFileRevisionRequest;
+  readonly [ipcChannels.sharedSyncDocumentContents]: SharedProjectDocumentSyncRequest;
+  readonly [ipcChannels.sharedApplyDocumentTextOperations]: SharedProjectDocumentTextOperationRequest;
+  readonly [ipcChannels.sharedPullDocumentContents]: SharedProjectDocumentPullRequest;
+  readonly [ipcChannels.sharedStartRealtime]: SharedProjectRealtimeSubscriptionRequest;
+  readonly [ipcChannels.sharedStopRealtime]: SharedProjectRealtimeSubscriptionRequest;
+  readonly [ipcChannels.sharedRealtimeEvent]: SharedProjectRealtimeEvent;
   readonly [ipcChannels.fileRead]: {
     readonly projectRoot: string;
     readonly path: string;
@@ -2279,6 +2916,17 @@ export type IpcRequestMap = {
   };
   readonly [ipcChannels.wordRollbackChangeSet]: {
     readonly changesetId: string;
+  };
+  readonly [ipcChannels.onlyOfficeGetStatus]: undefined;
+  readonly [ipcChannels.onlyOfficeCreateSession]: {
+    readonly projectRoot: string;
+    readonly filePath: string;
+  };
+  readonly [ipcChannels.onlyOfficeForceSave]: {
+    readonly sessionId: string;
+  };
+  readonly [ipcChannels.onlyOfficeExportPdf]: {
+    readonly sessionId: string;
   };
   readonly [ipcChannels.buildDetectToolchain]: undefined;
   readonly [ipcChannels.buildRun]: BuildRunRequest;
@@ -2346,6 +2994,9 @@ export type IpcRequestMap = {
     readonly pdfPath: string;
   };
   readonly [ipcChannels.lifecycleImportSourceZip]: undefined;
+  readonly [ipcChannels.lifecycleCreateForAgent]: {
+    readonly projectName: string;
+  };
   readonly [ipcChannels.lifecycleCreateFromTemplate]: {
     readonly templateId: ProjectTemplateId;
     readonly projectName: string;
@@ -2385,6 +3036,7 @@ export type IpcResponseMap = {
   readonly [ipcChannels.projectGetState]: ProjectState;
   readonly [ipcChannels.projectOpen]: ProjectOpenResult | undefined;
   readonly [ipcChannels.projectOpenRecent]: ProjectOpenResult;
+  readonly [ipcChannels.projectClearRecent]: ProjectState;
   readonly [ipcChannels.projectRefresh]: ProjectOpenResult;
   readonly [ipcChannels.projectCreateEntry]: ProjectOpenResult;
   readonly [ipcChannels.projectRenameEntry]: ProjectOpenResult;
@@ -2392,6 +3044,54 @@ export type IpcResponseMap = {
   readonly [ipcChannels.projectDeleteEntry]: ProjectDeleteResult;
   readonly [ipcChannels.projectSetMainFile]: ProjectOpenResult;
   readonly [ipcChannels.projectChanged]: undefined;
+  readonly [ipcChannels.sharedGetConnection]: SharedProjectConnection;
+  readonly [ipcChannels.sharedSignIn]: SharedProjectConnection;
+  readonly [ipcChannels.sharedSignOut]: SharedProjectConnection;
+  readonly [ipcChannels.sharedListSessions]: readonly SharedProjectSessionSummary[];
+  readonly [ipcChannels.sharedRevokeSession]: SharedProjectSessionRevokeResult;
+  readonly [ipcChannels.sharedListProjects]: readonly SharedProjectSummary[];
+  readonly [ipcChannels.sharedCreateProject]: SharedProjectSummary;
+  readonly [ipcChannels.sharedCreateFromLocalProject]: SharedProjectCreateFromLocalProjectResult;
+  readonly [ipcChannels.sharedCreateFromSourceZip]:
+    | SharedProjectCreateFromLocalProjectResult
+    | undefined;
+  readonly [ipcChannels.sharedUpdateProjectSettings]: SharedProjectSummary;
+  readonly [ipcChannels.sharedDeleteProject]: SharedProjectSummary;
+  readonly [ipcChannels.sharedExportSourceZip]: ExportSourceZipResult | undefined;
+  readonly [ipcChannels.sharedOpenProject]: SharedProjectOpenResult;
+  readonly [ipcChannels.sharedInvite]: SharedProjectInvitationSummary;
+  readonly [ipcChannels.sharedAcceptInvitation]: SharedProjectMemberSummary;
+  readonly [ipcChannels.sharedListMembers]: readonly SharedProjectMemberSummary[];
+  readonly [ipcChannels.sharedUpdateMemberRole]: SharedProjectMemberSummary;
+  readonly [ipcChannels.sharedTransferOwnership]: readonly SharedProjectMemberSummary[];
+  readonly [ipcChannels.sharedRemoveMember]: SharedProjectMemberSummary;
+  readonly [ipcChannels.sharedListPresence]: readonly SharedProjectPresenceSummary[];
+  readonly [ipcChannels.sharedUpdatePresence]: SharedProjectPresenceSummary;
+  readonly [ipcChannels.sharedListActivity]: readonly SharedProjectActivitySummary[];
+  readonly [ipcChannels.sharedListComments]: readonly SharedProjectCommentSummary[];
+  readonly [ipcChannels.sharedCreateComment]: SharedProjectCommentSummary;
+  readonly [ipcChannels.sharedResolveComment]: SharedProjectCommentSummary;
+  readonly [ipcChannels.sharedListAuditEvents]: readonly SharedProjectAuditEventSummary[];
+  readonly [ipcChannels.sharedPublishAgentRun]: SharedProjectAgentRunPublishResult;
+  readonly [ipcChannels.sharedUpdateAgentRunStatus]: SharedProjectAgentRunSummary;
+  readonly [ipcChannels.sharedListAgentRuns]: readonly SharedProjectAgentRunSummary[];
+  readonly [ipcChannels.sharedListAgentChangeSets]: readonly SharedProjectAgentChangeSetSummary[];
+  readonly [ipcChannels.sharedApplyAgentChangeSet]: SharedProjectAppliedAgentChangeSetResult;
+  readonly [ipcChannels.sharedRejectAgentChangeSet]: SharedProjectAgentChangeSetSummary;
+  readonly [ipcChannels.sharedListBuildArtifacts]: readonly SharedProjectBuildArtifactSummary[];
+  readonly [ipcChannels.sharedGetBuildArtifact]: SharedProjectBuildArtifactDetails;
+  readonly [ipcChannels.sharedPublishBuildArtifact]: SharedProjectBuildArtifactSummary;
+  readonly [ipcChannels.sharedAttachAgentRunBuildArtifact]: SharedProjectAgentRunSummary;
+  readonly [ipcChannels.sharedGetFileRevision]: SharedProjectFileRevisionLookupResult;
+  readonly [ipcChannels.sharedListFileRevisions]: readonly SharedProjectFileRevisionSummary[];
+  readonly [ipcChannels.sharedGetFileRevisionDetails]: SharedProjectFileRevisionDetails;
+  readonly [ipcChannels.sharedRestoreFileRevision]: SharedProjectDocumentSyncResult;
+  readonly [ipcChannels.sharedSyncDocumentContents]: SharedProjectDocumentSyncResult;
+  readonly [ipcChannels.sharedApplyDocumentTextOperations]: SharedProjectDocumentSyncResult;
+  readonly [ipcChannels.sharedPullDocumentContents]: SharedProjectDocumentSyncResult;
+  readonly [ipcChannels.sharedStartRealtime]: SharedProjectRealtimeSubscriptionResult;
+  readonly [ipcChannels.sharedStopRealtime]: SharedProjectRealtimeSubscriptionResult;
+  readonly [ipcChannels.sharedRealtimeEvent]: undefined;
   readonly [ipcChannels.fileRead]: ProjectFileSnapshot;
   readonly [ipcChannels.fileWrite]: {
     readonly saved: true;
@@ -2402,6 +3102,10 @@ export type IpcResponseMap = {
   readonly [ipcChannels.wordCreateChangeSet]: WordChangeSet;
   readonly [ipcChannels.wordApplyChangeSet]: WordChangeSetApplyResult;
   readonly [ipcChannels.wordRollbackChangeSet]: WordChangeSetApplyResult;
+  readonly [ipcChannels.onlyOfficeGetStatus]: OnlyOfficeStatus;
+  readonly [ipcChannels.onlyOfficeCreateSession]: OnlyOfficeEditorSession;
+  readonly [ipcChannels.onlyOfficeForceSave]: OnlyOfficeForceSaveResult;
+  readonly [ipcChannels.onlyOfficeExportPdf]: OnlyOfficeExportPdfResult;
   readonly [ipcChannels.buildDetectToolchain]: LatexToolchainStatus;
   readonly [ipcChannels.buildRun]: BuildResult;
   readonly [ipcChannels.buildStop]: { readonly stopped: boolean };
@@ -2429,6 +3133,7 @@ export type IpcResponseMap = {
   readonly [ipcChannels.lifecycleExportSourceZip]: ExportSourceZipResult | undefined;
   readonly [ipcChannels.lifecycleExportPdf]: ExportPdfResult | undefined;
   readonly [ipcChannels.lifecycleImportSourceZip]: ProjectOpenResult | undefined;
+  readonly [ipcChannels.lifecycleCreateForAgent]: ProjectOpenResult | undefined;
   readonly [ipcChannels.lifecycleCreateFromTemplate]: ProjectOpenResult | undefined;
   readonly [ipcChannels.lifecycleCreateFromExternalTemplate]:
     | ProjectOpenResult
@@ -2477,6 +3182,7 @@ export type DesktopApi = {
     readonly getState: () => Promise<ProjectState>;
     readonly open: () => Promise<ProjectOpenResult | undefined>;
     readonly openRecent: (rootPath: string) => Promise<ProjectOpenResult>;
+    readonly clearRecent: () => Promise<ProjectState>;
     readonly refresh: (projectRoot: string) => Promise<ProjectOpenResult>;
     readonly createEntry: (
       request: IpcRequestMap[typeof ipcChannels.projectCreateEntry]
@@ -2494,6 +3200,137 @@ export type DesktopApi = {
       request: IpcRequestMap[typeof ipcChannels.projectSetMainFile]
     ) => Promise<ProjectOpenResult>;
     readonly onChanged: (callback: (event: ProjectChangeEvent) => void) => () => void;
+  };
+  readonly shared: {
+    readonly getConnection: () => Promise<SharedProjectConnection>;
+    readonly signIn: (
+      request: SharedProjectSignInRequest
+    ) => Promise<SharedProjectConnection>;
+    readonly signOut: () => Promise<SharedProjectConnection>;
+    readonly listSessions: () => Promise<readonly SharedProjectSessionSummary[]>;
+    readonly revokeSession: (
+      request: SharedProjectSessionRevokeRequest
+    ) => Promise<SharedProjectSessionRevokeResult>;
+    readonly listProjects: () => Promise<readonly SharedProjectSummary[]>;
+    readonly createProject: (
+      request: SharedProjectCreateRequest
+    ) => Promise<SharedProjectSummary>;
+    readonly createFromLocalProject: (
+      request: SharedProjectCreateFromLocalProjectRequest
+    ) => Promise<SharedProjectCreateFromLocalProjectResult>;
+    readonly createFromSourceZip: (
+      request: SharedProjectCreateFromSourceZipRequest
+    ) => Promise<SharedProjectCreateFromLocalProjectResult | undefined>;
+    readonly updateProjectSettings: (
+      request: SharedProjectSettingsUpdateRequest
+    ) => Promise<SharedProjectSummary>;
+    readonly deleteProject: (
+      request: SharedProjectDeleteRequest
+    ) => Promise<SharedProjectSummary>;
+    readonly exportSourceZip: (
+      request: SharedProjectExportSourceZipRequest
+    ) => Promise<ExportSourceZipResult | undefined>;
+    readonly openProject: (projectId: string) => Promise<SharedProjectOpenResult>;
+    readonly invite: (
+      request: SharedProjectInviteRequest
+    ) => Promise<SharedProjectInvitationSummary>;
+    readonly acceptInvitation: (
+      request: SharedProjectAcceptInvitationRequest
+    ) => Promise<SharedProjectMemberSummary>;
+    readonly listMembers: (
+      projectId: string
+    ) => Promise<readonly SharedProjectMemberSummary[]>;
+    readonly updateMemberRole: (
+      request: SharedProjectMemberRoleUpdateRequest
+    ) => Promise<SharedProjectMemberSummary>;
+    readonly transferOwnership: (
+      request: SharedProjectOwnershipTransferRequest
+    ) => Promise<readonly SharedProjectMemberSummary[]>;
+    readonly removeMember: (
+      request: SharedProjectMemberRemoveRequest
+    ) => Promise<SharedProjectMemberSummary>;
+    readonly listPresence: (
+      projectId: string
+    ) => Promise<readonly SharedProjectPresenceSummary[]>;
+    readonly updatePresence: (
+      request: SharedProjectPresenceUpdateRequest
+    ) => Promise<SharedProjectPresenceSummary>;
+    readonly listActivity: (
+      projectId: string
+    ) => Promise<readonly SharedProjectActivitySummary[]>;
+    readonly listComments: (
+      projectId: string
+    ) => Promise<readonly SharedProjectCommentSummary[]>;
+    readonly createComment: (
+      request: SharedProjectCommentCreateRequest
+    ) => Promise<SharedProjectCommentSummary>;
+    readonly resolveComment: (
+      request: SharedProjectCommentResolveRequest
+    ) => Promise<SharedProjectCommentSummary>;
+    readonly listAuditEvents: (
+      projectId: string
+    ) => Promise<readonly SharedProjectAuditEventSummary[]>;
+    readonly publishAgentRun: (
+      request: SharedProjectAgentRunPublishRequest
+    ) => Promise<SharedProjectAgentRunPublishResult>;
+    readonly updateAgentRunStatus: (
+      request: SharedProjectAgentRunStatusUpdateRequest
+    ) => Promise<SharedProjectAgentRunSummary>;
+    readonly listAgentRuns: (
+      projectId: string
+    ) => Promise<readonly SharedProjectAgentRunSummary[]>;
+    readonly listAgentChangeSets: (
+      projectId: string
+    ) => Promise<readonly SharedProjectAgentChangeSetSummary[]>;
+    readonly applyAgentChangeSet: (
+      request: SharedProjectAgentChangeSetStatusRequest
+    ) => Promise<SharedProjectAppliedAgentChangeSetResult>;
+    readonly rejectAgentChangeSet: (
+      request: SharedProjectAgentChangeSetStatusRequest
+    ) => Promise<SharedProjectAgentChangeSetSummary>;
+    readonly listBuildArtifacts: (
+      projectId: string
+    ) => Promise<readonly SharedProjectBuildArtifactSummary[]>;
+    readonly getBuildArtifact: (
+      projectId: string,
+      artifactId: string
+    ) => Promise<SharedProjectBuildArtifactDetails>;
+    readonly publishBuildArtifact: (
+      request: SharedProjectBuildArtifactPublishRequest
+    ) => Promise<SharedProjectBuildArtifactSummary>;
+    readonly attachAgentRunBuildArtifact: (
+      request: SharedProjectAgentRunBuildArtifactAttachRequest
+    ) => Promise<SharedProjectAgentRunSummary>;
+    readonly getFileRevision: (
+      request: SharedProjectFileRevisionLookupRequest
+    ) => Promise<SharedProjectFileRevisionLookupResult>;
+    readonly listFileRevisions: (
+      request: SharedProjectFileRevisionLookupRequest
+    ) => Promise<readonly SharedProjectFileRevisionSummary[]>;
+    readonly getFileRevisionDetails: (
+      request: SharedProjectFileRevisionRequest
+    ) => Promise<SharedProjectFileRevisionDetails>;
+    readonly restoreFileRevision: (
+      request: SharedProjectFileRevisionRequest
+    ) => Promise<SharedProjectDocumentSyncResult>;
+    readonly syncDocumentContents: (
+      request: SharedProjectDocumentSyncRequest
+    ) => Promise<SharedProjectDocumentSyncResult>;
+    readonly applyDocumentTextOperations: (
+      request: SharedProjectDocumentTextOperationRequest
+    ) => Promise<SharedProjectDocumentSyncResult>;
+    readonly pullDocumentContents: (
+      request: SharedProjectDocumentPullRequest
+    ) => Promise<SharedProjectDocumentSyncResult>;
+    readonly startRealtime: (
+      projectId: string
+    ) => Promise<SharedProjectRealtimeSubscriptionResult>;
+    readonly stopRealtime: (
+      projectId: string
+    ) => Promise<SharedProjectRealtimeSubscriptionResult>;
+    readonly onRealtimeEvent: (
+      callback: (event: SharedProjectRealtimeEvent) => void
+    ) => () => void;
   };
   readonly files: {
     readonly read: (
@@ -2519,6 +3356,18 @@ export type DesktopApi = {
     readonly rollbackChangeSet: (
       request: IpcRequestMap[typeof ipcChannels.wordRollbackChangeSet]
     ) => Promise<WordChangeSetApplyResult>;
+  };
+  readonly onlyOffice: {
+    readonly getStatus: () => Promise<OnlyOfficeStatus>;
+    readonly createSession: (
+      request: IpcRequestMap[typeof ipcChannels.onlyOfficeCreateSession]
+    ) => Promise<OnlyOfficeEditorSession>;
+    readonly forceSave: (
+      request: IpcRequestMap[typeof ipcChannels.onlyOfficeForceSave]
+    ) => Promise<OnlyOfficeForceSaveResult>;
+    readonly exportPdf: (
+      request: IpcRequestMap[typeof ipcChannels.onlyOfficeExportPdf]
+    ) => Promise<OnlyOfficeExportPdfResult>;
   };
   readonly build: {
     readonly detectToolchain: () => Promise<LatexToolchainStatus>;
@@ -2590,6 +3439,9 @@ export type DesktopApi = {
       request: IpcRequestMap[typeof ipcChannels.lifecycleExportPdf]
     ) => Promise<ExportPdfResult | undefined>;
     readonly importSourceZip: () => Promise<ProjectOpenResult | undefined>;
+    readonly createForAgent: (
+      request: IpcRequestMap[typeof ipcChannels.lifecycleCreateForAgent]
+    ) => Promise<ProjectOpenResult | undefined>;
     readonly createFromTemplate: (
       request: IpcRequestMap[typeof ipcChannels.lifecycleCreateFromTemplate]
     ) => Promise<ProjectOpenResult | undefined>;

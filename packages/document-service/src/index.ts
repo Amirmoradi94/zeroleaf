@@ -47,7 +47,9 @@ export async function readWordDocument(
 
   const extraction = await extractDocxParagraphs(absolutePath);
   const paragraphs = splitExtractedParagraphs(extraction.plainText);
-  const blocks = paragraphs.map((text, index) => createParagraphBlock(text, index));
+  const blocks = (paragraphs.length === 0 ? [""] : paragraphs).map((text, index) =>
+    createParagraphBlock(text, index)
+  );
 
   return {
     kind: "word",
@@ -73,7 +75,11 @@ export async function saveWordDocument(
       {
         children:
           documentBlocks.length === 0
-            ? [new Paragraph("")]
+            ? [
+                new Paragraph({
+                  children: [new TextRun(" ")]
+                })
+              ]
             : documentBlocks.map(
                 (block) =>
                   new Paragraph({

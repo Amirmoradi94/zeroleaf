@@ -14,6 +14,7 @@
     { "path": "../../packages/agent-host" },
     { "path": "../../packages/history-service" },
     { "path": "../../packages/latex-service" },
+    { "path": "../../packages/onlyoffice-service" },
     { "path": "../../packages/pdf-service" },
     { "path": "../../packages/project-lifecycle-service" },
     { "path": "../../packages/project-service" },

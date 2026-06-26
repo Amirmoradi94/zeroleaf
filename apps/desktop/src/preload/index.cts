@@ -35,6 +35,7 @@ const api: DesktopApi = {
     getState: () => invoke("project.getState", undefined),
     open: () => invoke("project.open", undefined),
     openRecent: (rootPath) => invoke("project.openRecent", { rootPath }),
+    clearRecent: () => invoke("project.clearRecent", undefined),
     refresh: (projectRoot) => invoke("project.refresh", { projectRoot }),
     createEntry: (request) => invoke("project.createEntry", request),
     renameEntry: (request) => invoke("project.renameEntry", request),
@@ -53,6 +54,68 @@ const api: DesktopApi = {
       return () => ipcRenderer.off("project.changed", listener);
     }
   },
+  shared: {
+    getConnection: () => invoke("shared.getConnection", undefined),
+    signIn: (request) => invoke("shared.signIn", request),
+    signOut: () => invoke("shared.signOut", undefined),
+    listSessions: () => invoke("shared.listSessions", undefined),
+    revokeSession: (request) => invoke("shared.revokeSession", request),
+    listProjects: () => invoke("shared.listProjects", undefined),
+    createProject: (request) => invoke("shared.createProject", request),
+    createFromLocalProject: (request) =>
+      invoke("shared.createFromLocalProject", request),
+    createFromSourceZip: (request) => invoke("shared.createFromSourceZip", request),
+    updateProjectSettings: (request) => invoke("shared.updateProjectSettings", request),
+    deleteProject: (request) => invoke("shared.deleteProject", request),
+    exportSourceZip: (request) => invoke("shared.exportSourceZip", request),
+    openProject: (projectId) => invoke("shared.openProject", { projectId }),
+    invite: (request) => invoke("shared.invite", request),
+    acceptInvitation: (request) => invoke("shared.acceptInvitation", request),
+    listMembers: (projectId) => invoke("shared.listMembers", { projectId }),
+    updateMemberRole: (request) => invoke("shared.updateMemberRole", request),
+    transferOwnership: (request) => invoke("shared.transferOwnership", request),
+    removeMember: (request) => invoke("shared.removeMember", request),
+    listPresence: (projectId) => invoke("shared.listPresence", { projectId }),
+    updatePresence: (request) => invoke("shared.updatePresence", request),
+    listActivity: (projectId) => invoke("shared.listActivity", { projectId }),
+    listComments: (projectId) => invoke("shared.listComments", { projectId }),
+    createComment: (request) => invoke("shared.createComment", request),
+    resolveComment: (request) => invoke("shared.resolveComment", request),
+    listAuditEvents: (projectId) => invoke("shared.listAuditEvents", { projectId }),
+    publishAgentRun: (request) => invoke("shared.publishAgentRun", request),
+    updateAgentRunStatus: (request) => invoke("shared.updateAgentRunStatus", request),
+    listAgentRuns: (projectId) => invoke("shared.listAgentRuns", { projectId }),
+    listAgentChangeSets: (projectId) =>
+      invoke("shared.listAgentChangeSets", { projectId }),
+    applyAgentChangeSet: (request) => invoke("shared.applyAgentChangeSet", request),
+    rejectAgentChangeSet: (request) => invoke("shared.rejectAgentChangeSet", request),
+    listBuildArtifacts: (projectId) =>
+      invoke("shared.listBuildArtifacts", { projectId }),
+    getBuildArtifact: (projectId, artifactId) =>
+      invoke("shared.getBuildArtifact", { projectId, artifactId }),
+    publishBuildArtifact: (request) => invoke("shared.publishBuildArtifact", request),
+    attachAgentRunBuildArtifact: (request) =>
+      invoke("shared.attachAgentRunBuildArtifact", request),
+    getFileRevision: (request) => invoke("shared.getFileRevision", request),
+    listFileRevisions: (request) => invoke("shared.listFileRevisions", request),
+    getFileRevisionDetails: (request) =>
+      invoke("shared.getFileRevisionDetails", request),
+    restoreFileRevision: (request) => invoke("shared.restoreFileRevision", request),
+    syncDocumentContents: (request) => invoke("shared.syncDocumentContents", request),
+    applyDocumentTextOperations: (request) =>
+      invoke("shared.applyDocumentTextOperations", request),
+    pullDocumentContents: (request) => invoke("shared.pullDocumentContents", request),
+    startRealtime: (projectId) => invoke("shared.startRealtime", { projectId }),
+    stopRealtime: (projectId) => invoke("shared.stopRealtime", { projectId }),
+    onRealtimeEvent: (callback) => {
+      const listener = (_event: Electron.IpcRendererEvent, event: unknown) => {
+        callback(event as Parameters<typeof callback>[0]);
+      };
+
+      ipcRenderer.on("shared.realtimeEvent", listener);
+      return () => ipcRenderer.off("shared.realtimeEvent", listener);
+    }
+  },
   files: {
     read: (request) => invoke("file.read", request),
     write: (request) => invoke("file.write", request)
@@ -63,6 +126,12 @@ const api: DesktopApi = {
     createChangeSet: (request) => invoke("word.createChangeSet", request),
     applyChangeSet: (request) => invoke("word.applyChangeSet", request),
     rollbackChangeSet: (request) => invoke("word.rollbackChangeSet", request)
+  },
+  onlyOffice: {
+    getStatus: () => invoke("onlyoffice.getStatus", undefined),
+    createSession: (request) => invoke("onlyoffice.createSession", request),
+    forceSave: (request) => invoke("onlyoffice.forceSave", request),
+    exportPdf: (request) => invoke("onlyoffice.exportPdf", request)
   },
   build: {
     detectToolchain: () => invoke("build.detectToolchain", undefined),
@@ -107,6 +176,7 @@ const api: DesktopApi = {
     exportSourceZip: (request) => invoke("lifecycle.exportSourceZip", request),
     exportPdf: (request) => invoke("lifecycle.exportPdf", request),
     importSourceZip: () => invoke("lifecycle.importSourceZip", undefined),
+    createForAgent: (request) => invoke("lifecycle.createForAgent", request),
     createFromTemplate: (request) => invoke("lifecycle.createFromTemplate", request),
     createFromExternalTemplate: (request) =>
       invoke("lifecycle.createFromExternalTemplate", request),

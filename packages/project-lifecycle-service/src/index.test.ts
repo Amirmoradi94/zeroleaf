@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   checkSubmissionBundle,
+  collectSharedProjectSourceFiles,
   createProjectFromTemplate,
   exportPdf,
   exportSourceZip,
@@ -34,6 +35,7 @@ describe("project-lifecycle-service", () => {
     );
     await writeFile(join(projectPath, "main.aux"), "generated", "utf8");
     await writeFile(join(projectPath, "main.bbl"), "generated bibliography", "utf8");
+    await mkdir(join(projectPath, "assets", "empty"), { recursive: true });
     await mkdir(join(projectPath, ".latex-agent"), { recursive: true });
     await writeFile(join(projectPath, ".latex-agent", "state.json"), "{}", "utf8");
 
@@ -58,6 +60,10 @@ describe("project-lifecycle-service", () => {
     ).resolves.toContain("\\documentclass");
     await expect(stat(join(importResult.projectRoot, "main.aux"))).rejects.toThrow();
     await expect(stat(join(importResult.projectRoot, "main.bbl"))).rejects.toThrow();
+    const emptyDirectoryStats = await stat(
+      join(importResult.projectRoot, "assets", "empty")
+    );
+    expect(emptyDirectoryStats.isDirectory()).toBe(true);
     expect(importResult.fileCount).toBe(1);
   });
 
@@ -94,6 +100,56 @@ describe("project-lifecycle-service", () => {
       stat(join(importResult.projectRoot, "main.bbl"))
     ).resolves.toBeDefined();
     expect(importResult.fileCount).toBe(3);
+  });
+
+  it("collects source files and binary assets for shared project creation", async () => {
+    const projectPath = join(sandboxPath, "shareable-paper");
+    await mkdir(join(projectPath, "sections"), { recursive: true });
+    await mkdir(join(projectPath, "sections", "drafts"), { recursive: true });
+    await mkdir(join(projectPath, "figures"), { recursive: true });
+    await mkdir(join(projectPath, ".latex-agent", "build"), { recursive: true });
+    await writeFile(
+      join(projectPath, "main.tex"),
+      "\\documentclass{article}\\begin{document}Hi\\end{document}\n",
+      "utf8"
+    );
+    await writeFile(join(projectPath, "sections", "intro.tex"), "Intro\n", "utf8");
+    await writeFile(join(projectPath, "main.aux"), "generated", "utf8");
+    await writeFile(
+      join(projectPath, ".latex-agent", "build", "main.log"),
+      "generated",
+      "utf8"
+    );
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2]);
+    await writeFile(join(projectPath, "figures", "plot.png"), pngBytes);
+
+    const result = await collectSharedProjectSourceFiles({
+      projectRoot: projectPath
+    });
+
+    expect(result.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "main.tex" }),
+        expect.objectContaining({ path: "sections/intro.tex" }),
+        expect.objectContaining({
+          path: "figures/plot.png",
+          contents: pngBytes.toString("base64"),
+          contentEncoding: "base64"
+        })
+      ])
+    );
+    expect(result.files.map((file) => file.path)).not.toContain("main.aux");
+    expect(result.files.map((file) => file.path)).not.toContain(
+      ".latex-agent/build/main.log"
+    );
+    expect(result.directories).toEqual(
+      expect.arrayContaining([
+        { path: "figures" },
+        { path: "sections" },
+        { path: "sections/drafts" }
+      ])
+    );
+    expect(result.skippedFilePaths).toEqual([]);
   });
 
   it("creates built-in template projects", async () => {

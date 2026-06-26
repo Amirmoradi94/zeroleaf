@@ -745,8 +745,10 @@ export class CodexCliProvider {
         createMessageEvent(
           sessionId,
           "assistant",
-          codexResponse.message ||
-            `Codex proposed ${wordChangeSets.length} Word edit${wordChangeSets.length === 1 ? "" : "s"}.`
+          request.mode === "autonomous-local"
+            ? `I prepared ${wordChangeSets.length} Word edit${wordChangeSets.length === 1 ? "" : "s"} for ZeroLeaf to apply directly.`
+            : codexResponse.message ||
+                `Codex proposed ${wordChangeSets.length} Word edit${wordChangeSets.length === 1 ? "" : "s"}.`
         )
       );
 
@@ -892,7 +894,7 @@ export class CodexCliProvider {
           [
             finalCodexResponse.message,
             finalCodexResponse.message.trim().length === 0
-              ? "Compile verification finished. Build details are available in the Log panel."
+              ? "I applied the edit and ran compile verification."
               : ""
           ]
             .filter((line) => line.trim().length > 0)
@@ -1820,8 +1822,9 @@ function createCodexPrompt(
     "You are the OpenAI Codex provider inside a local-first LaTeX editor.",
     "Use your own judgment to decide how to complete the user's task.",
     request.mode === "autonomous-local"
-      ? 'You may inspect and modify files directly inside the current project root with Codex CLI tools. Do not write outside the project root. After direct source edits, return action "run-compile" so ZeroLeaf can verify the result.'
+      ? 'You have full project-scoped access through Codex CLI tools: inspect, create, edit, overwrite, move, and delete files inside the current project root. Do not write outside the project root. For project-scoped edit requests, prefer direct file edits over returning review patches. After direct source edits, return action "run-compile" so ZeroLeaf can verify the result.'
       : "You may inspect the project from the current working directory. Do not modify files directly inside Codex CLI; return a ZeroLeaf action so the app can perform project-scoped changes safely.",
+    "If a search command, regex, glob, or shell command fails, retry with a simpler literal search, list files, or read likely source files directly before concluding the task cannot be completed.",
     'Do not run LaTeX compile commands inside Codex CLI. For compile, recompile, build, or PDF generation requests, return action "run-compile" so ZeroLeaf can run its local build tool.',
     "Return only JSON matching the provided schema.",
     "The schema always requires a patches array. Use patches: [] for answers, single-file patches, and non-patch app actions.",
@@ -1857,20 +1860,25 @@ function createCodexPrompt(
     request.mode === "read-only"
       ? 'The current ZeroLeaf mode is read-only, so action must be "answer". You may describe suggested edits in message, but do not return a patch action.'
       : request.mode === "autonomous-local"
-        ? 'The current ZeroLeaf mode is autonomous-local. Prefer direct project-root file edits for safe source changes, then return action "run-compile". If direct editing is not safe, return action "answer" with the reason.'
+        ? 'The current ZeroLeaf mode is autonomous-local. Use direct project-root edits for project-scoped file changes whenever possible, including multi-file edits and new project files. If no edit is needed, return action "answer". If direct editing is impossible, return a concrete ZeroLeaf action rather than stopping at a tool failure.'
         : 'ZeroLeaf will perform returned actions through project-scoped app tools. In "apply-with-review" mode, patches wait for user approval.',
     request.mode === "read-only"
       ? ""
       : 'For edit, change, rewrite, replace, insert, delete, merge, combine, consolidate, reorganize, restructure, fix, repair, compile, recompile, build, PDF generation, compile-error, failing-build, visual PDF review, and diagnostic tasks, return the concrete action whenever safe: "patch" for source edits, "delete-entry" for deleting project files or folders, "move-entry" for moving or renaming files, "set-main-file" for changing the project main TeX file, "capture-pdf-preview" for rendered preview evidence, and "run-compile" for builds. Do not stop at explaining the edit or app action.',
+    "Write message like a person reporting back after doing the task: first person, concrete, concise, and warm. Say what you changed or checked, mention verification when relevant, and avoid generic boilerplate such as build-log directions.",
     "In message, always explain the result in user-facing terms: list the files or sections changed and the purpose of the change. If no source file changed, say why no change was made and do not imply that an edit happened.",
     "Preserve all unrelated text and formatting when returning a patch.",
-    request.activeDocument?.kind === "word"
-      ? 'The active document is a Microsoft Word .docx file represented as extracted paragraphs. Do not return a raw .docx patch. For Word edits, set action "word-edit", patches: [], and populate wordChangesets with filePath, summary, and operations using operation types "replace-block", "insert-block-after", "delete-block", "move-block", or "replace-selection".'
-      : "",
+    formatWordEditInstructions(request),
     "For patches, afterContents must be the complete target file after the edit, not a snippet, diff, abbreviated file, or only the changed section. Never omit unchanged content.",
     "When splitting embedded bibliography entries into a separate .bib file, return one patch for the .bib file and one patch for the TeX file that removes the embedded bibliography block and references the .bib file.",
     snapshot.path === newFileSnapshotPath
       ? 'No active TeX file is open. If the user asks to create a .tex file, return action "patch", choose a clear project-relative targetFilePath ending in .tex, set afterContents to the complete new file contents, and use an empty original file.'
+      : "",
+    snapshot.path === newFileSnapshotPath
+      ? 'If the project root is empty and the user asks to create, start, make, or set up a project, treat the prompt as a project bootstrap request. Return action "patch" with complete file contents for every required project file in patches. Default to a compilable LaTeX project when the requested format is ambiguous. Include a main .tex file, and add supporting .bib, section, style, or README files only when they help satisfy the prompt.'
+      : "",
+    snapshot.path === newFileSnapshotPath
+      ? "For a fresh project bootstrap, do not answer with instructions or ask the user to open a template picker. Decide the project structure from the prompt and return concrete project-relative file patches. Nested file paths are allowed when useful, but never use absolute paths or paths outside the project root."
       : "",
     request.selectedText === undefined
       ? ""
@@ -1894,6 +1902,7 @@ function createCodexPrompt(
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
+    formatActiveWordBlockContext(request),
     "",
     `Active file preview (${snapshot.path}):`,
     request.activeDocument?.kind === "word" ? "```text" : "```tex",
@@ -1929,6 +1938,48 @@ function createActiveDocumentSnapshot(
         : request.activeDocument.contents,
     mtimeMs: Date.now()
   };
+}
+
+function formatWordEditInstructions(request: AgentStartRequest): string {
+  if (request.activeDocument?.kind !== "word") {
+    return "";
+  }
+
+  return [
+    "The active document is a Microsoft Word .docx file represented as paragraph blocks.",
+    'For Word edits, set action "word-edit", targetFilePath to the .docx path, afterContents to "", patches to [], and populate wordChangesets.',
+    request.mode === "autonomous-local"
+      ? "In autonomous-local mode, ZeroLeaf applies returned wordChangesets directly to the .docx and refreshes ONLYOFFICE. In your message, say you prepared the Word edit for ZeroLeaf to apply; do not claim the .docx changed inside Codex CLI."
+      : "",
+    "Do not return a raw .docx patch and do not create or edit .tex files for Word-document requests.",
+    "Each Word operation must target one of the block IDs listed below.",
+    'For operation "replace-block", include type, blockId, afterText, and set afterBlockId, block, startOffset, endOffset, replacementText to null.',
+    'For operation "insert-block-after", include type, afterBlockId, block { id, kind: "paragraph", text }, and set blockId, afterText, startOffset, endOffset, replacementText to null. Use afterBlockId null to insert at the beginning.',
+    'For operation "delete-block", include type, blockId, and set afterText, afterBlockId, block, startOffset, endOffset, replacementText to null.',
+    'For operation "replace-selection", include type, blockId, startOffset, endOffset, replacementText, and set afterText, afterBlockId, block to null.',
+    "Prefer replacing the existing blank or placeholder paragraph for the first substantial Word edit."
+  ].join("\n");
+}
+
+function formatActiveWordBlockContext(request: AgentStartRequest): string {
+  if (request.activeDocument?.kind !== "word") {
+    return "";
+  }
+
+  const blockLines = request.activeDocument.blocks.map((block, index) => {
+    const preview = block.text.length === 0 ? "<blank paragraph>" : block.text;
+    return `${index + 1}. id=${block.id} kind=${block.kind} text=${JSON.stringify(preview)}`;
+  });
+
+  return [
+    "Active Word paragraph blocks:",
+    ...blockLines,
+    request.activeDocument.warnings.length === 0
+      ? ""
+      : `Word extraction warnings: ${request.activeDocument.warnings.join("; ")}`
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
 }
 
 async function readInitialSnapshot({
@@ -2209,12 +2260,13 @@ function createCodexInterruptedRetryPrompt(
 ): string {
   return [
     "You are the OpenAI Codex planner inside ZeroLeaf, a local-first LaTeX editor.",
-    "The previous Codex planner attempt was interrupted before it returned a valid action.",
+    "The previous Codex planner attempt failed before it returned a valid action.",
     "Use this smaller prompt and avoid broad project scans. Return one JSON action only.",
     "Do not modify files or run LaTeX commands inside Codex CLI. ZeroLeaf will run returned app actions.",
     "The schema requires designWorkflow. Return an empty design workflow unless this is a website, UI, code-generation, or design/runtime QA task.",
-    'Use action "patch" for a minimal source edit, "delete-entry" for deleting project files or folders, "move-entry" for file moves, "set-main-file" for changing the main TeX file, "capture-pdf-preview" for rendered preview evidence, "run-compile" for compile requests, or "answer" only when no safe action exists.',
-    `Interrupted attempt: ${formatPlannerFailure(error)}`,
+    'Use action "patch" for a minimal source edit, "word-edit" for Microsoft Word .docx edits, "delete-entry" for deleting project files or folders, "move-entry" for file moves, "set-main-file" for changing the main TeX file, "capture-pdf-preview" for rendered preview evidence, "run-compile" for compile requests, or "answer" only when no safe action exists.',
+    formatWordEditInstructions(request),
+    `Failed attempt: ${formatPlannerFailure(error)}`,
     `User task: ${request.prompt}`,
     formatApprovedNetworkContext(request),
     `Project root: ${request.projectRoot}`,
@@ -2225,9 +2277,10 @@ function createCodexInterruptedRetryPrompt(
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
+    formatActiveWordBlockContext(request),
     "",
     `Focused active file preview (${snapshot.path}):`,
-    "```tex",
+    request.activeDocument?.kind === "word" ? "```text" : "```tex",
     createFocusedSourcePreview(snapshot.contents),
     "```"
   ]
@@ -2240,7 +2293,9 @@ function isRetryableCodexExecError(error: unknown): boolean {
   return (
     message.includes("timed out") ||
     message.includes("terminated by sigterm") ||
-    message.includes("terminated by sigkill")
+    message.includes("terminated by sigkill") ||
+    message.includes("expected agent response schema") ||
+    message.includes("not a json object")
   );
 }
 
@@ -2480,7 +2535,9 @@ function parseCodexAgentResponse(value: unknown): CodexAgentResponse {
     ...(candidate.patches === undefined ? {} : { patches: candidate.patches }),
     ...(candidate.wordChangesets === undefined
       ? {}
-      : { wordChangesets: candidate.wordChangesets }),
+      : {
+          wordChangesets: normalizeCodexAgentWordChangeSets(candidate.wordChangesets)
+        }),
     designWorkflow: candidate.designWorkflow ?? createEmptyDesignWorkflowOutput(),
     message: candidate.message,
     notes: candidate.notes
@@ -2581,6 +2638,7 @@ function isValidWordBlockOperation(value: unknown): value is WordBlockOperation 
     case "insert-block-after":
       return (
         (operation.afterBlockId === undefined ||
+          operation.afterBlockId === null ||
           typeof operation.afterBlockId === "string") &&
         typeof operation.block === "object" &&
         operation.block !== null &&
@@ -2594,6 +2652,7 @@ function isValidWordBlockOperation(value: unknown): value is WordBlockOperation 
       return (
         typeof operation.blockId === "string" &&
         (operation.afterBlockId === undefined ||
+          operation.afterBlockId === null ||
           typeof operation.afterBlockId === "string")
       );
     case "replace-selection":
@@ -2605,6 +2664,57 @@ function isValidWordBlockOperation(value: unknown): value is WordBlockOperation 
       );
     default:
       return false;
+  }
+}
+
+function normalizeCodexAgentWordChangeSets(
+  changesets: readonly CodexAgentWordChangeSet[]
+): readonly CodexAgentWordChangeSet[] {
+  return changesets.map((changeset) => ({
+    ...changeset,
+    operations: changeset.operations.map(normalizeCodexWordBlockOperation)
+  }));
+}
+
+function normalizeCodexWordBlockOperation(
+  operation: WordBlockOperation
+): WordBlockOperation {
+  switch (operation.type) {
+    case "replace-block":
+      return {
+        type: "replace-block",
+        blockId: operation.blockId,
+        afterText: operation.afterText
+      };
+    case "insert-block-after":
+      return {
+        type: "insert-block-after",
+        ...(typeof operation.afterBlockId === "string"
+          ? { afterBlockId: operation.afterBlockId }
+          : {}),
+        block: operation.block
+      };
+    case "delete-block":
+      return {
+        type: "delete-block",
+        blockId: operation.blockId
+      };
+    case "move-block":
+      return {
+        type: "move-block",
+        blockId: operation.blockId,
+        ...(typeof operation.afterBlockId === "string"
+          ? { afterBlockId: operation.afterBlockId }
+          : {})
+      };
+    case "replace-selection":
+      return {
+        type: "replace-selection",
+        blockId: operation.blockId,
+        startOffset: operation.startOffset,
+        endOffset: operation.endOffset,
+        replacementText: operation.replacementText
+      };
   }
 }
 
@@ -2663,11 +2773,11 @@ export const codexOutputSchema = {
                     "replace-selection"
                   ]
                 },
-                blockId: { type: "string" },
-                afterText: { type: "string" },
-                afterBlockId: { type: "string" },
+                blockId: { type: ["string", "null"] },
+                afterText: { type: ["string", "null"] },
+                afterBlockId: { type: ["string", "null"] },
                 block: {
-                  type: "object",
+                  type: ["object", "null"],
                   additionalProperties: false,
                   properties: {
                     id: { type: "string" },
@@ -2676,11 +2786,20 @@ export const codexOutputSchema = {
                   },
                   required: ["id", "kind", "text"]
                 },
-                startOffset: { type: "number" },
-                endOffset: { type: "number" },
-                replacementText: { type: "string" }
+                startOffset: { type: ["number", "null"] },
+                endOffset: { type: ["number", "null"] },
+                replacementText: { type: ["string", "null"] }
               },
-              required: ["type"]
+              required: [
+                "type",
+                "blockId",
+                "afterText",
+                "afterBlockId",
+                "block",
+                "startOffset",
+                "endOffset",
+                "replacementText"
+              ]
             }
           }
         },
@@ -3026,8 +3145,8 @@ function formatCompileActionMessage(
   return [
     actionSummary,
     buildResult.status === "succeeded"
-      ? "Compile finished. Build details are available in the Log panel."
-      : "Compile did not succeed. Build details are available in the Log panel."
+      ? "I ran the compile, and it passed."
+      : `I ran the compile, but it still has ${buildResult.diagnostics.length} diagnostic${buildResult.diagnostics.length === 1 ? "" : "s"}.`
   ]
     .filter((line) => line.trim().length > 0)
     .join("\n\n");

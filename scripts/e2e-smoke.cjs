@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain } = require("electron");
 const fsSync = require("node:fs");
 const fs = require("node:fs/promises");
-const { randomUUID } = require("node:crypto");
+const { createHash, randomUUID } = require("node:crypto");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const zlib = require("node:zlib");
@@ -14,15 +14,44 @@ let projectChangeDebouncer;
 let projectChangedEventCount = 0;
 let nextFileWriteFailurePath;
 let nextSyncTexReverseUnavailable = false;
+let nextSharedProjectNumber = 1;
 const editorProjectStates = new Map();
 let appSettingsState;
 const buildRequests = [];
 const buildResults = [];
 const exportedSourceZips = [];
+const exportedSharedSourceZips = [];
 const exportedPdfs = [];
 const openedExternalPaths = [];
 const agentSessions = new Map();
 const agentStartRecords = [];
+const sharedE2EState = {
+  connection: { connected: false },
+  users: [],
+  sessions: [],
+  projects: [],
+  members: new Map(),
+  invitations: [],
+  presence: [],
+  comments: [],
+  buildArtifacts: [],
+  inspectedBuildArtifactIds: [],
+  documentOperationsByUpdateId: new Map(),
+  agentRuns: [],
+  agentChangeSets: [],
+  activity: [],
+  auditEvents: [],
+  revisions: new Map(),
+  revisionHistory: [],
+  cacheRoot: undefined
+};
+
+function createSharedE2EProjectId() {
+  const projectId = `shared-project-${nextSharedProjectNumber}`;
+  nextSharedProjectNumber += 1;
+  return projectId;
+}
+
 let nextImportZipPath;
 let nextImportDestinationParentPath;
 let nextImportProjectName;
@@ -80,6 +109,44 @@ async function waitForText(win, text, timeoutMs = 60_000) {
   return false;
 }
 
+async function waitForAriaRegionText(
+  win,
+  regionLabel,
+  text,
+  { expected = true, timeoutMs = 10_000 } = {}
+) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const matched = await win.webContents.executeJavaScript(`
+      (() => {
+        const region = document.querySelector(${JSON.stringify(`[aria-label="${regionLabel}"]`)});
+        const haystack = region?.textContent ?? "";
+        return haystack.includes(${JSON.stringify(text)});
+      })()
+    `);
+    if (matched === expected) {
+      return true;
+    }
+    await wait(300);
+  }
+  return false;
+}
+
+async function waitForEditorCollaborator(win, titleIncludes, timeoutMs = 10_000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const found = await win.webContents.executeJavaScript(`
+      [...document.querySelectorAll(".editor-collaborator")]
+        .some((candidate) => candidate.getAttribute("title")?.includes(${JSON.stringify(titleIncludes)}) === true)
+    `);
+    if (found) {
+      return true;
+    }
+    await wait(300);
+  }
+  return false;
+}
+
 async function waitForAnyText(win, candidates, timeoutMs = 60_000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
@@ -113,6 +180,54 @@ async function clickButton(win, text) {
   `);
   if (clicked) {
     await captureStep(win, `click-button-${text}`);
+  }
+  return clicked;
+}
+
+async function clickButtonInAriaRegion(win, regionLabel, text) {
+  const clicked = await win.webContents.executeJavaScript(`
+    (() => {
+      const region = document.querySelector(${JSON.stringify(`[aria-label="${regionLabel}"]`)});
+      const target = [...(region?.querySelectorAll("button") ?? [])]
+        .find((button) => button.innerText.includes(${JSON.stringify(text)}) || (button.getAttribute("aria-label") ?? "").includes(${JSON.stringify(text)}));
+      if (!target) return false;
+      if (target.disabled) return false;
+      target.click();
+      return true;
+    })()
+  `);
+  if (clicked) {
+    await captureStep(win, `click-region-${regionLabel}-${text}`);
+  }
+  return clicked;
+}
+
+async function clickButtonInAriaRegionRow(win, regionLabel, rowText, buttonText) {
+  const clicked = await win.webContents.executeJavaScript(`
+    new Promise((resolve) => {
+      const startedAt = Date.now();
+      const tryClick = () => {
+        const region = document.querySelector(${JSON.stringify(`[aria-label="${regionLabel}"]`)});
+        const row = [...(region?.querySelectorAll(".shared-presence__row") ?? [])]
+          .find((candidate) => candidate.textContent?.includes(${JSON.stringify(rowText)}));
+        const target = [...(row?.querySelectorAll("button") ?? [])]
+          .find((button) => button.innerText.includes(${JSON.stringify(buttonText)}) || (button.getAttribute("aria-label") ?? "").includes(${JSON.stringify(buttonText)}));
+        if (target && !target.disabled) {
+          target.click();
+          resolve(true);
+          return;
+        }
+        if (Date.now() - startedAt >= 5_000) {
+          resolve(false);
+          return;
+        }
+        window.setTimeout(tryClick, 100);
+      };
+      tryClick();
+    })
+  `);
+  if (clicked) {
+    await captureStep(win, `click-region-row-${regionLabel}-${rowText}-${buttonText}`);
   }
   return clicked;
 }
@@ -263,6 +378,25 @@ async function selectFieldValue(win, label, value) {
   return selected;
 }
 
+async function selectByAriaLabel(win, label, value) {
+  const selected = await win.webContents.executeJavaScript(`
+    (() => {
+      const select = document.querySelector(${JSON.stringify(`select[aria-label="${label}"]`)});
+      if (!(select instanceof HTMLSelectElement)) {
+        return false;
+      }
+
+      select.value = ${JSON.stringify(value)};
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()
+  `);
+  if (selected) {
+    await captureStep(win, `select-${label}-${value}`);
+  }
+  return selected;
+}
+
 async function selectAgentPaneValue(win, label, value) {
   const selected = await win.webContents.executeJavaScript(`
     (() => {
@@ -301,6 +435,52 @@ async function setInputValueByLabel(win, label, value) {
   `);
   if (updated) {
     await captureStep(win, `set-input-${label}`);
+  }
+  return updated;
+}
+
+async function setTemplatePickerFieldValue(win, label, value) {
+  const updated = await win.webContents.executeJavaScript(`
+    (() => {
+      const field = [...document.querySelectorAll("label.template-picker__field")]
+        .find((candidate) => candidate.querySelector(".eyebrow")?.textContent?.trim() === ${JSON.stringify(label)});
+      const input = field?.querySelector("input");
+      if (!(input instanceof HTMLInputElement)) {
+        return false;
+      }
+
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      input.focus();
+      valueSetter?.call(input, ${JSON.stringify(value)});
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    })()
+  `);
+  if (updated) {
+    await captureStep(win, `set-template-field-${label}`);
+  }
+  return updated;
+}
+
+async function setTemplatePickerTextareaValue(win, label, value) {
+  const updated = await win.webContents.executeJavaScript(`
+    (() => {
+      const field = [...document.querySelectorAll("label.template-picker__field")]
+        .find((candidate) => candidate.querySelector(".eyebrow")?.textContent?.trim() === ${JSON.stringify(label)});
+      const textarea = field?.querySelector("textarea");
+      if (!(textarea instanceof HTMLTextAreaElement)) {
+        return false;
+      }
+
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      textarea.focus();
+      valueSetter?.call(textarea, ${JSON.stringify(value)});
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    })()
+  `);
+  if (updated) {
+    await captureStep(win, `set-template-textarea-${label}`);
   }
   return updated;
 }
@@ -434,6 +614,55 @@ async function replaceEditorText(win, text, expectedPath) {
   await win.webContents.insertText(text);
   await wait(500);
   await captureStep(win, `replace-editor-${expectedPath ?? "active"}`);
+}
+
+async function replaceEditorTextThroughHook(win, expectedPath, text) {
+  const result = await win.webContents.executeJavaScript(`
+    (() => {
+      const hook = window.__latexAgentE2E;
+      if (hook === undefined || typeof hook.setEditorValue !== "function") {
+        return { ok: false, reason: "missing hook" };
+      }
+      const setResult = hook.setEditorValue(${JSON.stringify(expectedPath)}, ${JSON.stringify(text)});
+      if (!setResult.ok) {
+        return setResult;
+      }
+      const readResult = hook.getEditorValue?.(${JSON.stringify(expectedPath)});
+      return readResult?.ok && readResult.value === ${JSON.stringify(text)}
+        ? { ok: true }
+        : { ok: false, reason: readResult?.reason ?? "value mismatch" };
+    })()
+  `);
+  if (result.ok) {
+    await wait(500);
+    await captureStep(win, `replace-editor-hook-${expectedPath}`);
+  }
+  return result;
+}
+
+async function waitForEditorValue(
+  win,
+  expectedPath,
+  expectedValue,
+  timeoutMs = 10_000
+) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const result = await win.webContents.executeJavaScript(`
+      (() => {
+        const hook = window.__latexAgentE2E;
+        if (hook === undefined || typeof hook.getEditorValue !== "function") {
+          return { ok: false, reason: "missing hook" };
+        }
+        return hook.getEditorValue(${JSON.stringify(expectedPath)});
+      })()
+    `);
+    if (result.ok && result.value === expectedValue) {
+      return true;
+    }
+    await wait(200);
+  }
+  return false;
 }
 
 async function replaceEditorModelText(win, expectedPath, searchText, replacementText) {
@@ -807,6 +1036,202 @@ async function waitForLatestBuildResult(predicate, timeoutMs = 10_000) {
   }
 
   return buildResults.at(-1);
+}
+
+async function waitForSharedBuildArtifact(predicate, timeoutMs = 60_000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const artifact = sharedE2EState.buildArtifacts.at(-1);
+    if (artifact !== undefined && predicate(artifact)) {
+      return artifact;
+    }
+    await wait(200);
+  }
+
+  return sharedE2EState.buildArtifacts.at(-1);
+}
+
+async function waitForSharedAgentRun(predicate, timeoutMs = 20_000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const run = sharedE2EState.agentRuns.find(predicate);
+    if (run !== undefined) {
+      return run;
+    }
+    await wait(100);
+  }
+
+  return sharedE2EState.agentRuns.find(predicate);
+}
+
+async function waitForSharedAgentChangeSet(predicate, timeoutMs = 20_000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const changeset = sharedE2EState.agentChangeSets.find(predicate);
+    if (changeset !== undefined) {
+      return changeset;
+    }
+    await wait(100);
+  }
+
+  return sharedE2EState.agentChangeSets.find(predicate);
+}
+
+async function waitForSharedMember(projectId, predicate, timeoutMs = 10_000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const member = (sharedE2EState.members.get(projectId) ?? []).find(predicate);
+    if (member !== undefined) {
+      return member;
+    }
+    await wait(100);
+  }
+
+  return (sharedE2EState.members.get(projectId) ?? []).find(predicate);
+}
+
+async function waitForSharedMemberRemoval(projectId, predicate, timeoutMs = 10_000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    if (!(sharedE2EState.members.get(projectId) ?? []).some(predicate)) {
+      return true;
+    }
+    await wait(100);
+  }
+
+  return !(sharedE2EState.members.get(projectId) ?? []).some(predicate);
+}
+
+async function waitForSharedRevisionContents(
+  projectId,
+  filePath,
+  contents,
+  timeoutMs = 10_000
+) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const revision = sharedE2EState.revisions.get(`${projectId}:${filePath}`);
+    if (revision?.contents === contents) {
+      return revision;
+    }
+    await wait(100);
+  }
+
+  return sharedE2EState.revisions.get(`${projectId}:${filePath}`);
+}
+
+function createSharedE2ETextOperations(beforeContents, afterContents) {
+  if (beforeContents === afterContents) {
+    return [];
+  }
+
+  let sharedPrefixLength = 0;
+  while (
+    sharedPrefixLength < beforeContents.length &&
+    sharedPrefixLength < afterContents.length &&
+    beforeContents.charCodeAt(sharedPrefixLength) ===
+      afterContents.charCodeAt(sharedPrefixLength)
+  ) {
+    sharedPrefixLength += 1;
+  }
+
+  let beforeSuffixOffset = beforeContents.length;
+  let afterSuffixOffset = afterContents.length;
+  while (
+    beforeSuffixOffset > sharedPrefixLength &&
+    afterSuffixOffset > sharedPrefixLength &&
+    beforeContents.charCodeAt(beforeSuffixOffset - 1) ===
+      afterContents.charCodeAt(afterSuffixOffset - 1)
+  ) {
+    beforeSuffixOffset -= 1;
+    afterSuffixOffset -= 1;
+  }
+
+  return [
+    {
+      rangeOffset: sharedPrefixLength,
+      rangeLength: beforeSuffixOffset - sharedPrefixLength,
+      text: afterContents.slice(sharedPrefixLength, afterSuffixOffset)
+    }
+  ];
+}
+
+async function writeSharedE2ECacheFile(projectId, filePath, contents) {
+  const cachePath = path.join(sharedE2EState.cacheRoot, projectId);
+  const targetPath = path.join(cachePath, filePath);
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, contents, "utf8");
+  return cachePath;
+}
+
+async function updateSharedE2ERevision(projectId, filePath, contents) {
+  const previous = sharedE2EState.revisions.get(`${projectId}:${filePath}`);
+  const revision = {
+    projectId,
+    path: filePath,
+    revisionId: `rev-${randomUUID()}`,
+    actorUserId: sharedE2EState.connection.user?.id ?? "shared-user-owner",
+    contents,
+    mtimeMs: Date.now(),
+    createdAt: new Date().toISOString()
+  };
+  const updateId = `update-${revision.revisionId}`;
+  sharedE2EState.revisions.set(`${projectId}:${filePath}`, revision);
+  sharedE2EState.revisionHistory.push(revision);
+  sharedE2EState.documentOperationsByUpdateId.set(
+    updateId,
+    createSharedE2ETextOperations(previous?.contents ?? "", contents)
+  );
+  await writeSharedE2ECacheFile(projectId, filePath, contents);
+  return { ...revision, updateId };
+}
+
+async function waitForSharedInvitation(predicate, timeoutMs = 10_000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const invitation = sharedE2EState.invitations.at(-1);
+    if (invitation !== undefined && predicate(invitation)) {
+      return invitation;
+    }
+    await wait(100);
+  }
+
+  return sharedE2EState.invitations.at(-1);
+}
+
+async function waitForSharedComment(predicate, timeoutMs = 10_000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const comment = sharedE2EState.comments.find(predicate);
+    if (comment !== undefined) {
+      return comment;
+    }
+    await wait(100);
+  }
+
+  return sharedE2EState.comments.find(predicate);
+}
+
+async function waitForSharedProject(predicate, timeoutMs = 10_000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const project = sharedE2EState.projects.find(predicate);
+    if (project !== undefined) {
+      return project;
+    }
+    await wait(100);
+  }
+
+  return sharedE2EState.projects.find(predicate);
 }
 
 async function startProjectWatcher(win, projectRoot) {
@@ -3343,12 +3768,146 @@ async function registerIpc(projectRoot) {
     path.join(sandboxPath, "history.sqlite")
   );
   appSettingsState = defaultAppSettings;
+  sharedE2EState.cacheRoot = path.join(sandboxPath, "shared-cache");
+
+  const getSharedProject = (projectId) => {
+    const project = sharedE2EState.projects.find(
+      (candidate) => candidate.id === projectId
+    );
+    if (project === undefined) {
+      throw new Error(`Shared project ${projectId} was not found.`);
+    }
+    return project;
+  };
+  const getSharedRevisionKey = (projectId, filePath) => `${projectId}:${filePath}`;
+  const getSharedRevision = (projectId, filePath) => {
+    const revision = sharedE2EState.revisions.get(
+      getSharedRevisionKey(projectId, filePath)
+    );
+    if (revision === undefined) {
+      throw new Error(`Shared file ${filePath} was not found.`);
+    }
+    return revision;
+  };
+  const updateSharedRevision = updateSharedE2ERevision;
+  const applySharedTextOperations = (contents, operations) => {
+    return [...operations]
+      .sort((left, right) => right.rangeOffset - left.rangeOffset)
+      .reduce(
+        (nextContents, operation) =>
+          `${nextContents.slice(0, operation.rangeOffset)}${operation.text}${nextContents.slice(
+            operation.rangeOffset + operation.rangeLength
+          )}`,
+        contents
+      );
+  };
+  const toSharedProjectSummary = (project, role = project.role) => ({
+    id: project.id,
+    name: project.name,
+    ownerUserId: project.ownerUserId,
+    mainFilePath: project.mainFilePath,
+    compiler: project.compiler,
+    role,
+    updatedAt: project.updatedAt
+  });
+  const getSharedUserIdForEmail = (email) => {
+    if (email === "owner@example.test") {
+      return "shared-user-owner";
+    }
+    if (email === "collaborator@example.test") {
+      return "shared-user-collaborator";
+    }
+    return `shared-user-${createHash("sha256").update(email).digest("hex").slice(0, 12)}`;
+  };
+  const getSharedActorUserId = () =>
+    sharedE2EState.connection.user?.id ?? "shared-user-owner";
+  const getSharedProjectMembership = (projectId, userId = getSharedActorUserId()) =>
+    (sharedE2EState.members.get(projectId) ?? []).find(
+      (member) => member.userId === userId
+    );
+  const writeSharedSourceExportFile = async (rootPath, filePath, contents) => {
+    const targetPath = path.join(rootPath, filePath);
+    const relativePath = path.relative(rootPath, targetPath);
+    if (
+      relativePath.length === 0 ||
+      relativePath.startsWith("..") ||
+      path.isAbsolute(relativePath)
+    ) {
+      throw new Error("Shared E2E export contained an unsafe project path.");
+    }
+
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.writeFile(targetPath, contents, "utf8");
+  };
+  const createPromptHash = (prompt) =>
+    createHash("sha256").update(prompt).digest("hex").slice(0, 16);
+  const recordSharedActivity = (projectId, eventType, message) => {
+    const event = {
+      id: `shared-activity-${sharedE2EState.activity.length + 1}`,
+      projectId,
+      actorUserId: getSharedActorUserId(),
+      eventType,
+      message,
+      createdAt: new Date().toISOString()
+    };
+    sharedE2EState.activity.unshift(event);
+    return event;
+  };
+  const recordSharedAuditEvent = (projectId, eventType, message, details = {}) => {
+    const event = {
+      id: `shared-audit-${sharedE2EState.auditEvents.length + 1}`,
+      projectId,
+      actorUserId: getSharedActorUserId(),
+      eventType,
+      message,
+      ...details,
+      createdAt: new Date().toISOString()
+    };
+    sharedE2EState.auditEvents.unshift(event);
+    return event;
+  };
+  const summarizeSharedPatchPreview = (beforeContents, afterContents) => {
+    const beforeLines = beforeContents.split(/\r?\n/).slice(0, 8).join("\n");
+    const afterLines = afterContents.split(/\r?\n/).slice(0, 8).join("\n");
+    return [`--- before`, beforeLines, `--- after`, afterLines].join("\n");
+  };
+  const getSharedAgentRun = (projectId, agentRunId) => {
+    const run = sharedE2EState.agentRuns.find(
+      (candidate) => candidate.projectId === projectId && candidate.id === agentRunId
+    );
+    if (run === undefined) {
+      throw new Error(`Shared agent run ${agentRunId} was not found.`);
+    }
+    return run;
+  };
+  const getSharedAgentChangeSet = (projectId, changesetId) => {
+    const changeset = sharedE2EState.agentChangeSets.find(
+      (candidate) => candidate.projectId === projectId && candidate.id === changesetId
+    );
+    if (changeset === undefined) {
+      throw new Error(`Shared agent changeset ${changesetId} was not found.`);
+    }
+    return changeset;
+  };
 
   ipcMain.handle("app.getInfo", () => ({
     appName: "ZeroLeaf",
     appVersion: "e2e",
     platform: process.platform,
     isPackaged: false
+  }));
+  ipcMain.handle("app.checkForUpdates", () => ({
+    checkedAt: new Date().toISOString(),
+    currentVersion: "e2e",
+    state: "not-configured",
+    message: "E2E smoke does not check for updates."
+  }));
+  ipcMain.handle("app.openUpdateDownload", () => ({ opened: true }));
+  ipcMain.handle("app.installUpdate", () => ({
+    scheduled: true,
+    installerPath: path.join(sandboxPath, "ZeroLeaf-e2e.dmg"),
+    targetAppPath: "/Applications/ZeroLeaf.app",
+    message: "E2E smoke does not install updates."
   }));
   ipcMain.handle("workbench.loadLayout", () => defaultWorkbenchLayout);
   ipcMain.handle("workbench.saveLayout", (_event, layout) => layout);
@@ -3412,6 +3971,978 @@ async function registerIpc(projectRoot) {
   ipcMain.handle("project.setMainFile", (_event, request) =>
     projectService.setProjectMainFile(request.projectRoot, metadata, request.path)
   );
+  ipcMain.handle("shared.getConnection", () => sharedE2EState.connection);
+  ipcMain.handle("shared.signIn", (_event, request) => {
+    const now = new Date().toISOString();
+    const user = {
+      id: getSharedUserIdForEmail(request.email),
+      email: request.email,
+      name: request.name ?? request.email,
+      createdAt: now
+    };
+    sharedE2EState.users = [
+      ...sharedE2EState.users.filter((candidate) => candidate.id !== user.id),
+      user
+    ];
+    sharedE2EState.sessions = [
+      {
+        id: "e2e-current-session",
+        userId: user.id,
+        current: true,
+        accessTokenExpiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+        refreshTokenExpiresAt: new Date(
+          Date.now() + 30 * 24 * 60 * 60_000
+        ).toISOString(),
+        createdAt: now
+      },
+      {
+        id: "e2e-remote-session",
+        userId: user.id,
+        current: false,
+        accessTokenExpiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+        refreshTokenExpiresAt: new Date(
+          Date.now() + 30 * 24 * 60 * 60_000
+        ).toISOString(),
+        createdAt: now
+      }
+    ];
+    sharedE2EState.connection = {
+      connected: true,
+      baseUrl: request.baseUrl,
+      user
+    };
+    return sharedE2EState.connection;
+  });
+  ipcMain.handle("shared.signOut", () => {
+    sharedE2EState.connection = { connected: false };
+    return sharedE2EState.connection;
+  });
+  ipcMain.handle("shared.listSessions", () => sharedE2EState.sessions);
+  ipcMain.handle("shared.revokeSession", (_event, request) => {
+    const beforeCount = sharedE2EState.sessions.length;
+    sharedE2EState.sessions = sharedE2EState.sessions.filter(
+      (session) => session.id !== request.sessionId || session.current
+    );
+    return {
+      sessionId: request.sessionId,
+      revoked: sharedE2EState.sessions.length !== beforeCount
+    };
+  });
+  ipcMain.handle("shared.listProjects", () => {
+    const userId = getSharedActorUserId();
+    return sharedE2EState.projects.flatMap((project) => {
+      const membership = getSharedProjectMembership(project.id, userId);
+      return membership === undefined
+        ? []
+        : [toSharedProjectSummary(project, membership.role)];
+    });
+  });
+  ipcMain.handle("shared.createProject", async (_event, request) => {
+    const now = new Date().toISOString();
+    const user = sharedE2EState.connection.user;
+    const project = {
+      id: createSharedE2EProjectId(),
+      name: request.name,
+      ownerUserId: user?.id ?? "shared-user-owner",
+      mainFilePath: request.files?.some((file) => file.path === "main.tex")
+        ? "main.tex"
+        : request.files?.[0]?.path,
+      compiler: "pdflatex",
+      role: "owner",
+      updatedAt: now
+    };
+    sharedE2EState.projects.push(project);
+    sharedE2EState.members.set(project.id, [
+      {
+        projectId: project.id,
+        userId: project.ownerUserId,
+        email: user?.email ?? "owner@example.test",
+        name: user?.name ?? "Owner",
+        role: "owner",
+        joinedAt: now
+      }
+    ]);
+    sharedE2EState.presence = [
+      ...sharedE2EState.presence.filter(
+        (presence) =>
+          presence.projectId !== project.id ||
+          presence.userId !== "shared-user-remote-cursor"
+      ),
+      {
+        projectId: project.id,
+        userId: "shared-user-remote-cursor",
+        displayName: "E2E Remote Cursor",
+        filePath: project.mainFilePath ?? "main.tex",
+        cursorLine: 1,
+        cursorColumn: 12,
+        updatedAt: now
+      }
+    ];
+    for (const file of request.files ?? []) {
+      await updateSharedRevision(project.id, file.path, file.contents);
+    }
+    return toSharedProjectSummary(project);
+  });
+  ipcMain.handle("shared.createFromLocalProject", async (_event, request) => {
+    const sourceFiles = await lifecycleService.collectSharedProjectSourceFiles({
+      projectRoot: request.projectRoot
+    });
+    if (sourceFiles.files.length === 0) {
+      throw new Error("No shareable source files were found in this local project.");
+    }
+
+    const now = new Date().toISOString();
+    const user = sharedE2EState.connection.user;
+    const project = {
+      id: createSharedE2EProjectId(),
+      name: request.name,
+      ownerUserId: user?.id ?? "shared-user-owner",
+      mainFilePath: sourceFiles.files.some((file) => file.path === "main.tex")
+        ? "main.tex"
+        : (sourceFiles.files.find((file) => file.path.endsWith(".tex"))?.path ??
+          sourceFiles.files[0].path),
+      compiler: "pdflatex",
+      role: "owner",
+      updatedAt: now
+    };
+    sharedE2EState.projects.push(project);
+    sharedE2EState.members.set(project.id, [
+      {
+        projectId: project.id,
+        userId: project.ownerUserId,
+        email: user?.email ?? "owner@example.test",
+        name: user?.name ?? "Owner",
+        role: "owner",
+        joinedAt: now
+      }
+    ]);
+    for (const file of sourceFiles.files) {
+      await updateSharedRevision(project.id, file.path, file.contents);
+    }
+
+    return {
+      project: toSharedProjectSummary(project),
+      importedFileCount: sourceFiles.files.length,
+      importedDirectoryCount: sourceFiles.directories.length,
+      skippedFilePaths: sourceFiles.skippedFilePaths
+    };
+  });
+  ipcMain.handle("shared.createFromSourceZip", async (_event, request) => {
+    if (nextImportZipPath === undefined) {
+      return undefined;
+    }
+
+    const requestedName = request.name?.trim();
+    const tempParentPath = path.join(
+      sandboxPath,
+      `shared-zip-import-${sharedE2EState.projects.length + 1}`
+    );
+    await fs.rm(tempParentPath, { recursive: true, force: true });
+    await fs.mkdir(tempParentPath, { recursive: true });
+
+    try {
+      const imported = await lifecycleService.importProjectZip({
+        zipPath: nextImportZipPath,
+        destinationParentPath: tempParentPath,
+        projectName:
+          requestedName?.length > 0
+            ? requestedName
+            : (nextImportProjectName ??
+              path.basename(nextImportZipPath, path.extname(nextImportZipPath)))
+      });
+      const sourceFiles = await lifecycleService.collectSharedProjectSourceFiles({
+        projectRoot: imported.projectRoot
+      });
+      if (sourceFiles.files.length === 0) {
+        throw new Error("No shareable source files were found in this ZIP archive.");
+      }
+
+      const now = new Date().toISOString();
+      const user = sharedE2EState.connection.user;
+      const project = {
+        id: createSharedE2EProjectId(),
+        name:
+          requestedName?.length > 0
+            ? requestedName
+            : (nextImportProjectName ?? path.basename(imported.projectRoot)),
+        ownerUserId: user?.id ?? "shared-user-owner",
+        mainFilePath: sourceFiles.files.some((file) => file.path === "main.tex")
+          ? "main.tex"
+          : (sourceFiles.files.find((file) => file.path.endsWith(".tex"))?.path ??
+            sourceFiles.files[0].path),
+        compiler: "pdflatex",
+        role: "owner",
+        updatedAt: now
+      };
+      sharedE2EState.projects.push(project);
+      sharedE2EState.members.set(project.id, [
+        {
+          projectId: project.id,
+          userId: project.ownerUserId,
+          email: user?.email ?? "owner@example.test",
+          name: user?.name ?? "Owner",
+          role: "owner",
+          joinedAt: now
+        }
+      ]);
+      for (const file of sourceFiles.files) {
+        await updateSharedRevision(project.id, file.path, file.contents);
+      }
+
+      return {
+        project: toSharedProjectSummary(project),
+        importedFileCount: sourceFiles.files.length,
+        importedDirectoryCount: sourceFiles.directories.length,
+        skippedFilePaths: sourceFiles.skippedFilePaths
+      };
+    } finally {
+      nextImportZipPath = undefined;
+      nextImportProjectName = undefined;
+      await fs.rm(tempParentPath, { recursive: true, force: true });
+    }
+  });
+  ipcMain.handle("shared.exportSourceZip", async (_event, request) => {
+    const membership = getSharedProjectMembership(request.projectId);
+    if (membership?.role !== "owner") {
+      throw new Error("Only owners can export shared projects.");
+    }
+
+    const project = getSharedProject(request.projectId);
+    const tempRoot = path.join(
+      sandboxPath,
+      `shared-source-export-root-${exportedSharedSourceZips.length + 1}`
+    );
+    const destinationPath = path.join(
+      sandboxPath,
+      `shared-source-export-${exportedSharedSourceZips.length + 1}.zip`
+    );
+    await fs.rm(tempRoot, { recursive: true, force: true });
+    await fs.mkdir(tempRoot, { recursive: true });
+
+    try {
+      for (const revision of sharedE2EState.revisions.values()) {
+        if (revision.projectId === request.projectId) {
+          await writeSharedSourceExportFile(tempRoot, revision.path, revision.contents);
+        }
+      }
+      const result = await lifecycleService.exportSourceZip({
+        projectRoot: tempRoot,
+        destinationPath,
+        includeBuildArtifacts: false
+      });
+      const exportResult = {
+        ...result,
+        projectId: project.id,
+        projectName: project.name
+      };
+      exportedSharedSourceZips.push(exportResult);
+      return result;
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+  ipcMain.handle("shared.deleteProject", (_event, request) => {
+    const membership = getSharedProjectMembership(request.projectId);
+    if (membership?.role !== "owner") {
+      throw new Error("Only owners can delete shared projects.");
+    }
+
+    const project = getSharedProject(request.projectId);
+    sharedE2EState.projects = sharedE2EState.projects.filter(
+      (candidate) => candidate.id !== request.projectId
+    );
+    sharedE2EState.members.delete(request.projectId);
+    sharedE2EState.invitations = sharedE2EState.invitations.filter(
+      (invitation) => invitation.projectId !== request.projectId
+    );
+    sharedE2EState.comments = sharedE2EState.comments.filter(
+      (comment) => comment.projectId !== request.projectId
+    );
+    sharedE2EState.presence = sharedE2EState.presence.filter(
+      (presence) => presence.projectId !== request.projectId
+    );
+    sharedE2EState.buildArtifacts = sharedE2EState.buildArtifacts.filter(
+      (artifact) => artifact.projectId !== request.projectId
+    );
+    sharedE2EState.agentRuns = sharedE2EState.agentRuns.filter(
+      (run) => run.projectId !== request.projectId
+    );
+    sharedE2EState.agentChangeSets = sharedE2EState.agentChangeSets.filter(
+      (changeset) => changeset.projectId !== request.projectId
+    );
+    sharedE2EState.activity = sharedE2EState.activity.filter(
+      (event) => event.projectId !== request.projectId
+    );
+    sharedE2EState.auditEvents = sharedE2EState.auditEvents.filter(
+      (event) => event.projectId !== request.projectId
+    );
+    for (const key of [...sharedE2EState.revisions.keys()]) {
+      if (key.startsWith(`${request.projectId}:`)) {
+        sharedE2EState.revisions.delete(key);
+      }
+    }
+    sharedE2EState.revisionHistory = sharedE2EState.revisionHistory.filter(
+      (revision) => revision.projectId !== request.projectId
+    );
+    return toSharedProjectSummary(project, "owner");
+  });
+  ipcMain.handle("shared.openProject", async (_event, request) => {
+    const sharedProject = getSharedProject(request.projectId);
+    const membership = getSharedProjectMembership(request.projectId);
+    if (membership === undefined) {
+      throw new Error("Current user is not a member of this shared project.");
+    }
+    const cachePath = path.join(sharedE2EState.cacheRoot, request.projectId);
+    await fs.rm(cachePath, { recursive: true, force: true });
+    await fs.mkdir(cachePath, { recursive: true });
+    for (const [key, revision] of sharedE2EState.revisions.entries()) {
+      if (key.startsWith(`${request.projectId}:`)) {
+        await writeSharedE2ECacheFile(
+          request.projectId,
+          revision.path,
+          revision.contents
+        );
+      }
+    }
+    if (sharedProject.mainFilePath !== undefined) {
+      await projectService.setProjectMainFile(
+        cachePath,
+        metadata,
+        sharedProject.mainFilePath
+      );
+    }
+    const opened = await projectService.openProject(cachePath, metadata);
+    return {
+      ...opened,
+      sharedProjectId: request.projectId,
+      localCachePath: cachePath,
+      role: membership.role,
+      compiler: sharedProject.compiler
+    };
+  });
+  ipcMain.handle("shared.invite", (_event, request) => {
+    const invitation = {
+      id: `invite-${sharedE2EState.invitations.length + 1}`,
+      projectId: request.projectId,
+      email: request.email,
+      role: request.role,
+      status: "pending"
+    };
+    sharedE2EState.invitations.push(invitation);
+    return invitation;
+  });
+  ipcMain.handle("shared.acceptInvitation", (_event, request) => {
+    const now = new Date().toISOString();
+    const user = sharedE2EState.connection.user;
+    const invitation = sharedE2EState.invitations.find(
+      (candidate) => candidate.id === request.invitationId
+    );
+    if (user === undefined || invitation === undefined) {
+      throw new Error("Invitation is not available.");
+    }
+    if (invitation.email !== user.email) {
+      throw new Error("Invitation does not belong to the signed-in user.");
+    }
+    invitation.status = "accepted";
+    const existingMembers = sharedE2EState.members.get(invitation.projectId) ?? [];
+    sharedE2EState.members.set(invitation.projectId, [
+      ...existingMembers.filter((member) => member.userId !== user.id),
+      {
+        projectId: invitation.projectId,
+        userId: user.id,
+        email: user.email,
+        name: user.name,
+        role: invitation.role,
+        joinedAt: now
+      }
+    ]);
+    return invitation;
+  });
+  ipcMain.handle(
+    "shared.listMembers",
+    (_event, request) => sharedE2EState.members.get(request.projectId) ?? []
+  );
+  ipcMain.handle("shared.updateMemberRole", (_event, request) => {
+    const actorMembership = getSharedProjectMembership(request.projectId);
+    if (actorMembership?.role !== "owner") {
+      throw new Error("Only owners can update shared project member roles.");
+    }
+    const members = sharedE2EState.members.get(request.projectId) ?? [];
+    const member = members.find((candidate) => candidate.userId === request.userId);
+    if (member === undefined) {
+      throw new Error("Shared project member is not available.");
+    }
+    if (member.role === "owner") {
+      throw new Error("Project owner role cannot be changed here.");
+    }
+    const updatedMember = { ...member, role: request.role };
+    sharedE2EState.members.set(
+      request.projectId,
+      members.map((candidate) =>
+        candidate.userId === request.userId ? updatedMember : candidate
+      )
+    );
+    return updatedMember;
+  });
+  ipcMain.handle("shared.removeMember", (_event, request) => {
+    const actorMembership = getSharedProjectMembership(request.projectId);
+    if (actorMembership?.role !== "owner") {
+      throw new Error("Only owners can remove shared project members.");
+    }
+    const members = sharedE2EState.members.get(request.projectId) ?? [];
+    const member = members.find((candidate) => candidate.userId === request.userId);
+    if (member === undefined) {
+      throw new Error("Shared project member is not available.");
+    }
+    if (member.role === "owner") {
+      throw new Error("Project owner cannot be removed.");
+    }
+    sharedE2EState.members.set(
+      request.projectId,
+      members.filter((candidate) => candidate.userId !== request.userId)
+    );
+    sharedE2EState.presence = sharedE2EState.presence.filter(
+      (presence) =>
+        presence.projectId !== request.projectId || presence.userId !== request.userId
+    );
+    return member;
+  });
+  ipcMain.handle("shared.transferOwnership", (_event, request) => {
+    const actorMembership = getSharedProjectMembership(request.projectId);
+    if (actorMembership?.role !== "owner") {
+      throw new Error("Only owners can transfer shared project ownership.");
+    }
+    const members = sharedE2EState.members.get(request.projectId) ?? [];
+    const nextOwner = members.find((candidate) => candidate.userId === request.userId);
+    if (nextOwner === undefined) {
+      throw new Error("Shared project member is not available.");
+    }
+    if (nextOwner.role === "owner") {
+      throw new Error("Project owner cannot transfer ownership to themselves.");
+    }
+    const transferredMembers = members.map((member) =>
+      member.userId === request.userId
+        ? { ...member, role: "owner" }
+        : member.role === "owner"
+          ? { ...member, role: "editor" }
+          : member
+    );
+    sharedE2EState.members.set(request.projectId, transferredMembers);
+    const project = getSharedProject(request.projectId);
+    const transferredProject = {
+      ...project,
+      ownerUserId: request.userId,
+      updatedAt: new Date().toISOString()
+    };
+    sharedE2EState.projects = sharedE2EState.projects.map((candidate) =>
+      candidate.id === request.projectId ? transferredProject : candidate
+    );
+    return transferredMembers;
+  });
+  ipcMain.handle("shared.listPresence", (_event, request) => {
+    const projectId = typeof request === "string" ? request : request.projectId;
+    return sharedE2EState.presence.filter(
+      (presence) => presence.projectId === projectId
+    );
+  });
+  ipcMain.handle("shared.updatePresence", (_event, request) => {
+    const presence = {
+      projectId: request.projectId,
+      userId: sharedE2EState.connection.user?.id ?? "shared-user-owner",
+      displayName: sharedE2EState.connection.user?.name ?? "Owner",
+      filePath: request.filePath,
+      cursorLine: request.cursorLine,
+      cursorColumn: request.cursorColumn,
+      updatedAt: new Date().toISOString()
+    };
+    sharedE2EState.presence = [
+      ...sharedE2EState.presence.filter(
+        (candidate) =>
+          candidate.projectId !== presence.projectId ||
+          candidate.userId !== presence.userId
+      ),
+      presence
+    ];
+    return presence;
+  });
+  ipcMain.handle("shared.listActivity", (_event, request) =>
+    sharedE2EState.activity.filter(
+      (activity) => activity.projectId === request.projectId
+    )
+  );
+  ipcMain.handle("shared.listComments", (_event, request) => {
+    const membership = getSharedProjectMembership(request.projectId);
+    if (membership === undefined) {
+      throw new Error("Current user is not a member of this shared project.");
+    }
+
+    return sharedE2EState.comments
+      .filter((comment) => comment.projectId === request.projectId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  });
+  ipcMain.handle("shared.createComment", (_event, request) => {
+    const membership = getSharedProjectMembership(request.projectId);
+    if (membership === undefined) {
+      throw new Error("Current user is not a member of this shared project.");
+    }
+    if (request.filePath !== undefined) {
+      getSharedRevision(request.projectId, request.filePath);
+    }
+
+    const now = new Date().toISOString();
+    const comment = {
+      id: `shared-comment-${sharedE2EState.comments.length + 1}`,
+      projectId: request.projectId,
+      authorUserId: getSharedActorUserId(),
+      body: String(request.body ?? "").trim(),
+      ...(request.filePath === undefined ? {} : { filePath: request.filePath }),
+      ...(request.line === undefined ? {} : { line: request.line }),
+      resolved: false,
+      createdAt: now,
+      updatedAt: now
+    };
+    if (comment.body.length === 0) {
+      throw new Error("Comment body is required.");
+    }
+
+    sharedE2EState.comments = [comment, ...sharedE2EState.comments];
+    recordSharedActivity(
+      request.projectId,
+      "comment.created",
+      request.filePath === undefined
+        ? "Commented on the project."
+        : `Commented on ${request.filePath}.`
+    );
+    return comment;
+  });
+  ipcMain.handle("shared.resolveComment", (_event, request) => {
+    const membership = getSharedProjectMembership(request.projectId);
+    if (membership === undefined) {
+      throw new Error("Current user is not a member of this shared project.");
+    }
+
+    const comment = sharedE2EState.comments.find(
+      (candidate) =>
+        candidate.projectId === request.projectId && candidate.id === request.commentId
+    );
+    if (comment === undefined) {
+      throw new Error("Project comment was not found.");
+    }
+    if (
+      membership.role === "viewer" &&
+      comment.authorUserId !== getSharedActorUserId()
+    ) {
+      throw new Error(
+        "Only editors, owners, or the comment author can resolve this comment."
+      );
+    }
+
+    const now = new Date().toISOString();
+    const resolvedComment = {
+      ...comment,
+      resolved: true,
+      resolvedByUserId: getSharedActorUserId(),
+      resolvedAt: now,
+      updatedAt: now
+    };
+    sharedE2EState.comments = sharedE2EState.comments.map((candidate) =>
+      candidate.id === comment.id ? resolvedComment : candidate
+    );
+    recordSharedActivity(
+      request.projectId,
+      "comment.resolved",
+      `Resolved comment ${comment.id.slice(0, 8)}.`
+    );
+    return resolvedComment;
+  });
+  ipcMain.handle("shared.listAuditEvents", (_event, request) =>
+    sharedE2EState.auditEvents.filter(
+      (auditEvent) => auditEvent.projectId === request.projectId
+    )
+  );
+  ipcMain.handle("shared.publishAgentRun", (_event, request) => {
+    const now = new Date().toISOString();
+    const existingRun =
+      request.agentRunId === undefined
+        ? undefined
+        : getSharedAgentRun(request.projectId, request.agentRunId);
+    const run = existingRun ?? {
+      id: `shared-agent-run-${sharedE2EState.agentRuns.length + 1}`,
+      projectId: request.projectId,
+      actorUserId: getSharedActorUserId(),
+      providerId: request.providerId,
+      mode: request.mode,
+      promptHash: createPromptHash(request.prompt),
+      status: request.status,
+      changesetIds: [],
+      buildArtifactIds: [],
+      createdAt: now,
+      updatedAt: now
+    };
+    if (existingRun === undefined) {
+      sharedE2EState.agentRuns.unshift(run);
+      recordSharedActivity(request.projectId, "agent.run.started", "Agent run started");
+      recordSharedAuditEvent(
+        request.projectId,
+        "agent.run.started",
+        "Agent run started",
+        { agentRunId: run.id }
+      );
+    }
+
+    const publishedChangeSets = request.changesetIds
+      .filter(
+        (localChangeSetId) =>
+          !sharedE2EState.agentChangeSets.some(
+            (changeset) => changeset.localChangeSetId === localChangeSetId
+          )
+      )
+      .map((localChangeSetId) => {
+        const localChangeSet = historyStore.getChangeSetWithContents(localChangeSetId);
+        const sharedChangeSet = {
+          id: `shared-agent-changeset-${sharedE2EState.agentChangeSets.length + 1}`,
+          projectId: request.projectId,
+          agentRunId: run.id,
+          actorUserId: getSharedActorUserId(),
+          filePath: localChangeSet.filePath,
+          summary: localChangeSet.summary,
+          status: "proposed",
+          createdAt: now,
+          updatedAt: now,
+          patchPreview: summarizeSharedPatchPreview(
+            localChangeSet.beforeContents,
+            localChangeSet.afterContents
+          ),
+          localChangeSetId,
+          beforeContents: localChangeSet.beforeContents,
+          afterContents: localChangeSet.afterContents
+        };
+        sharedE2EState.agentChangeSets.unshift(sharedChangeSet);
+        return sharedChangeSet;
+      });
+
+    run.changesetIds = [
+      ...new Set([
+        ...run.changesetIds,
+        ...publishedChangeSets.map((changeset) => changeset.id)
+      ])
+    ];
+    run.buildArtifactIds = [
+      ...new Set([...(run.buildArtifactIds ?? []), ...(request.buildArtifactIds ?? [])])
+    ];
+    run.status =
+      publishedChangeSets.length > 0 && request.status === "completed"
+        ? "waiting-for-review"
+        : request.status;
+    run.updatedAt = now;
+
+    for (const changeset of publishedChangeSets) {
+      recordSharedActivity(
+        request.projectId,
+        "agent.changeset.proposed",
+        `Agent proposed ${changeset.filePath}`
+      );
+      recordSharedAuditEvent(
+        request.projectId,
+        "agent.changeset.proposed",
+        `Agent proposed ${changeset.filePath}`,
+        { agentRunId: run.id, changesetId: changeset.id }
+      );
+    }
+
+    return {
+      agentRun: run,
+      changesets: publishedChangeSets
+    };
+  });
+  ipcMain.handle("shared.updateAgentRunStatus", (_event, request) => {
+    const run = getSharedAgentRun(request.projectId, request.agentRunId);
+    run.status = request.status;
+    run.updatedAt = new Date().toISOString();
+    recordSharedActivity(
+      request.projectId,
+      "agent.run.updated",
+      `Agent run marked ${request.status}`
+    );
+    recordSharedAuditEvent(
+      request.projectId,
+      "agent.run.updated",
+      `Agent run marked ${request.status}`,
+      { agentRunId: run.id }
+    );
+    return run;
+  });
+  ipcMain.handle("shared.listAgentRuns", (_event, request) =>
+    sharedE2EState.agentRuns.filter((run) => run.projectId === request.projectId)
+  );
+  ipcMain.handle("shared.listAgentChangeSets", (_event, request) =>
+    sharedE2EState.agentChangeSets.filter(
+      (changeset) => changeset.projectId === request.projectId
+    )
+  );
+  ipcMain.handle("shared.applyAgentChangeSet", async (_event, request) => {
+    const changeset = getSharedAgentChangeSet(request.projectId, request.changesetId);
+    if (changeset.status !== "proposed") {
+      throw new Error("Only proposed shared agent changesets can be applied.");
+    }
+    const revision = await updateSharedRevision(
+      request.projectId,
+      changeset.filePath,
+      changeset.afterContents
+    );
+    const now = new Date().toISOString();
+    changeset.status = "applied";
+    changeset.appliedAt = now;
+    changeset.appliedRevisionId = revision.revisionId;
+    changeset.updatedAt = now;
+    const run = getSharedAgentRun(request.projectId, changeset.agentRunId);
+    run.status = "completed";
+    run.updatedAt = now;
+    recordSharedActivity(
+      request.projectId,
+      "agent.changeset.applied",
+      `Applied agent changeset for ${changeset.filePath}`
+    );
+    recordSharedAuditEvent(
+      request.projectId,
+      "agent.changeset.applied",
+      `Applied agent changeset for ${changeset.filePath}`,
+      { agentRunId: run.id, changesetId: changeset.id }
+    );
+    return {
+      changeset,
+      fileRevision: {
+        projectId: revision.projectId,
+        path: revision.path,
+        revisionId: revision.revisionId,
+        contents: revision.contents,
+        mtimeMs: revision.mtimeMs
+      }
+    };
+  });
+  ipcMain.handle("shared.rejectAgentChangeSet", (_event, request) => {
+    const changeset = getSharedAgentChangeSet(request.projectId, request.changesetId);
+    const now = new Date().toISOString();
+    changeset.status = "rejected";
+    changeset.updatedAt = now;
+    recordSharedActivity(
+      request.projectId,
+      "agent.changeset.rejected",
+      `Rejected agent changeset for ${changeset.filePath}`
+    );
+    recordSharedAuditEvent(
+      request.projectId,
+      "agent.changeset.rejected",
+      `Rejected agent changeset for ${changeset.filePath}`,
+      { agentRunId: changeset.agentRunId, changesetId: changeset.id }
+    );
+    return changeset;
+  });
+  ipcMain.handle("shared.listBuildArtifacts", (_event, request) =>
+    sharedE2EState.buildArtifacts
+      .filter((artifact) => artifact.projectId === request.projectId)
+      .slice()
+      .reverse()
+  );
+  ipcMain.handle("shared.getBuildArtifact", (_event, request) => {
+    sharedE2EState.inspectedBuildArtifactIds.push(request.artifactId);
+    return sharedE2EState.buildArtifacts.find(
+      (artifact) =>
+        artifact.projectId === request.projectId && artifact.id === request.artifactId
+    );
+  });
+  ipcMain.handle("shared.listFileRevisions", (_event, request) => {
+    getSharedRevision(request.projectId, request.path);
+    return sharedE2EState.revisionHistory
+      .filter(
+        (revision) =>
+          revision.projectId === request.projectId && revision.path === request.path
+      )
+      .map((revision) => ({
+        id: revision.revisionId,
+        projectId: revision.projectId,
+        path: revision.path,
+        actorUserId: revision.actorUserId,
+        createdAt: revision.createdAt,
+        contentEncoding: "utf8",
+        byteLength: Buffer.byteLength(revision.contents, "utf8")
+      }))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  });
+  ipcMain.handle("shared.getFileRevision", (_event, request) => {
+    const revision = getSharedRevision(request.projectId, request.path);
+    return {
+      projectId: revision.projectId,
+      path: revision.path,
+      revisionId: revision.revisionId
+    };
+  });
+  ipcMain.handle("shared.getFileRevisionDetails", (_event, request) => {
+    const revision = sharedE2EState.revisionHistory.find(
+      (candidate) =>
+        candidate.projectId === request.projectId &&
+        candidate.revisionId === request.revisionId
+    );
+    if (revision === undefined) {
+      throw new Error(`Shared revision ${request.revisionId} was not found.`);
+    }
+    return {
+      id: revision.revisionId,
+      projectId: revision.projectId,
+      path: revision.path,
+      actorUserId: revision.actorUserId,
+      createdAt: revision.createdAt,
+      contentEncoding: "utf8",
+      byteLength: Buffer.byteLength(revision.contents, "utf8"),
+      contents: revision.contents
+    };
+  });
+  ipcMain.handle("shared.restoreFileRevision", async (_event, request) => {
+    const membership = getSharedProjectMembership(request.projectId);
+    if (membership === undefined || membership.role === "viewer") {
+      throw new Error("Shared revision restore requires Editor access.");
+    }
+
+    const sourceRevision = sharedE2EState.revisionHistory.find(
+      (candidate) =>
+        candidate.projectId === request.projectId &&
+        candidate.revisionId === request.revisionId
+    );
+    if (sourceRevision === undefined) {
+      throw new Error(`Shared revision ${request.revisionId} was not found.`);
+    }
+
+    const revision = await updateSharedRevision(
+      request.projectId,
+      sourceRevision.path,
+      sourceRevision.contents
+    );
+    recordSharedActivity(
+      request.projectId,
+      "file.revision.restored",
+      `Restored ${sourceRevision.path} from revision ${request.revisionId.slice(0, 8)}.`
+    );
+    return {
+      projectId: revision.projectId,
+      path: revision.path,
+      contents: revision.contents,
+      revisionId: revision.revisionId,
+      mtimeMs: revision.mtimeMs,
+      lastUpdateId: revision.updateId
+    };
+  });
+  ipcMain.handle("shared.publishBuildArtifact", (_event, request) => {
+    const revision = getSharedRevision(request.projectId, request.mainFilePath);
+    const artifact = {
+      id: `shared-build-${sharedE2EState.buildArtifacts.length + 1}`,
+      projectId: request.projectId,
+      sourceRevisionId: request.sourceRevisionId ?? revision.revisionId,
+      desktopClientId: "e2e-desktop",
+      compiler: request.buildResult.compiler,
+      status: request.buildResult.status,
+      platform: process.platform,
+      diagnosticCount: request.buildResult.diagnostics.length,
+      pdfByteLength: request.buildResult.artifact?.byteLength,
+      rawLog: request.buildResult.rawLog,
+      diagnostics: request.buildResult.diagnostics,
+      createdAt: new Date().toISOString()
+    };
+    sharedE2EState.buildArtifacts.push(artifact);
+    recordSharedActivity(
+      request.projectId,
+      "build-artifact.created",
+      `Compiled ${request.mainFilePath}: ${artifact.status}`
+    );
+    recordSharedAuditEvent(
+      request.projectId,
+      "build-artifact.created",
+      `Compiled ${request.mainFilePath}: ${artifact.status}`,
+      { buildArtifactIds: [artifact.id] }
+    );
+    return artifact;
+  });
+  ipcMain.handle("shared.attachAgentRunBuildArtifact", (_event, request) => {
+    const run = getSharedAgentRun(request.projectId, request.agentRunId);
+    run.buildArtifactIds = [
+      ...new Set([...(run.buildArtifactIds ?? []), request.artifactId])
+    ];
+    run.status = "completed";
+    run.updatedAt = new Date().toISOString();
+    recordSharedActivity(
+      request.projectId,
+      "agent.run.build-attached",
+      `Attached build ${request.artifactId} to agent run`
+    );
+    recordSharedAuditEvent(
+      request.projectId,
+      "agent.run.build-attached",
+      `Attached build ${request.artifactId} to agent run`,
+      { agentRunId: run.id, buildArtifactIds: [request.artifactId] }
+    );
+    return run;
+  });
+  ipcMain.handle("shared.applyDocumentTextOperations", async (_event, request) => {
+    const current = getSharedRevision(request.projectId, request.path);
+    const contents = applySharedTextOperations(current.contents, request.operations);
+    const revision = await updateSharedRevision(
+      request.projectId,
+      request.path,
+      contents
+    );
+    return {
+      projectId: request.projectId,
+      path: request.path,
+      contents: revision.contents,
+      revisionId: revision.revisionId,
+      mtimeMs: revision.mtimeMs,
+      lastUpdateId: revision.updateId,
+      remoteUpdateCount: 0,
+      remoteTextOperations: []
+    };
+  });
+  ipcMain.handle("shared.syncDocumentContents", async (_event, request) => {
+    const revision = await updateSharedRevision(
+      request.projectId,
+      request.path,
+      request.contents
+    );
+    return {
+      projectId: request.projectId,
+      path: request.path,
+      contents: revision.contents,
+      revisionId: revision.revisionId,
+      mtimeMs: revision.mtimeMs,
+      lastUpdateId: revision.updateId,
+      remoteUpdateCount: 0,
+      remoteTextOperations: []
+    };
+  });
+  ipcMain.handle("shared.pullDocumentContents", (_event, request) => {
+    const revision = getSharedRevision(request.projectId, request.path);
+    const updateId = `update-${revision.revisionId}`;
+    const hasRemoteUpdate =
+      request.afterUpdateId !== undefined && request.afterUpdateId !== updateId;
+    return {
+      projectId: request.projectId,
+      path: request.path,
+      contents: revision.contents,
+      revisionId: revision.revisionId,
+      mtimeMs: revision.mtimeMs,
+      lastUpdateId: updateId,
+      remoteUpdateCount: hasRemoteUpdate ? 1 : 0,
+      remoteTextOperations: hasRemoteUpdate
+        ? (sharedE2EState.documentOperationsByUpdateId.get(updateId) ?? [])
+        : []
+    };
+  });
+  ipcMain.handle("shared.startRealtime", (_event, request) => ({
+    projectId: request.projectId,
+    subscribed: true
+  }));
+  ipcMain.handle("shared.stopRealtime", (_event, request) => ({
+    projectId: request.projectId,
+    subscribed: false
+  }));
   ipcMain.handle("file.read", (_event, request) =>
     projectService.readProjectFile(request.projectRoot, request.path)
   );
@@ -3440,6 +4971,7 @@ async function registerIpc(projectRoot) {
   ipcMain.handle("pdf.readArtifact", (_event, request) =>
     pdfService.readPdfArtifact(request.projectRoot, request.pdfPath)
   );
+  ipcMain.handle("pdf.reportPreviewBounds", () => ({ reported: true }));
   ipcMain.handle("synctex.forward", (_event, request) =>
     latexService.runSyncTexForward(request)
   );
@@ -3481,6 +5013,16 @@ async function registerIpc(projectRoot) {
   ipcMain.handle("history.listAuditEvents", (_event, request) =>
     historyStore.listAuditEvents(request.projectRoot)
   );
+  ipcMain.handle("history.listWordChangeSets", () => []);
+  ipcMain.handle("history.createWordChangeSet", (_event, request) => request.changeset);
+  ipcMain.handle("history.markWordChangeSetApplied", (_event, request) => ({
+    ...request.changeset,
+    status: "applied"
+  }));
+  ipcMain.handle("history.rejectWordChangeSet", () => ({
+    applied: false,
+    operations: []
+  }));
   ipcMain.handle("references.analyze", (_event, request) =>
     referenceService.analyzeProjectReferences(request.projectRoot)
   );
@@ -3782,6 +5324,1033 @@ async function registerIpc(projectRoot) {
   ipcMain.handle("agent.cancel", () => ({ cancelled: false }));
 }
 
+async function runSharedProjectDesktopScenario(win) {
+  const sharedProjectName = "e2e-shared-paper";
+  const sharedEmail = "owner@example.test";
+  const collaboratorEmail = "collaborator@example.test";
+  const viewerEmail = "viewer@example.test";
+  const editedSource = [
+    "\\documentclass{article}",
+    "\\begin{document}",
+    "Shared E2E source edited from the desktop renderer.",
+    "\\end{document}",
+    ""
+  ].join("\n");
+  const collaboratorEditedSource = [
+    "\\documentclass{article}",
+    "\\begin{document}",
+    "Shared E2E source edited by the invited collaborator.",
+    "\\end{document}",
+    ""
+  ].join("\n");
+  const remoteRealtimeSource = [
+    "\\documentclass{article}",
+    "\\begin{document}",
+    "Shared E2E source updated remotely without refreshing the project.",
+    "\\end{document}",
+    ""
+  ].join("\n");
+  const importedSharedProjectName = "e2e-shared-zip-paper";
+  const importedSharedMainSource = [
+    "\\documentclass{article}",
+    "\\begin{document}",
+    "Shared ZIP lifecycle source imported through desktop.",
+    "\\input{sections/intro}",
+    "\\end{document}",
+    ""
+  ].join("\n");
+  const importedSharedIntroSource = [
+    "\\section{Imported Section}",
+    "This section should round-trip through shared source export.",
+    ""
+  ].join("\n");
+  const localSharedProjectName = "e2e-local-paper-share";
+  const sharedCommentBody =
+    "Please double-check the repaired ending before submitting this shared draft.";
+
+  if (!(await setTemplatePickerFieldValue(win, "Email", sharedEmail))) {
+    throw new Error("Shared E2E: email field was not editable.");
+  }
+  if (!(await setTemplatePickerFieldValue(win, "Name", "E2E Owner"))) {
+    throw new Error("Shared E2E: name field was not editable.");
+  }
+  if (!(await clickButton(win, "Sign In"))) {
+    throw new Error("Shared E2E: Sign In button was not clickable.");
+  }
+  if (!(await waitForText(win, `Signed in as ${sharedEmail}.`, 10_000))) {
+    throw new Error("Shared E2E: signed-in status did not render.");
+  }
+  if (!(await waitForText(win, "Sessions", 10_000))) {
+    throw new Error("Shared E2E: session management list did not render.");
+  }
+  if (!(await clickButton(win, "Revoke"))) {
+    throw new Error("Shared E2E: remote session revoke button was not clickable.");
+  }
+  if (!(await waitForText(win, "Revoked Session e2e-remo.", 10_000))) {
+    throw new Error("Shared E2E: session revoke status did not render.");
+  }
+
+  if (!(await setTemplatePickerFieldValue(win, "Project name", sharedProjectName))) {
+    throw new Error("Shared E2E: project name field was not editable.");
+  }
+  if (!(await clickButton(win, "Create"))) {
+    throw new Error("Shared E2E: Create button was not clickable.");
+  }
+  if (!(await waitForText(win, `Created ${sharedProjectName}.`, 10_000))) {
+    throw new Error("Shared E2E: created project status did not render.");
+  }
+  if (!(await clickButton(win, sharedProjectName))) {
+    throw new Error("Shared E2E: shared project row was not clickable.");
+  }
+  if (!(await waitForText(win, "Shared project", 20_000))) {
+    throw new Error("Shared E2E: shared project badge did not render.");
+  }
+  if (!(await waitForText(win, "main.tex", 20_000))) {
+    throw new Error("Shared E2E: main.tex was not visible after opening.");
+  }
+  const openSharedTab = await waitForOpenFileTabState(win, "main.tex", {
+    dirty: false
+  });
+  if (!openSharedTab.found) {
+    throw new Error("Shared E2E: main.tex editor tab did not open.");
+  }
+  if (!(await waitForText(win, "E2E Remote Cursor", 10_000))) {
+    throw new Error("Shared E2E: remote collaborator presence did not render.");
+  }
+  if (!(await waitForEditorCollaborator(win, "E2E Remote Cursor · main.tex:1:12"))) {
+    throw new Error("Shared E2E: remote collaborator editor badge did not render.");
+  }
+
+  const editResult = await replaceEditorTextThroughHook(win, "main.tex", editedSource);
+  if (!editResult.ok) {
+    throw new Error(`Shared E2E: editor hook edit failed: ${editResult.reason}`);
+  }
+  if (!(await waitForText(win, "Synced main.tex", 10_000))) {
+    throw new Error("Shared E2E: shared document operation did not sync.");
+  }
+  const savedRevision = sharedE2EState.revisions.get("shared-project-1:main.tex");
+  if (savedRevision?.contents !== editedSource) {
+    throw new Error("Shared E2E: shared text operations did not update server state.");
+  }
+
+  if (!(await clickButton(win, "Compile project"))) {
+    throw new Error("Shared E2E: Compile project button was not clickable.");
+  }
+  const sharedArtifact = await waitForSharedBuildArtifact(
+    (artifact) =>
+      artifact.projectId === "shared-project-1" && artifact.status === "succeeded"
+  );
+  if (sharedArtifact === undefined) {
+    throw new Error("Shared E2E: shared compile artifact was not recorded.");
+  }
+  if (sharedArtifact.sourceRevisionId !== savedRevision.revisionId) {
+    throw new Error(
+      "Shared E2E: compile artifact was not tied to saved source revision."
+    );
+  }
+
+  const brokenSource = [
+    "\\documentclass{article}",
+    "\\begin{document}",
+    "Shared E2E source with an agent-repairable compile error.",
+    ""
+  ].join("\n");
+  const brokenEditResult = await replaceEditorTextThroughHook(
+    win,
+    "main.tex",
+    brokenSource
+  );
+  if (!brokenEditResult.ok) {
+    throw new Error(
+      `Shared E2E: broken-source editor hook edit failed: ${brokenEditResult.reason}`
+    );
+  }
+  const brokenRevision = await waitForSharedRevisionContents(
+    "shared-project-1",
+    "main.tex",
+    brokenSource
+  );
+  if (brokenRevision?.contents !== brokenSource) {
+    throw new Error("Shared E2E: broken source was not saved to server state.");
+  }
+
+  if (!(await clickButton(win, "Compile project"))) {
+    throw new Error(
+      "Shared E2E: Compile project button was not clickable for broken source."
+    );
+  }
+  const failedSharedArtifact = await waitForSharedBuildArtifact(
+    (artifact) =>
+      artifact.projectId === "shared-project-1" &&
+      artifact.status === "failed" &&
+      artifact.sourceRevisionId === brokenRevision.revisionId
+  );
+  if (failedSharedArtifact === undefined) {
+    throw new Error("Shared E2E: failed shared compile artifact was not recorded.");
+  }
+
+  const agentRunCountBefore = sharedE2EState.agentRuns.length;
+  const agentChangeSetCountBefore = sharedE2EState.agentChangeSets.length;
+  const sharedBuildArtifactCountBeforeAgentApproval =
+    sharedE2EState.buildArtifacts.length;
+  if (
+    !(await setAgentPrompt(win, "Fix the compile error and keep the edit minimal."))
+  ) {
+    throw new Error("Shared E2E: Agent prompt was not editable.");
+  }
+  if (!(await clickAgentSendButton(win))) {
+    throw new Error("Shared E2E: Agent Send button was not clickable.");
+  }
+  if (
+    !(await waitForText(
+      win,
+      "Review the proposed patch before applying it to the project.",
+      20_000
+    ))
+  ) {
+    throw new Error("Shared E2E: agent approval request did not render.");
+  }
+  if (!(await waitForText(win, "Created changeset", 20_000))) {
+    throw new Error("Shared E2E: shared agent changeset was not visible.");
+  }
+  const proposedSharedAgentChangeSet = await waitForSharedAgentChangeSet(
+    (changeset) =>
+      sharedE2EState.agentChangeSets.length > agentChangeSetCountBefore &&
+      changeset.projectId === "shared-project-1" &&
+      changeset.filePath === "main.tex" &&
+      changeset.status === "proposed"
+  );
+  if (proposedSharedAgentChangeSet === undefined) {
+    throw new Error("Shared E2E: server did not record the shared agent changeset.");
+  }
+  const sharedAgentRun = await waitForSharedAgentRun(
+    (run) =>
+      sharedE2EState.agentRuns.length > agentRunCountBefore &&
+      run.projectId === "shared-project-1" &&
+      run.changesetIds.includes(proposedSharedAgentChangeSet.id) &&
+      run.status === "waiting-for-review"
+  );
+  if (sharedAgentRun === undefined) {
+    throw new Error("Shared E2E: server did not record the shared agent run.");
+  }
+  if (!proposedSharedAgentChangeSet.patchPreview.includes("\\end{document}")) {
+    throw new Error(
+      "Shared E2E: shared agent changeset did not expose the repaired patch preview."
+    );
+  }
+
+  if (!(await clickButton(win, "Allow"))) {
+    throw new Error("Shared E2E: agent patch approval was not clickable.");
+  }
+  const approvedSharedArtifact = await waitForSharedBuildArtifact(
+    (artifact) =>
+      sharedE2EState.buildArtifacts.length >
+        sharedBuildArtifactCountBeforeAgentApproval &&
+      artifact.projectId === "shared-project-1" &&
+      artifact.status === "succeeded",
+    90_000
+  );
+  if (approvedSharedArtifact === undefined) {
+    throw new Error(
+      "Shared E2E: approved agent patch did not publish a successful shared compile."
+    );
+  }
+  const completedSharedAgentRun = await waitForSharedAgentRun(
+    (run) =>
+      run.id === sharedAgentRun.id &&
+      run.status === "completed" &&
+      run.buildArtifactIds.includes(approvedSharedArtifact.id)
+  );
+  if (completedSharedAgentRun === undefined) {
+    throw new Error(
+      "Shared E2E: approval compile was not attached to the shared agent run."
+    );
+  }
+  if (!(await waitForText(win, "Agent patch applied and verified.", 20_000))) {
+    throw new Error("Shared E2E: agent verification status did not render.");
+  }
+  if (
+    !sharedE2EState.auditEvents.some(
+      (event) =>
+        event.projectId === "shared-project-1" &&
+        event.agentRunId === sharedAgentRun.id &&
+        (event.changesetId === proposedSharedAgentChangeSet.id ||
+          event.buildArtifactIds?.includes(approvedSharedArtifact.id))
+    )
+  ) {
+    throw new Error(
+      "Shared E2E: shared audit events did not connect the agent run evidence."
+    );
+  }
+
+  if (
+    !(await setTemplatePickerTextareaValue(
+      win,
+      "Comment on main.tex",
+      sharedCommentBody
+    ))
+  ) {
+    throw new Error("Shared E2E: shared comment textarea was not editable.");
+  }
+  if (!(await clickButtonInAriaRegion(win, "Shared comments", "Comment"))) {
+    throw new Error("Shared E2E: shared Comment button was not clickable.");
+  }
+  const ownerSharedComment = await waitForSharedComment(
+    (comment) =>
+      comment.projectId === "shared-project-1" &&
+      comment.body === sharedCommentBody &&
+      comment.filePath === "main.tex" &&
+      !comment.resolved,
+    10_000
+  );
+  if (
+    ownerSharedComment === undefined ||
+    !(await waitForAriaRegionText(win, "Shared comments", sharedCommentBody))
+  ) {
+    throw new Error("Shared E2E: owner shared comment was not visible or persisted.");
+  }
+
+  if (
+    !(await setTemplatePickerFieldValue(win, "Collaborator email", collaboratorEmail))
+  ) {
+    throw new Error("Shared E2E: collaborator email field was not editable.");
+  }
+  if (!(await clickButton(win, "Invite"))) {
+    throw new Error("Shared E2E: Invite button was not clickable.");
+  }
+  const sharedInvitation = await waitForSharedInvitation(
+    (invitation) =>
+      invitation.projectId === "shared-project-1" &&
+      invitation.email === collaboratorEmail &&
+      invitation.role === "editor"
+  );
+  if (sharedInvitation === undefined) {
+    throw new Error("Shared E2E: invitation was not recorded by shared IPC.");
+  }
+  if (!(await selectByAriaLabel(win, "Collaborator role", "viewer"))) {
+    throw new Error("Shared E2E: collaborator role selector was not editable.");
+  }
+  if (!(await setTemplatePickerFieldValue(win, "Collaborator email", viewerEmail))) {
+    throw new Error("Shared E2E: viewer email field was not editable.");
+  }
+  if (!(await clickButton(win, "Invite"))) {
+    throw new Error("Shared E2E: Viewer Invite button was not clickable.");
+  }
+  const viewerInvitation = await waitForSharedInvitation(
+    (invitation) =>
+      invitation.projectId === "shared-project-1" &&
+      invitation.email === viewerEmail &&
+      invitation.role === "viewer"
+  );
+  if (viewerInvitation === undefined) {
+    throw new Error("Shared E2E: viewer invitation was not recorded by shared IPC.");
+  }
+
+  if (!(await clickButton(win, "Sign out of shared projects"))) {
+    throw new Error("Shared E2E: active shared sign-out button was not clickable.");
+  }
+  if (!(await waitForText(win, "Signed out of shared projects.", 10_000))) {
+    throw new Error("Shared E2E: sign-out status did not render.");
+  }
+  const ownerSessionsAfterRevoke = sharedE2EState.sessions.length;
+  if (!(await clickButton(win, "Close project"))) {
+    throw new Error(
+      "Shared E2E: Close project button was not clickable before collaborator sign-in."
+    );
+  }
+  if (!(await waitForText(win, "Open Folder", 10_000))) {
+    throw new Error(
+      "Shared E2E: dashboard did not render before collaborator sign-in."
+    );
+  }
+
+  if (!(await setTemplatePickerFieldValue(win, "Email", collaboratorEmail))) {
+    throw new Error("Shared E2E: collaborator email field was not editable.");
+  }
+  if (!(await setTemplatePickerFieldValue(win, "Name", "E2E Collaborator"))) {
+    throw new Error("Shared E2E: collaborator name field was not editable.");
+  }
+  if (!(await clickButton(win, "Sign In"))) {
+    throw new Error("Shared E2E: collaborator Sign In button was not clickable.");
+  }
+  if (!(await waitForText(win, `Signed in as ${collaboratorEmail}.`, 10_000))) {
+    throw new Error("Shared E2E: collaborator sign-in status did not render.");
+  }
+  if (!(await setTemplatePickerFieldValue(win, "Invitation id", sharedInvitation.id))) {
+    throw new Error("Shared E2E: invitation id field was not editable.");
+  }
+  if (!(await clickButton(win, "Accept"))) {
+    throw new Error("Shared E2E: Accept invitation button was not clickable.");
+  }
+  if (!(await waitForText(win, "Invitation accepted.", 10_000))) {
+    throw new Error("Shared E2E: invitation accepted status did not render.");
+  }
+  if (!(await waitForText(win, "Editor ·", 10_000))) {
+    throw new Error(
+      "Shared E2E: accepted collaborator project did not show Editor role."
+    );
+  }
+  if (!(await clickButton(win, sharedProjectName))) {
+    throw new Error("Shared E2E: collaborator shared project row was not clickable.");
+  }
+  if (!(await waitForText(win, "Shared project", 20_000))) {
+    throw new Error("Shared E2E: collaborator shared project badge did not render.");
+  }
+  if (
+    !(await waitForAriaRegionText(win, "Shared comments", sharedCommentBody, {
+      timeoutMs: 20_000
+    }))
+  ) {
+    throw new Error("Shared E2E: collaborator did not see the owner shared comment.");
+  }
+  if (!(await clickButtonInAriaRegion(win, "Shared comments", "Resolve"))) {
+    throw new Error(
+      "Shared E2E: collaborator shared comment Resolve was not clickable."
+    );
+  }
+  if (
+    !(await waitForText(
+      win,
+      `Resolved comment ${ownerSharedComment.id.slice(0, 8)}.`,
+      10_000
+    ))
+  ) {
+    throw new Error("Shared E2E: shared comment resolve status did not render.");
+  }
+  const resolvedSharedComment = sharedE2EState.comments.find(
+    (comment) => comment.id === ownerSharedComment.id
+  );
+  if (
+    resolvedSharedComment?.resolved !== true ||
+    resolvedSharedComment.resolvedByUserId !== "shared-user-collaborator" ||
+    !(await waitForAriaRegionText(win, "Shared comments", "Resolved · main.tex", {
+      timeoutMs: 10_000
+    }))
+  ) {
+    throw new Error("Shared E2E: collaborator did not resolve the shared comment.");
+  }
+  const savedRevisionLabel = savedRevision.revisionId.slice(0, 8);
+  if (
+    !(await waitForAriaRegionText(win, "Shared file revisions", savedRevisionLabel, {
+      timeoutMs: 20_000
+    }))
+  ) {
+    throw new Error("Shared E2E: collaborator did not see earlier file revisions.");
+  }
+  if (
+    !(await clickButtonInAriaRegionRow(
+      win,
+      "Shared file revisions",
+      savedRevisionLabel,
+      "Inspect"
+    ))
+  ) {
+    throw new Error("Shared E2E: shared file revision Inspect was not clickable.");
+  }
+  if (
+    !(await waitForText(win, "Shared E2E source edited from the desktop renderer."))
+  ) {
+    throw new Error("Shared E2E: shared file revision preview did not render.");
+  }
+  if (
+    !(await clickButtonInAriaRegionRow(
+      win,
+      "Shared file revisions",
+      savedRevisionLabel,
+      "Restore"
+    ))
+  ) {
+    throw new Error("Shared E2E: shared file revision Restore was not clickable.");
+  }
+  const restoredSharedRevision = await waitForSharedRevisionContents(
+    "shared-project-1",
+    "main.tex",
+    editedSource,
+    20_000
+  );
+  if (
+    restoredSharedRevision?.contents !== editedSource ||
+    restoredSharedRevision.revisionId === savedRevision.revisionId ||
+    !(await waitForEditorValue(win, "main.tex", editedSource, 20_000))
+  ) {
+    throw new Error("Shared E2E: shared file revision restore did not apply.");
+  }
+  if (
+    !(await waitForAriaRegionText(win, "Shared activity", "file.revision.restored")) ||
+    !(await waitForAriaRegionText(win, "Shared activity", "comment.resolved"))
+  ) {
+    throw new Error(
+      "Shared E2E: shared activity did not show comment and revision restore events."
+    );
+  }
+  if (!(await waitForText(win, "Agent runs", 20_000))) {
+    throw new Error("Shared E2E: collaborator did not see shared agent runs.");
+  }
+  if (!(await waitForText(win, "Completed · mock", 20_000))) {
+    throw new Error("Shared E2E: collaborator did not see the completed agent run.");
+  }
+  if (!(await waitForText(win, "1 changeset · 1 compile result", 20_000))) {
+    throw new Error(
+      "Shared E2E: collaborator did not see the agent run evidence counts."
+    );
+  }
+  if (!(await waitForText(win, "Agent changesets", 20_000))) {
+    throw new Error("Shared E2E: collaborator did not see shared agent changesets.");
+  }
+  if (!(await waitForText(win, "main.tex · Applied", 20_000))) {
+    throw new Error("Shared E2E: collaborator did not see the applied changeset.");
+  }
+  if (!(await waitForText(win, "\\end{document}", 20_000))) {
+    throw new Error("Shared E2E: collaborator did not see the patch preview.");
+  }
+  if (!(await waitForText(win, "Agent audit", 20_000))) {
+    throw new Error("Shared E2E: collaborator did not see shared agent audit.");
+  }
+  if (!(await waitForText(win, "Agent changeset applied", 20_000))) {
+    throw new Error(
+      "Shared E2E: collaborator did not see the applied changeset audit event."
+    );
+  }
+  if (!(await waitForText(win, "agent.run.build-attached", 20_000))) {
+    throw new Error(
+      "Shared E2E: collaborator did not see the agent compile audit event."
+    );
+  }
+  if (!(await clickButtonInAriaRegion(win, "Shared agent runs", "Show changeset"))) {
+    throw new Error(
+      "Shared E2E: collaborator shared agent run changeset link was not clickable."
+    );
+  }
+  if (!(await clickButtonInAriaRegion(win, "Shared agent runs", "Inspect compile"))) {
+    throw new Error(
+      "Shared E2E: collaborator shared agent run compile link was not clickable."
+    );
+  }
+  if (!(await waitForText(win, "Opened shared succeeded pdflatex compile", 10_000))) {
+    throw new Error("Shared E2E: collaborator agent compile inspection did not open.");
+  }
+  if (!sharedE2EState.inspectedBuildArtifactIds.includes(approvedSharedArtifact.id)) {
+    throw new Error(
+      "Shared E2E: collaborator did not inspect the agent compile artifact."
+    );
+  }
+  if (!(await clickButtonInAriaRegion(win, "Shared agent audit", "Show changeset"))) {
+    throw new Error(
+      "Shared E2E: collaborator shared audit changeset link was not clickable."
+    );
+  }
+  await replaceEditorText(win, collaboratorEditedSource, "main.tex");
+  const collaboratorRevision = await waitForSharedRevisionContents(
+    "shared-project-1",
+    "main.tex",
+    collaboratorEditedSource
+  );
+  if (collaboratorRevision?.contents !== collaboratorEditedSource) {
+    throw new Error(
+      "Shared E2E: invited collaborator edit did not update server state."
+    );
+  }
+  const collaboratorBuildArtifactCountBefore = sharedE2EState.buildArtifacts.length;
+  if (!(await clickButton(win, "Compile project"))) {
+    throw new Error(
+      "Shared E2E: collaborator Compile project button was not clickable."
+    );
+  }
+  const collaboratorArtifact = await waitForSharedBuildArtifact(
+    (artifact) =>
+      sharedE2EState.buildArtifacts.length > collaboratorBuildArtifactCountBefore &&
+      artifact.projectId === "shared-project-1" &&
+      artifact.status === "succeeded" &&
+      artifact.sourceRevisionId === collaboratorRevision.revisionId
+  );
+  if (collaboratorArtifact === undefined) {
+    throw new Error(
+      "Shared E2E: invited collaborator compile artifact was not recorded."
+    );
+  }
+  if (!(await clickButton(win, "Sign out of shared projects"))) {
+    throw new Error("Shared E2E: collaborator sign-out button was not clickable.");
+  }
+  if (!(await waitForText(win, "Signed out of shared projects.", 10_000))) {
+    throw new Error("Shared E2E: collaborator sign-out status did not render.");
+  }
+  if (!(await clickButton(win, "Close project"))) {
+    throw new Error(
+      "Shared E2E: Close project button was not clickable before viewer sign-in."
+    );
+  }
+  if (!(await waitForText(win, "Open Folder", 10_000))) {
+    throw new Error("Shared E2E: dashboard did not render before viewer sign-in.");
+  }
+
+  if (!(await setTemplatePickerFieldValue(win, "Email", viewerEmail))) {
+    throw new Error("Shared E2E: viewer sign-in email field was not editable.");
+  }
+  if (!(await setTemplatePickerFieldValue(win, "Name", "E2E Viewer"))) {
+    throw new Error("Shared E2E: viewer sign-in name field was not editable.");
+  }
+  if (!(await clickButton(win, "Sign In"))) {
+    throw new Error("Shared E2E: viewer Sign In button was not clickable.");
+  }
+  if (!(await waitForText(win, `Signed in as ${viewerEmail}.`, 10_000))) {
+    throw new Error("Shared E2E: viewer sign-in status did not render.");
+  }
+  if (!(await setTemplatePickerFieldValue(win, "Invitation id", viewerInvitation.id))) {
+    throw new Error("Shared E2E: viewer invitation id field was not editable.");
+  }
+  if (!(await clickButton(win, "Accept"))) {
+    throw new Error("Shared E2E: viewer Accept invitation button was not clickable.");
+  }
+  if (!(await waitForText(win, "Invitation accepted.", 10_000))) {
+    throw new Error("Shared E2E: viewer invitation accepted status did not render.");
+  }
+  if (!(await waitForText(win, "Viewer ·", 10_000))) {
+    throw new Error("Shared E2E: accepted viewer project did not show Viewer role.");
+  }
+  if (!(await clickButton(win, sharedProjectName))) {
+    throw new Error("Shared E2E: viewer shared project row was not clickable.");
+  }
+  if (
+    !(await waitForText(
+      win,
+      "Read-only shared project. Local compile remains available.",
+      20_000
+    ))
+  ) {
+    throw new Error("Shared E2E: viewer read-only shared status did not render.");
+  }
+  const remoteRealtimeRevision = await updateSharedE2ERevision(
+    "shared-project-1",
+    "main.tex",
+    remoteRealtimeSource
+  );
+  win.webContents.send("shared.realtimeEvent", {
+    type: "document.updated",
+    projectId: "shared-project-1",
+    path: "main.tex",
+    updateId: remoteRealtimeRevision.updateId,
+    revisionId: remoteRealtimeRevision.revisionId
+  });
+  if (!(await waitForEditorValue(win, "main.tex", remoteRealtimeSource, 10_000))) {
+    throw new Error(
+      "Shared E2E: remote realtime document update did not reach the open editor."
+    );
+  }
+  if (
+    !(await waitForText(
+      win,
+      `source ${collaboratorRevision.revisionId.slice(0, 8)}`,
+      10_000
+    ))
+  ) {
+    throw new Error(
+      "Shared E2E: viewer did not see the collaborator compile source revision."
+    );
+  }
+  if (!(await clickButtonInAriaRegion(win, "Shared compile history", "Inspect"))) {
+    throw new Error(
+      "Shared E2E: viewer shared compile Inspect button was not clickable."
+    );
+  }
+  if (!(await waitForText(win, "Opened shared succeeded pdflatex compile", 10_000))) {
+    throw new Error("Shared E2E: viewer shared compile inspection did not open.");
+  }
+  if (!sharedE2EState.inspectedBuildArtifactIds.includes(collaboratorArtifact.id)) {
+    throw new Error(
+      "Shared E2E: viewer did not inspect the collaborator compile artifact."
+    );
+  }
+  const viewerAttemptedSource = [
+    "\\documentclass{article}",
+    "\\begin{document}",
+    "Shared E2E source should not be saved by a viewer.",
+    "\\end{document}",
+    ""
+  ].join("\n");
+  await replaceEditorText(win, viewerAttemptedSource, "main.tex");
+  await wait(1_000);
+  if (await clickButton(win, "Save file")) {
+    throw new Error("Shared E2E: viewer Save file button was unexpectedly clickable.");
+  }
+  const afterViewerAttemptRevision = sharedE2EState.revisions.get(
+    "shared-project-1:main.tex"
+  );
+  if (afterViewerAttemptRevision?.contents !== remoteRealtimeSource) {
+    throw new Error("Shared E2E: viewer edit unexpectedly updated server state.");
+  }
+
+  if (!(await clickButton(win, "Sign out of shared projects"))) {
+    throw new Error("Shared E2E: viewer sign-out button was not clickable.");
+  }
+  if (!(await waitForText(win, "Signed out of shared projects.", 10_000))) {
+    throw new Error("Shared E2E: viewer sign-out status did not render.");
+  }
+  if (!(await clickButton(win, "Close project"))) {
+    throw new Error(
+      "Shared E2E: Close project button was not clickable before owner member management."
+    );
+  }
+  if (!(await waitForText(win, "Open Folder", 10_000))) {
+    throw new Error(
+      "Shared E2E: dashboard did not render before owner member management."
+    );
+  }
+
+  if (!(await setTemplatePickerFieldValue(win, "Email", sharedEmail))) {
+    throw new Error("Shared E2E: owner re-sign-in email field was not editable.");
+  }
+  if (!(await setTemplatePickerFieldValue(win, "Name", "E2E Owner"))) {
+    throw new Error("Shared E2E: owner re-sign-in name field was not editable.");
+  }
+  if (!(await clickButton(win, "Sign In"))) {
+    throw new Error("Shared E2E: owner re-sign-in button was not clickable.");
+  }
+  if (!(await waitForText(win, `Signed in as ${sharedEmail}.`, 10_000))) {
+    throw new Error("Shared E2E: owner re-sign-in status did not render.");
+  }
+  if (!(await waitForText(win, "Owner ·", 10_000))) {
+    throw new Error("Shared E2E: owner project row did not show Owner role.");
+  }
+  if (!(await clickButton(win, sharedProjectName))) {
+    throw new Error(
+      "Shared E2E: owner shared project row was not clickable for member management."
+    );
+  }
+  if (!(await waitForText(win, "Members", 20_000))) {
+    throw new Error("Shared E2E: owner shared members region did not render.");
+  }
+  if (
+    !(await waitForText(win, "E2E Collaborator", 20_000)) ||
+    !(await waitForText(win, "E2E Viewer", 20_000))
+  ) {
+    throw new Error("Shared E2E: owner did not see accepted shared members.");
+  }
+  if (!(await selectByAriaLabel(win, `Role for ${collaboratorEmail}`, "viewer"))) {
+    throw new Error("Shared E2E: collaborator member role selector was not editable.");
+  }
+  const collaboratorViewerMember = await waitForSharedMember(
+    "shared-project-1",
+    (member) => member.email === collaboratorEmail && member.role === "viewer"
+  );
+  if (collaboratorViewerMember?.role !== "viewer") {
+    throw new Error("Shared E2E: collaborator role was not updated to viewer.");
+  }
+  if (!(await selectByAriaLabel(win, `Role for ${collaboratorEmail}`, "editor"))) {
+    throw new Error(
+      "Shared E2E: collaborator member role selector was not editable for restoring editor."
+    );
+  }
+  const collaboratorEditorMember = await waitForSharedMember(
+    "shared-project-1",
+    (member) => member.email === collaboratorEmail && member.role === "editor"
+  );
+  if (collaboratorEditorMember?.role !== "editor") {
+    throw new Error("Shared E2E: collaborator role was not restored to editor.");
+  }
+  if (
+    !(await clickButtonInAriaRegionRow(win, "Shared members", "E2E Viewer", "Remove"))
+  ) {
+    throw new Error("Shared E2E: viewer member Remove button was not clickable.");
+  }
+  if (
+    !(await waitForSharedMemberRemoval(
+      "shared-project-1",
+      (member) => member.email === viewerEmail
+    ))
+  ) {
+    throw new Error("Shared E2E: viewer member was not removed from server state.");
+  }
+
+  if (!(await clickButton(win, "Close project"))) {
+    throw new Error(
+      "Shared E2E: Close project button was not clickable before shared ZIP lifecycle."
+    );
+  }
+  if (!(await waitForText(win, "Open Folder", 10_000))) {
+    throw new Error("Shared E2E: dashboard did not render before shared ZIP import.");
+  }
+
+  const sharedImportZipPath = path.join(sandboxPath, "shared-source-import.zip");
+  await fs.writeFile(
+    sharedImportZipPath,
+    createTestZipArchive([
+      {
+        path: "main.tex",
+        data: Buffer.from(importedSharedMainSource, "utf8")
+      },
+      {
+        path: "sections/intro.tex",
+        data: Buffer.from(importedSharedIntroSource, "utf8")
+      },
+      {
+        path: "main.aux",
+        data: Buffer.from("generated artifact should not be shared\n", "utf8")
+      }
+    ])
+  );
+  if (
+    !(await setTemplatePickerFieldValue(win, "Project name", importedSharedProjectName))
+  ) {
+    throw new Error("Shared E2E: shared ZIP import project name was not editable.");
+  }
+  nextImportZipPath = sharedImportZipPath;
+  nextImportProjectName = importedSharedProjectName;
+  if (!(await clickButton(win, "Import ZIP"))) {
+    throw new Error("Shared E2E: shared Import ZIP button was not clickable.");
+  }
+  if (
+    !(await waitForText(
+      win,
+      `Imported 2 files into ${importedSharedProjectName}.`,
+      20_000
+    ))
+  ) {
+    throw new Error("Shared E2E: shared ZIP import status did not render.");
+  }
+  const importedSharedProject = sharedE2EState.projects.find(
+    (project) => project.name === importedSharedProjectName
+  );
+  if (importedSharedProject === undefined) {
+    throw new Error("Shared E2E: imported shared project was not created.");
+  }
+  const importedMainRevision = sharedE2EState.revisions.get(
+    `${importedSharedProject.id}:main.tex`
+  );
+  const importedIntroRevision = sharedE2EState.revisions.get(
+    `${importedSharedProject.id}:sections/intro.tex`
+  );
+  if (
+    importedMainRevision?.contents !== importedSharedMainSource ||
+    importedIntroRevision?.contents !== importedSharedIntroSource ||
+    sharedE2EState.revisions.has(`${importedSharedProject.id}:main.aux`)
+  ) {
+    throw new Error(
+      "Shared E2E: imported shared ZIP files did not match the shareable source set."
+    );
+  }
+  if (!(await clickButton(win, importedSharedProjectName))) {
+    throw new Error("Shared E2E: imported shared project row was not clickable.");
+  }
+  if (!(await waitForEditorValue(win, "main.tex", importedSharedMainSource, 20_000))) {
+    throw new Error("Shared E2E: imported shared project did not open main.tex.");
+  }
+  if (!(await clickButton(win, "Close project"))) {
+    throw new Error(
+      "Shared E2E: Close project button was not clickable after shared ZIP open."
+    );
+  }
+  if (!(await waitForText(win, "Open Folder", 10_000))) {
+    throw new Error("Shared E2E: dashboard did not render before shared ZIP export.");
+  }
+
+  const sharedExportCountBefore = exportedSharedSourceZips.length;
+  if (
+    !(await clickButton(
+      win,
+      `Export shared source ZIP for ${importedSharedProjectName}`
+    ))
+  ) {
+    throw new Error("Shared E2E: shared Export source ZIP button was not clickable.");
+  }
+  if (!(await waitForText(win, "Exported 2 shared source files.", 20_000))) {
+    throw new Error("Shared E2E: shared source ZIP export status did not render.");
+  }
+  const sharedSourceExport = exportedSharedSourceZips.at(-1);
+  if (
+    sharedSourceExport === undefined ||
+    exportedSharedSourceZips.length !== sharedExportCountBefore + 1
+  ) {
+    throw new Error("Shared E2E: shared source export did not produce an archive.");
+  }
+  const lifecycleService =
+    await import("../packages/project-lifecycle-service/dist/index.js");
+  const sharedExportImportParentPath = path.join(sandboxPath, "shared-export-imports");
+  await fs.mkdir(sharedExportImportParentPath, { recursive: true });
+  const importedSharedExport = await lifecycleService.importProjectZip({
+    zipPath: sharedSourceExport.archivePath,
+    destinationParentPath: sharedExportImportParentPath,
+    projectName: "shared-export-roundtrip"
+  });
+  const exportedSharedMain = await fs.readFile(
+    path.join(importedSharedExport.projectRoot, "main.tex"),
+    "utf8"
+  );
+  const exportedSharedIntro = await fs.readFile(
+    path.join(importedSharedExport.projectRoot, "sections/intro.tex"),
+    "utf8"
+  );
+  if (
+    exportedSharedMain !== importedSharedMainSource ||
+    exportedSharedIntro !== importedSharedIntroSource
+  ) {
+    throw new Error("Shared E2E: exported shared source ZIP did not round-trip.");
+  }
+  try {
+    await fs.stat(path.join(importedSharedExport.projectRoot, "main.aux"));
+    throw new Error("Shared E2E: exported shared source ZIP included main.aux.");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  await installPromptResponses(win, { confirms: [true] });
+  if (!(await clickButton(win, `Delete shared project ${importedSharedProjectName}`))) {
+    throw new Error("Shared E2E: shared Delete project button was not clickable.");
+  }
+  if (
+    !(await waitForText(
+      win,
+      `Deleted shared project ${importedSharedProjectName}.`,
+      20_000
+    ))
+  ) {
+    throw new Error("Shared E2E: shared delete status did not render.");
+  }
+  if (
+    sharedE2EState.projects.some(
+      (project) => project.id === importedSharedProject.id
+    ) ||
+    sharedE2EState.revisions.has(`${importedSharedProject.id}:main.tex`) ||
+    !(await waitForAriaRegionText(
+      win,
+      "Shared project list",
+      importedSharedProjectName,
+      {
+        expected: false,
+        timeoutMs: 10_000
+      }
+    ))
+  ) {
+    throw new Error(
+      "Shared E2E: deleted shared project was still visible or persisted."
+    );
+  }
+
+  if (!(await clickButton(win, sharedProjectName))) {
+    throw new Error(
+      "Shared E2E: owner shared project row was not clickable after lifecycle check."
+    );
+  }
+  if (!(await waitForText(win, "Members", 20_000))) {
+    throw new Error(
+      "Shared E2E: owner shared members region did not render after lifecycle check."
+    );
+  }
+
+  await installPromptResponses(win, { confirms: [true] });
+  if (
+    !(await clickButtonInAriaRegionRow(
+      win,
+      "Shared members",
+      "E2E Collaborator",
+      "Transfer ownership"
+    ))
+  ) {
+    throw new Error(
+      "Shared E2E: collaborator member Transfer ownership button was not clickable."
+    );
+  }
+  const collaboratorOwnerMember = await waitForSharedMember(
+    "shared-project-1",
+    (member) => member.email === collaboratorEmail && member.role === "owner"
+  );
+  if (collaboratorOwnerMember?.role !== "owner") {
+    throw new Error("Shared E2E: collaborator did not become project owner.");
+  }
+  const previousOwnerMember = await waitForSharedMember(
+    "shared-project-1",
+    (member) => member.email === sharedEmail && member.role === "editor"
+  );
+  if (previousOwnerMember?.role !== "editor") {
+    throw new Error("Shared E2E: previous owner did not become editor.");
+  }
+  const transferredProject = sharedE2EState.projects.find(
+    (project) => project.id === "shared-project-1"
+  );
+  if (transferredProject?.ownerUserId !== collaboratorOwnerMember.userId) {
+    throw new Error("Shared E2E: project owner id was not transferred.");
+  }
+
+  if (!(await clickButton(win, "Close project"))) {
+    throw new Error(
+      "Shared E2E: Close project button was not clickable before local share."
+    );
+  }
+  if (!(await waitForText(win, "Open Folder", 10_000))) {
+    throw new Error("Shared E2E: dashboard did not render before local share.");
+  }
+  if (!(await clickButton(win, "Open Folder"))) {
+    throw new Error(
+      "Shared E2E: Open Folder button was not clickable for local share."
+    );
+  }
+  if (!(await waitForText(win, "Local project", 20_000))) {
+    throw new Error("Shared E2E: local project did not open before sharing.");
+  }
+  if (
+    !(await setTemplatePickerFieldValue(win, "Shared name", localSharedProjectName))
+  ) {
+    throw new Error("Shared E2E: local share project name was not editable.");
+  }
+  if (!(await clickButton(win, "Share project"))) {
+    throw new Error("Shared E2E: Share project button was not clickable.");
+  }
+  const localSharedProject = await waitForSharedProject(
+    (project) => project.name === localSharedProjectName,
+    20_000
+  );
+  const localSharedMainRevision =
+    localSharedProject === undefined
+      ? undefined
+      : sharedE2EState.revisions.get(`${localSharedProject.id}:main.tex`);
+  if (
+    localSharedProject === undefined ||
+    localSharedProject.ownerUserId !== "shared-user-owner" ||
+    localSharedMainRevision === undefined ||
+    !localSharedMainRevision.contents.includes("\\documentclass")
+  ) {
+    throw new Error("Shared E2E: local project was not copied into shared storage.");
+  }
+  if (!(await waitForText(win, "Shared project", 20_000))) {
+    throw new Error("Shared E2E: local shared project did not reopen as shared.");
+  }
+
+  return {
+    projectName: sharedProjectName,
+    savedRevisionId: savedRevision.revisionId,
+    buildArtifactId: sharedArtifact.id,
+    failedBuildArtifactId: failedSharedArtifact.id,
+    agentRunId: completedSharedAgentRun.id,
+    agentChangeSetId: proposedSharedAgentChangeSet.id,
+    agentBuildArtifactId: approvedSharedArtifact.id,
+    auditEventCount: sharedE2EState.auditEvents.length,
+    presenceCount: sharedE2EState.presence.length,
+    invitationId: sharedInvitation.id,
+    viewerInvitationId: viewerInvitation.id,
+    collaboratorSawAgentRunId: completedSharedAgentRun.id,
+    collaboratorSawAgentChangeSetId: proposedSharedAgentChangeSet.id,
+    collaboratorInspectedAgentBuildArtifactId: approvedSharedArtifact.id,
+    ownerSharedCommentId: ownerSharedComment.id,
+    collaboratorResolvedCommentId: resolvedSharedComment.id,
+    restoredSharedRevisionId: restoredSharedRevision.revisionId,
+    collaboratorRevisionId: collaboratorRevision.revisionId,
+    remoteRealtimeRevisionId: remoteRealtimeRevision.revisionId,
+    collaboratorBuildArtifactId: collaboratorArtifact.id,
+    viewerInspectedBuildArtifactId: collaboratorArtifact.id,
+    viewerReadOnlyRevisionId: afterViewerAttemptRevision.revisionId,
+    collaboratorManagedRole: collaboratorEditorMember.role,
+    removedViewerMemberEmail: viewerEmail,
+    importedSharedProjectId: importedSharedProject.id,
+    exportedSharedSourceZipPath: sharedSourceExport.archivePath,
+    deletedSharedProjectId: importedSharedProject.id,
+    localSharedProjectId: localSharedProject.id,
+    transferredOwnerEmail: collaboratorEmail,
+    previousOwnerRole: previousOwnerMember.role,
+    sessionsAfterRevoke: ownerSessionsAfterRevoke
+  };
+}
+
 async function main() {
   sandboxPath = await fs.mkdtemp(path.join(require("node:os").tmpdir(), "latex-e2e-"));
   const expectMissingToolchain = process.env.E2E_EXPECT_TEX_MISSING === "1";
@@ -3836,7 +6405,7 @@ async function main() {
       throw new Error("Missing latexmk guidance did not mention MacTeX or BasicTeX.");
     }
     preOpenSetupGuidance = true;
-  } else {
+  } else if (process.env.E2E_ONLY_SHARED !== "1") {
     if (
       !(await waitForAnyText(
         win,
@@ -3846,6 +6415,36 @@ async function main() {
     ) {
       throw new Error("Installed TeX toolchain readiness did not render.");
     }
+  }
+
+  const sharedScenario =
+    !expectMissingToolchain && process.env.E2E_SKIP_SHARED_PROJECTS !== "1"
+      ? await runSharedProjectDesktopScenario(win)
+      : undefined;
+
+  if (process.env.E2E_ONLY_SHARED === "1") {
+    const summary = await getDomSummary(win);
+    if (summary.unlabeledButtons !== 0) {
+      throw new Error(`Found ${summary.unlabeledButtons} unlabeled icon buttons.`);
+    }
+    console.log(
+      JSON.stringify(
+        {
+          projectRoot,
+          preOpenToolchainSummary,
+          sharedScenario,
+          screenshotDir,
+          screenshotCount: screenshotManifest.length,
+          unlabeledButtons: summary.unlabeledButtons,
+          clientWidth: summary.clientWidth,
+          scrollWidth: summary.scrollWidth,
+          hasHorizontalOverflow: summary.hasHorizontalOverflow
+        },
+        null,
+        2
+      )
+    );
+    return;
   }
 
   if (!(await clickButton(win, "Open Folder"))) {
@@ -3944,6 +6543,7 @@ async function main() {
         projectRoot,
         preOpenToolchainSummary,
         projectHealth: summary.text.includes("Project health"),
+        sharedScenario,
         scenarios,
         screenshotDir,
         screenshotCount: screenshotManifest.length,

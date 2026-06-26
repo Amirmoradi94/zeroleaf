@@ -16,6 +16,8 @@ describe("agent host process session routing", () => {
     expect(source).toContain(
       "requestedSession.request.projectRoot === request.projectRoot"
     );
+    expect(source).toContain("isSameAgentProjectContext(");
+    expect(source).toContain("left.sharedProjectId === right.sharedProjectId");
     expect(source).toContain("requestedSession.request.mode === request.mode");
     expect(source).toContain("canContinueSession && request.sessionId !== undefined");
     expect(source).toContain(": randomUUID()");

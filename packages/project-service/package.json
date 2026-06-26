@@ -5,6 +5,20 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "node": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./project-gateway": {
+      "types": "./dist/project-gateway.d.ts",
+      "import": "./dist/project-gateway.js",
+      "node": "./dist/project-gateway.js",
+      "default": "./dist/project-gateway.js"
+    }
+  },
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --pretty",

@@ -132,6 +132,14 @@ export class ProjectMetadataStore {
     return (await this.read()).recentProjects;
   }
 
+  async clearRecentProjects(): Promise<readonly RecentProject[]> {
+    const metadata = await this.read();
+
+    await this.write({ ...metadata, recentProjects: [] });
+
+    return [];
+  }
+
   async recordProjectOpened(
     project: ProjectSummary
   ): Promise<readonly RecentProject[]> {
@@ -569,7 +577,7 @@ async function resolveWritableProjectPath(
   projectPath: string
 ): Promise<string> {
   const lexicalPath = resolveLexicalProjectPath(rootPath, projectPath);
-  const parentPath = await realpath(dirname(lexicalPath));
+  const parentPath = await ensureWritableParentPath(rootPath, dirname(lexicalPath));
 
   if (!isInsideRoot(rootPath, parentPath) || !isInsideRoot(rootPath, lexicalPath)) {
     throw new ProjectServiceError(
@@ -579,6 +587,60 @@ async function resolveWritableProjectPath(
   }
 
   return lexicalPath;
+}
+
+async function ensureWritableParentPath(
+  rootPath: string,
+  parentPath: string
+): Promise<string> {
+  try {
+    return await realpath(parentPath);
+  } catch (error) {
+    if (!isNodeErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+
+  const existingAncestor = await findExistingAncestor(parentPath);
+
+  if (!isInsideRoot(rootPath, existingAncestor)) {
+    throw new ProjectServiceError(
+      "Path resolves outside the project root.",
+      "outside-root"
+    );
+  }
+
+  await mkdir(parentPath, { recursive: true });
+  const resolvedParent = await realpath(parentPath);
+
+  if (!isInsideRoot(rootPath, resolvedParent)) {
+    throw new ProjectServiceError(
+      "Path resolves outside the project root.",
+      "outside-root"
+    );
+  }
+
+  return resolvedParent;
+}
+
+async function findExistingAncestor(path: string): Promise<string> {
+  let currentPath = path;
+
+  for (;;) {
+    try {
+      return await realpath(currentPath);
+    } catch (error) {
+      if (!isNodeErrorCode(error, "ENOENT")) {
+        throw error;
+      }
+
+      const parentPath = dirname(currentPath);
+      if (parentPath === currentPath) {
+        throw error;
+      }
+      currentPath = parentPath;
+    }
+  }
 }
 
 function resolveLexicalProjectPath(rootPath: string, projectPath: string): string {
@@ -605,6 +667,15 @@ function resolveLexicalProjectPath(rootPath: string, projectPath: string): strin
   }
 
   return resolvedPath;
+}
+
+function isNodeErrorCode(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { readonly code?: unknown }).code === code
+  );
 }
 
 async function assertPathDoesNotExist(absolutePath: string): Promise<void> {

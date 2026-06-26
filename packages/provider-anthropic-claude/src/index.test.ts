@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ClaudeProvider,
+  getClaudeToolsForMode,
   parseClaudeAgentResponseFromCli,
   parseClaudeAgentResponse,
   type ClaudeCodeToolBroker
@@ -70,6 +71,14 @@ describe("ClaudeProvider", () => {
           event.content.includes("The active file is a short article")
       )
     ).toBe(true);
+  });
+
+  it("configures Claude project tools by agent mode", () => {
+    expect(getClaudeToolsForMode("read-only")).toBe("Read,Grep,Glob,LS");
+    expect(getClaudeToolsForMode("apply-with-review")).toBe("Read,Grep,Glob,LS");
+    expect(getClaudeToolsForMode("autonomous-local")).toBe(
+      "Read,Grep,Glob,LS,Edit,MultiEdit,Write"
+    );
   });
 
   it("delegates TODO and placeholder reviews in read-only mode to Claude Code", async () => {
@@ -247,9 +256,49 @@ describe("ClaudeProvider", () => {
       "A user mentioning a PDF, paper, thesis, manuscript, or active document as source context does not by itself require a file edit"
     );
     expect(providerPrompt).toContain("Requests to merge, combine, consolidate");
+    expect(providerPrompt).toContain("Write message like a person reporting back");
     expect(providerPrompt).toContain("In message, always explain the result");
     expect(providerPrompt).toContain('Set action to "patch" only when');
     expect(providerPrompt).toContain("\\citep{smith2024}");
+  });
+
+  it("runs autonomous Claude sessions with project-scoped edit access", async () => {
+    const calls: string[] = [];
+    let providerPrompt = "";
+    let requestMode = "";
+    const provider = new ClaudeProvider({
+      getCliAuthStatus: () => Promise.resolve({ loggedIn: true }),
+      runClaudeCode: (request) => {
+        providerPrompt = request.prompt;
+        requestMode = request.mode;
+        return Promise.resolve(
+          createClaudeAnswer("Edited main.tex directly inside the project.")
+        );
+      }
+    });
+
+    const result = await provider.startSession(
+      {
+        providerId: "anthropic-claude",
+        mode: "autonomous-local",
+        projectRoot: "/tmp/project",
+        prompt: "Edit main.tex directly.",
+        activeFilePath: "main.tex",
+        mainFilePath: "main.tex",
+        compiler: "pdflatex"
+      },
+      createBroker(calls)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(requestMode).toBe("autonomous-local");
+    expect(providerPrompt).toContain("direct project-scoped access");
+    expect(providerPrompt).toContain(
+      "inspect, create, edit, overwrite, move, and delete"
+    );
+    expect(providerPrompt).toContain("Do not write outside the project root");
+    expect(providerPrompt).toContain("If a search command or pattern fails");
+    expect(calls).toEqual(["read-file:main.tex"]);
   });
 
   it("turns Claude Word edit output into a reviewable Word changeset", async () => {

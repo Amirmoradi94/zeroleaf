@@ -119,6 +119,10 @@ async function startSession(
     requestedSession !== undefined &&
     requestedSession.providerId === request.providerId &&
     requestedSession.request.projectRoot === request.projectRoot &&
+    isSameAgentProjectContext(
+      requestedSession.request.projectContext,
+      request.projectContext
+    ) &&
     requestedSession.request.mode === request.mode;
   const sessionId =
     canContinueSession && request.sessionId !== undefined
@@ -282,6 +286,22 @@ async function startSession(
     requestId,
     result
   });
+}
+
+function isSameAgentProjectContext(
+  left: AgentStartRequest["projectContext"],
+  right: AgentStartRequest["projectContext"]
+): boolean {
+  if (left === undefined || right === undefined) {
+    return left === right;
+  }
+
+  return (
+    left.backend === right.backend &&
+    left.sharedProjectId === right.sharedProjectId &&
+    left.localCachePath === right.localCachePath &&
+    left.role === right.role
+  );
 }
 
 async function respondApproval(

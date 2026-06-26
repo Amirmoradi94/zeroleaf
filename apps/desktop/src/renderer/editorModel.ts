@@ -78,7 +78,7 @@ export type TextSelectionRange = {
   readonly endColumn: number;
 };
 
-const internalProjectPathPrefixes = [".latex-agent/"] as const;
+const internalProjectPathPrefixes = [".latex-agent/", ".zeroleaf/"] as const;
 const editableExtensions = new Set([
   ".bib",
   ".cls",

@@ -1,0 +1,31 @@
+{
+  "createdAt": "2026-06-25T10:26:17.393Z",
+  "authStatus": {
+    "providerId": "openai-codex",
+    "state": "connected",
+    "message": "Codex CLI is logged in using ChatGPT."
+  },
+  "baseUrl": "http://127.0.0.1:56006",
+  "reportRoot": "/Users/amirmoradi94/Desktop/Projects/overleaf-clone/docs/qa/real-shared-codex-agent-2026-06-25",
+  "passed": true,
+  "result": {
+    "projectId": "116302dd-96a4-4be9-919b-cdcfd0eac8a2",
+    "invitationId": "6de39389-8bcb-436a-b784-5eb6f69a1e99",
+    "agentRunId": "41fcba1d-8733-4fed-a46d-29a73fae5f82",
+    "sharedChangeSetId": "924ab3f6-8343-4a68-9c08-65c7e584cd9a",
+    "localChangeSetId": "dce04ac8-b4f3-4275-a680-5f4f4925a49f",
+    "sourceRevisionId": "84e7a675-c0dd-4001-9dea-851351f77209",
+    "buildArtifactId": "f64204a4-d957-4553-8da6-e164e0461dbc",
+    "realtimeRunningAgentRunId": "41fcba1d-8733-4fed-a46d-29a73fae5f82",
+    "realtimeProposedChangeSetId": "924ab3f6-8343-4a68-9c08-65c7e584cd9a",
+    "realtimeAppliedChangeSetId": "924ab3f6-8343-4a68-9c08-65c7e584cd9a",
+    "realtimeAgentDocumentUpdateId": "f80d25fd-66a0-402a-9c25-25687c199cc4",
+    "realtimeAgentFileRevisionId": "84e7a675-c0dd-4001-9dea-851351f77209",
+    "realtimeBuildArtifactId": "f64204a4-d957-4553-8da6-e164e0461dbc",
+    "realtimeCompletedAgentRunId": "41fcba1d-8733-4fed-a46d-29a73fae5f82",
+    "initialCompileStatus": "failed",
+    "verifiedCompileStatus": "succeeded",
+    "auditEventCount": 4,
+    "pdfByteLength": 24165
+  }
+}

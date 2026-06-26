@@ -841,7 +841,8 @@ Text
     expect(
       shouldMarkPdfStaleForProjectChange([
         ".latex-agent/build/main.pdf",
-        ".latex-agent/build/main.log"
+        ".latex-agent/build/main.log",
+        ".zeroleaf/word-pdf/findings.pdf"
       ])
     ).toBe(false);
   });

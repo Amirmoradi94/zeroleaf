@@ -1,9 +1,10 @@
 import { watch, type FSWatcher } from "node:fs";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, extname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, dirname, extname, isAbsolute, join, relative } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   app,
@@ -11,6 +12,9 @@ import {
   dialog,
   ipcMain,
   nativeTheme,
+  net,
+  protocol,
+  safeStorage,
   shell,
   type IpcMainInvokeEvent,
   type OpenDialogOptions
@@ -41,6 +45,7 @@ import {
   ProjectMetadataStore,
   createProjectEntry,
   deleteProjectEntry,
+  detectMainTexFile,
   listProjectTree,
   moveProjectEntry,
   openProject,
@@ -51,18 +56,29 @@ import {
   writeProjectFile
 } from "@latex-agent/project-service";
 import {
+  SharedProjectCache,
+  SharedProjectClientError,
+  SharedProjectDocumentSession,
+  SharedProjectHttpClient,
+  isSharedProjectCollaborativeDocumentPath,
+  type SharedProjectRealtimeSession
+} from "@latex-agent/shared-project-client";
+import {
   analyzeProjectReferences,
   removeUnusedReferenceEntry,
   searchProjectReferences
 } from "@latex-agent/reference-service";
 import {
   checkSubmissionBundle,
+  collectSharedProjectSourceFiles,
+  createEmptyProject,
   createProjectFromTemplate,
   exportPdf as exportLifecyclePdf,
   exportSourceZip,
   importProjectZip,
   projectTemplates
 } from "@latex-agent/project-lifecycle-service";
+import { OnlyOfficeBridgeService } from "@latex-agent/onlyoffice-service";
 
 import {
   defaultAppSettings,
@@ -72,6 +88,7 @@ import {
   type AgentProviderSetupAction,
   type AgentEvent,
   type AgentNetworkFetchResult,
+  type AgentStartRequest,
   type AppSettings,
   type AppUpdateCheckResult,
   type EditorProjectState,
@@ -80,7 +97,24 @@ import {
   type IpcRequestMap,
   type IpcResponseMap,
   type PrivacySummary,
+  type ProjectFileSnapshot,
   type ProjectFileTreeNode,
+  type SharedProjectActivitySummary,
+  type SharedProjectAuditEventSummary,
+  type SharedProjectAgentChangeSetSummary,
+  type SharedProjectAgentRunSummary,
+  type SharedProjectBuildArtifactDetails,
+  type SharedProjectBuildArtifactSummary,
+  type SharedProjectConnection,
+  type SharedProjectDocumentSyncResult,
+  type SharedProjectDocumentTextOperation,
+  type SharedProjectInvitationSummary,
+  type SharedProjectMemberSummary,
+  type SharedProjectPresenceSummary,
+  type SharedProjectRealtimeEvent,
+  type SharedProjectRole,
+  type SharedProjectSessionSummary,
+  type SharedProjectSummary,
   type WorkbenchLayout
 } from "@latex-agent/ipc-contracts";
 import { ProjectChangeDebouncer } from "./projectWatcher.js";
@@ -89,7 +123,10 @@ import { PdfPreviewCaptureStore } from "./pdfPreviewCapture.js";
 const rendererDevServerUrl = process.env["VITE_DEV_SERVER_URL"];
 const mainDir = fileURLToPath(new URL(".", import.meta.url));
 const preloadPath = join(mainDir, "../preload/index.cjs");
-const rendererIndexPath = join(mainDir, "../renderer/index.html");
+const rendererRootPath = join(mainDir, "../renderer");
+const rendererProtocol = "zeroleaf";
+const rendererHost = "renderer";
+const packagedRendererUrl = `${rendererProtocol}://${rendererHost}/index.html`;
 const appIconPath = fileURLToPath(
   new URL("../../assets/zeroleaf-icon.png", import.meta.url)
 );
@@ -97,6 +134,20 @@ const agentHostProcessPath = fileURLToPath(
   import.meta.resolve("@latex-agent/agent-host/host-process")
 );
 const appName = "ZeroLeaf";
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: rendererProtocol,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true
+    }
+  }
+]);
+
 const agentHostClient = new AgentHostClient({
   hostProcessPath: agentHostProcessPath,
   handleToolRequest: handleAgentHostToolRequest,
@@ -115,6 +166,260 @@ let activeProjectWatcher: FSWatcher | undefined;
 let activeProjectRoot: string | undefined;
 let projectChangeDebouncer: ProjectChangeDebouncer | undefined;
 const pdfPreviewCaptureStore = new PdfPreviewCaptureStore();
+let sharedProjectClient: SharedProjectHttpClient | undefined;
+let sharedProjectConnection: SharedProjectConnection = { connected: false };
+let activeSharedProject:
+  | {
+      readonly projectId: string;
+      readonly localCachePath: string;
+    }
+  | undefined;
+const sharedDocumentSessions = new Map<string, SharedProjectDocumentSession>();
+let activeSharedRealtimeSession: SharedProjectRealtimeSession | undefined;
+let activeSharedRealtimeProjectId: string | undefined;
+let activeSharedRealtimeReconnectTimer: ReturnType<typeof setTimeout> | undefined;
+
+type PersistedSharedProjectSession = {
+  readonly baseUrl: string;
+  readonly accessToken?: string;
+  readonly refreshToken?: string;
+  readonly user: NonNullable<SharedProjectConnection["user"]>;
+};
+
+type PersistedSharedProjectSessionFile = {
+  readonly baseUrl: string;
+  readonly accessToken?: string;
+  readonly encryptedAccessToken?: string;
+  readonly refreshToken?: string;
+  readonly encryptedRefreshToken?: string;
+  readonly user: NonNullable<SharedProjectConnection["user"]>;
+};
+
+type ServerSharedProjectRealtimeEvent = Parameters<
+  NonNullable<
+    NonNullable<
+      Parameters<SharedProjectHttpClient["openRealtimeSession"]>[1]
+    >["onEvent"]
+  >
+>[0];
+
+type SharedProjectSourceExportFile = {
+  readonly path: string;
+  readonly contents: string;
+  readonly contentEncoding?: "utf8" | "base64";
+};
+
+type SharedProjectSourceExportDirectory = {
+  readonly path: string;
+};
+
+const onlyOfficeBridge = new OnlyOfficeBridgeService({
+  onBeforeDocumentSave: async ({ projectRoot, filePath }) => {
+    const history = getHistoryStore();
+    try {
+      await history.createWordDocumentSnapshot(projectRoot, filePath);
+    } finally {
+      history.close();
+    }
+  },
+  onAfterDocumentSave: async ({ projectRoot, filePath, sessionId }) => {
+    await recordAgentAudit(
+      projectRoot,
+      "onlyoffice.document.saved",
+      `ONLYOFFICE saved ${filePath} from session ${sessionId}.`
+    );
+    dispatchProjectChange(projectRoot, [filePath]);
+  }
+});
+
+function optionalStringProperty<TKey extends string>(
+  key: TKey,
+  value: string | undefined
+): { readonly [K in TKey]?: string } {
+  const trimmed = value?.trim();
+  return trimmed === undefined || trimmed.length === 0
+    ? {}
+    : ({ [key]: trimmed } as { readonly [K in TKey]: string });
+}
+
+function optionalNumberProperty<TKey extends string>(
+  key: TKey,
+  value: number | undefined
+): { readonly [K in TKey]?: number } {
+  return value === undefined
+    ? {}
+    : ({ [key]: value } as { readonly [K in TKey]: number });
+}
+
+function inferOnlyOfficeBridgeHost(
+  publicBaseUrl: string | undefined
+): string | undefined {
+  const explicitHost = process.env["ZEROLEAF_ONLYOFFICE_BRIDGE_HOST"]?.trim();
+  if (explicitHost !== undefined && explicitHost.length > 0) {
+    return explicitHost;
+  }
+
+  try {
+    return publicBaseUrl !== undefined &&
+      new URL(publicBaseUrl).hostname === "host.docker.internal"
+      ? "0.0.0.0"
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function inferOnlyOfficeBridgePort(
+  publicBaseUrl: string | undefined
+): number | undefined {
+  const explicitPort = process.env["ZEROLEAF_ONLYOFFICE_BRIDGE_PORT"]?.trim();
+  if (explicitPort !== undefined && explicitPort.length > 0) {
+    return parsePort(explicitPort);
+  }
+
+  try {
+    const parsedPort = publicBaseUrl === undefined ? "" : new URL(publicBaseUrl).port;
+    return parsedPort.length === 0 ? undefined : parsePort(parsedPort);
+  } catch {
+    return undefined;
+  }
+}
+
+function parsePort(value: string): number | undefined {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 && parsed < 65_536 ? parsed : undefined;
+}
+
+async function configureOnlyOfficeBridge(): Promise<void> {
+  const settings = await readAppSettings();
+  const bridgePublicBaseUrl = firstNonEmptyString(
+    process.env["ZEROLEAF_ONLYOFFICE_BRIDGE_PUBLIC_URL"],
+    settings.onlyOffice.bridgePublicBaseUrl
+  );
+  await onlyOfficeBridge.configure({
+    enabled: settings.onlyOffice.enabled,
+    documentServerUrl: firstNonEmptyString(
+      process.env["ZEROLEAF_ONLYOFFICE_DOCUMENT_SERVER_URL"],
+      settings.onlyOffice.documentServerUrl
+    ),
+    jwtSecret: firstNonEmptyString(
+      process.env["ZEROLEAF_ONLYOFFICE_JWT_SECRET"],
+      settings.onlyOffice.jwtSecret
+    ),
+    ...optionalStringProperty("bridgePublicBaseUrl", bridgePublicBaseUrl),
+    ...optionalStringProperty(
+      "bridgeHost",
+      inferOnlyOfficeBridgeHost(bridgePublicBaseUrl)
+    ),
+    ...optionalNumberProperty(
+      "preferredPort",
+      inferOnlyOfficeBridgePort(bridgePublicBaseUrl)
+    )
+  });
+}
+
+function firstNonEmptyString(...values: readonly (string | undefined)[]): string {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed !== undefined && trimmed.length > 0) {
+      return trimmed;
+    }
+  }
+
+  return "";
+}
+
+function toSafeExportFileBaseName(name: string): string {
+  const sanitized = name
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/gu, "-")
+    .replace(/\s+/gu, " ")
+    .slice(0, 80)
+    .trim();
+
+  return sanitized.length === 0 ? "shared-project" : sanitized;
+}
+
+function resolveSharedExportFilePath(rootPath: string, projectPath: string): string {
+  const targetPath = join(rootPath, projectPath);
+  const relativePath = relative(rootPath, targetPath);
+
+  if (
+    relativePath.length === 0 ||
+    relativePath.startsWith("..") ||
+    isAbsolute(relativePath)
+  ) {
+    throw new Error("Shared export contained an unsafe project path.");
+  }
+
+  return targetPath;
+}
+
+async function writeSharedProjectSourceExportFiles(
+  rootPath: string,
+  files: readonly SharedProjectSourceExportFile[],
+  directories: readonly SharedProjectSourceExportDirectory[] = []
+): Promise<void> {
+  for (const directory of directories) {
+    await mkdir(resolveSharedExportFilePath(rootPath, directory.path), {
+      recursive: true
+    });
+  }
+
+  for (const file of files) {
+    const targetPath = resolveSharedExportFilePath(rootPath, file.path);
+    const data =
+      file.contentEncoding === "base64"
+        ? Buffer.from(file.contents, "base64")
+        : file.contents;
+    await mkdir(dirname(targetPath), { recursive: true });
+    if (file.contentEncoding === "base64") {
+      await writeFile(targetPath, data);
+    } else {
+      await writeFile(targetPath, data, "utf8");
+    }
+  }
+}
+
+async function detectShareableMainFilePath(
+  projectRoot: string,
+  files: readonly { readonly path: string }[]
+): Promise<string | undefined> {
+  const tree = await listProjectTree(projectRoot);
+  const texPaths = flattenProjectTree(tree)
+    .filter((node) => node.kind === "file" && node.path.endsWith(".tex"))
+    .map((node) => node.path);
+  const mainFilePath = await detectMainTexFile(projectRoot, tree, texPaths);
+
+  return mainFilePath !== undefined && files.some((file) => file.path === mainFilePath)
+    ? mainFilePath
+    : undefined;
+}
+
+function registerPackagedRendererProtocol(): void {
+  protocol.handle(rendererProtocol, (request) => {
+    const requestUrl = new URL(request.url);
+    if (requestUrl.hostname !== rendererHost) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    const requestedPath =
+      requestUrl.pathname === "/"
+        ? "index.html"
+        : decodeURIComponent(requestUrl.pathname.replace(/^\/+/u, ""));
+    const rendererFilePath = join(rendererRootPath, requestedPath);
+    const relativePath = relative(rendererRootPath, rendererFilePath);
+    if (
+      relativePath.length === 0 ||
+      relativePath.startsWith("..") ||
+      isAbsolute(relativePath)
+    ) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    return net.fetch(pathToFileURL(rendererFilePath).toString());
+  });
+}
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number) {
   return typeof value === "number" && Number.isFinite(value)
@@ -202,6 +507,10 @@ function normalizeAppSettings(value: unknown): AppSettings {
     typeof candidate.updates === "object" && candidate.updates !== null
       ? (candidate.updates as Partial<AppSettings["updates"]>)
       : {};
+  const onlyOffice =
+    typeof candidate.onlyOffice === "object" && candidate.onlyOffice !== null
+      ? (candidate.onlyOffice as Partial<AppSettings["onlyOffice"]>)
+      : {};
 
   return {
     editor: {
@@ -283,6 +592,21 @@ function normalizeAppSettings(value: unknown): AppSettings {
           ? updates.checkOnStartup
           : defaultAppSettings.updates.checkOnStartup
     },
+    onlyOffice: {
+      enabled:
+        typeof onlyOffice.enabled === "boolean"
+          ? onlyOffice.enabled
+          : defaultAppSettings.onlyOffice.enabled,
+      documentServerUrl: normalizeHttpUrlSetting(
+        onlyOffice.documentServerUrl,
+        defaultAppSettings.onlyOffice.documentServerUrl
+      ),
+      jwtSecret: typeof onlyOffice.jwtSecret === "string" ? onlyOffice.jwtSecret : "",
+      bridgePublicBaseUrl: normalizeHttpUrlSetting(
+        onlyOffice.bridgePublicBaseUrl,
+        defaultAppSettings.onlyOffice.bridgePublicBaseUrl
+      )
+    },
     privacy: {
       storeAgentTranscripts:
         typeof privacy.storeAgentTranscripts === "boolean"
@@ -295,6 +619,26 @@ function normalizeAppSettings(value: unknown): AppSettings {
     },
     credentials: defaultAppSettings.credentials
   };
+}
+
+function normalizeHttpUrlSetting(value: unknown, fallback: string): string {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  const trimmed = value.trim().replace(/\/+$/u, "");
+  if (trimmed.length === 0) {
+    return fallback;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? trimmed
+      : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function isOneOf<TValue extends string>(
@@ -360,8 +704,1166 @@ function getProjectMetadataPath() {
   return join(app.getPath("userData"), "project-metadata.json");
 }
 
+function getSharedSessionPath() {
+  return join(app.getPath("userData"), "shared-session.json");
+}
+
+function getSharedDesktopClientIdPath() {
+  return join(app.getPath("userData"), "shared-desktop-client-id");
+}
+
+async function getSharedDesktopClientId(): Promise<string> {
+  try {
+    const existingId = (await readFile(getSharedDesktopClientIdPath(), "utf8")).trim();
+    if (existingId.length > 0) {
+      return existingId;
+    }
+  } catch {
+    // Create the id below when this desktop has not uploaded shared artifacts yet.
+  }
+
+  const nextId = `desktop_${randomUUID()}`;
+  await mkdir(app.getPath("userData"), { recursive: true });
+  await writeFile(getSharedDesktopClientIdPath(), `${nextId}\n`, "utf8");
+  return nextId;
+}
+
+async function readPersistedSharedProjectSession(): Promise<
+  PersistedSharedProjectSession | undefined
+> {
+  try {
+    const parsed = JSON.parse(
+      await readFile(getSharedSessionPath(), "utf8")
+    ) as Partial<PersistedSharedProjectSessionFile>;
+    const accessToken = readPersistedSharedProjectAccessToken(parsed);
+    const refreshToken = readPersistedSharedProjectRefreshToken(parsed);
+    if (
+      typeof parsed.baseUrl !== "string" ||
+      refreshToken === undefined ||
+      typeof parsed.user?.id !== "string" ||
+      typeof parsed.user.email !== "string" ||
+      typeof parsed.user.name !== "string"
+    ) {
+      return undefined;
+    }
+
+    return {
+      baseUrl: parsed.baseUrl,
+      ...(accessToken === undefined ? {} : { accessToken }),
+      ...(refreshToken === undefined ? {} : { refreshToken }),
+      user: {
+        id: parsed.user.id,
+        email: parsed.user.email,
+        name: parsed.user.name
+      }
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function readPersistedSharedProjectAccessToken(
+  parsed: Partial<PersistedSharedProjectSessionFile>
+): string | undefined {
+  return readPersistedSharedProjectToken(
+    parsed.encryptedAccessToken,
+    parsed.accessToken
+  );
+}
+
+function readPersistedSharedProjectRefreshToken(
+  parsed: Partial<PersistedSharedProjectSessionFile>
+): string | undefined {
+  return readPersistedSharedProjectToken(
+    parsed.encryptedRefreshToken,
+    parsed.refreshToken
+  );
+}
+
+function readPersistedSharedProjectToken(
+  encryptedToken: string | undefined,
+  plaintextToken: string | undefined
+): string | undefined {
+  if (typeof encryptedToken === "string") {
+    try {
+      return safeStorage.decryptString(Buffer.from(encryptedToken, "base64"));
+    } catch {
+      return undefined;
+    }
+  }
+
+  return typeof plaintextToken === "string" ? plaintextToken : undefined;
+}
+
+async function writePersistedSharedProjectSession(
+  session: PersistedSharedProjectSession
+): Promise<void> {
+  await mkdir(app.getPath("userData"), { recursive: true });
+  const encryptedAccessToken =
+    session.accessToken === undefined
+      ? {}
+      : encryptSharedProjectAccessToken(session.accessToken);
+  const encryptedRefreshToken =
+    session.refreshToken === undefined
+      ? {}
+      : encryptSharedProjectRefreshToken(session.refreshToken);
+
+  if (
+    session.refreshToken !== undefined &&
+    encryptedRefreshToken.encryptedRefreshToken === undefined
+  ) {
+    await clearPersistedSharedProjectSession();
+    return;
+  }
+
+  const persistedSession: PersistedSharedProjectSessionFile = {
+    baseUrl: session.baseUrl,
+    user: session.user,
+    ...encryptedAccessToken,
+    ...encryptedRefreshToken
+  };
+  await writeFile(
+    getSharedSessionPath(),
+    JSON.stringify(persistedSession, null, 2),
+    "utf8"
+  );
+}
+
+async function clearPersistedSharedProjectSession(): Promise<void> {
+  await rm(getSharedSessionPath(), { force: true });
+}
+
+function encryptSharedProjectAccessToken(
+  accessToken: string
+): Pick<PersistedSharedProjectSessionFile, "accessToken" | "encryptedAccessToken"> {
+  const token = encryptSharedProjectToken(accessToken);
+  return token.encryptedToken === undefined
+    ? {}
+    : { encryptedAccessToken: token.encryptedToken };
+}
+
+function encryptSharedProjectRefreshToken(
+  refreshToken: string
+): Pick<PersistedSharedProjectSessionFile, "refreshToken" | "encryptedRefreshToken"> {
+  const token = encryptSharedProjectToken(refreshToken);
+  return token.encryptedToken === undefined
+    ? {}
+    : { encryptedRefreshToken: token.encryptedToken };
+}
+
+function encryptSharedProjectToken(token: string): {
+  readonly encryptedToken?: string;
+} {
+  if (!safeStorage.isEncryptionAvailable()) {
+    return {};
+  }
+
+  return {
+    encryptedToken: safeStorage.encryptString(token).toString("base64")
+  };
+}
+
+function toSharedProjectConnection(
+  baseUrl: string,
+  user: NonNullable<SharedProjectConnection["user"]>
+): SharedProjectConnection {
+  return {
+    connected: true,
+    baseUrl,
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name
+    }
+  };
+}
+
+type SharedProjectClientCredentials = {
+  readonly baseUrl: string;
+  readonly accessToken?: string;
+  readonly refreshToken?: string;
+};
+
+function createSharedProjectClient(
+  credentials: SharedProjectClientCredentials
+): SharedProjectHttpClient {
+  return new SharedProjectHttpClient({
+    ...credentials,
+    onSessionRefreshed: (session) =>
+      persistRefreshedSharedProjectSession(credentials.baseUrl, session)
+  });
+}
+
+async function persistRefreshedSharedProjectSession(
+  baseUrl: string,
+  session: {
+    readonly refreshToken: string;
+    readonly user: NonNullable<SharedProjectConnection["user"]>;
+  }
+): Promise<void> {
+  await writePersistedSharedProjectSession({
+    baseUrl,
+    refreshToken: session.refreshToken,
+    user: session.user
+  });
+}
+
+async function restoreSharedProjectConnection(): Promise<SharedProjectConnection> {
+  if (sharedProjectClient !== undefined) {
+    return sharedProjectConnection;
+  }
+
+  const persisted = await readPersistedSharedProjectSession();
+  if (persisted === undefined) {
+    sharedProjectConnection = { connected: false };
+    return sharedProjectConnection;
+  }
+
+  const client = createSharedProjectClient({
+    baseUrl: persisted.baseUrl,
+    ...(persisted.accessToken === undefined
+      ? {}
+      : { accessToken: persisted.accessToken }),
+    ...(persisted.refreshToken === undefined
+      ? {}
+      : { refreshToken: persisted.refreshToken })
+  });
+
+  try {
+    const session = await client.refreshSession(persisted.refreshToken);
+    const user = session.user;
+    sharedProjectClient = client;
+    sharedProjectConnection = toSharedProjectConnection(persisted.baseUrl, user);
+    await writePersistedSharedProjectSession({
+      baseUrl: persisted.baseUrl,
+      refreshToken: session.refreshToken,
+      user
+    });
+  } catch {
+    sharedProjectClient = undefined;
+    sharedProjectConnection = { connected: false, baseUrl: persisted.baseUrl };
+  }
+
+  return sharedProjectConnection;
+}
+
 function getProjectMetadataStore() {
   return new ProjectMetadataStore(getProjectMetadataPath());
+}
+
+function getSharedProjectCache() {
+  return new SharedProjectCache(app.getPath("userData"));
+}
+
+function toSharedProjectSummary(project: {
+  readonly id: string;
+  readonly name: string;
+  readonly ownerUserId: string;
+  readonly mainFilePath?: string;
+  readonly compiler?: SharedProjectSummary["compiler"];
+  readonly role?: SharedProjectRole;
+  readonly updatedAt: string;
+}): SharedProjectSummary {
+  return {
+    id: project.id,
+    name: project.name,
+    ownerUserId: project.ownerUserId,
+    ...(project.mainFilePath === undefined
+      ? {}
+      : { mainFilePath: project.mainFilePath }),
+    ...(project.compiler === undefined ? {} : { compiler: project.compiler }),
+    role: project.role ?? "owner",
+    updatedAt: project.updatedAt
+  };
+}
+
+function toSharedProjectSessionSummary(session: {
+  readonly id: string;
+  readonly userId: string;
+  readonly current: boolean;
+  readonly accessTokenExpiresAt: string;
+  readonly refreshTokenExpiresAt: string;
+  readonly createdAt: string;
+}): SharedProjectSessionSummary {
+  return {
+    id: session.id,
+    userId: session.userId,
+    current: session.current,
+    accessTokenExpiresAt: session.accessTokenExpiresAt,
+    refreshTokenExpiresAt: session.refreshTokenExpiresAt,
+    createdAt: session.createdAt
+  };
+}
+
+function toSharedProjectInvitationSummary(invitation: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly email: string;
+  readonly role: "editor" | "viewer";
+  readonly status: "pending" | "accepted";
+}): SharedProjectInvitationSummary {
+  return {
+    id: invitation.id,
+    projectId: invitation.projectId,
+    email: invitation.email,
+    role: invitation.role,
+    status: invitation.status
+  };
+}
+
+function toSharedProjectMemberSummary(member: {
+  readonly projectId: string;
+  readonly userId: string;
+  readonly role: "owner" | "editor" | "viewer";
+  readonly email?: string;
+  readonly name?: string;
+  readonly joinedAt?: string;
+}): SharedProjectMemberSummary {
+  return {
+    projectId: member.projectId,
+    userId: member.userId,
+    role: member.role,
+    ...(member.email === undefined ? {} : { email: member.email }),
+    ...(member.name === undefined ? {} : { name: member.name }),
+    ...(member.joinedAt === undefined ? {} : { joinedAt: member.joinedAt })
+  };
+}
+
+function toSharedProjectPresenceSummary(presence: {
+  readonly projectId: string;
+  readonly userId: string;
+  readonly displayName: string;
+  readonly filePath?: string;
+  readonly cursorLine?: number;
+  readonly cursorColumn?: number;
+  readonly updatedAt: string;
+}): SharedProjectPresenceSummary {
+  return {
+    projectId: presence.projectId,
+    userId: presence.userId,
+    displayName: presence.displayName,
+    ...(presence.filePath === undefined ? {} : { filePath: presence.filePath }),
+    ...(presence.cursorLine === undefined ? {} : { cursorLine: presence.cursorLine }),
+    ...(presence.cursorColumn === undefined
+      ? {}
+      : { cursorColumn: presence.cursorColumn }),
+    updatedAt: presence.updatedAt
+  };
+}
+
+function toSharedProjectBuildArtifactSummary(artifact: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly sourceRevisionId: string;
+  readonly desktopClientId: string;
+  readonly compiler: string;
+  readonly engineVersion?: string;
+  readonly latexmkVersion?: string;
+  readonly status: "succeeded" | "failed" | "cancelled";
+  readonly platform: NodeJS.Platform;
+  readonly diagnostics: readonly unknown[];
+  readonly pdfByteLength?: number;
+  readonly createdAt: string;
+}): SharedProjectBuildArtifactSummary {
+  return {
+    id: artifact.id,
+    projectId: artifact.projectId,
+    sourceRevisionId: artifact.sourceRevisionId,
+    desktopClientId: artifact.desktopClientId,
+    compiler: artifact.compiler,
+    ...(artifact.engineVersion === undefined
+      ? {}
+      : { engineVersion: artifact.engineVersion }),
+    ...(artifact.latexmkVersion === undefined
+      ? {}
+      : { latexmkVersion: artifact.latexmkVersion }),
+    status: artifact.status,
+    platform: artifact.platform,
+    diagnosticCount: artifact.diagnostics.length,
+    ...(artifact.pdfByteLength === undefined
+      ? {}
+      : { pdfByteLength: artifact.pdfByteLength }),
+    createdAt: artifact.createdAt
+  };
+}
+
+function toSharedProjectBuildArtifactDetails(artifact: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly sourceRevisionId: string;
+  readonly desktopClientId: string;
+  readonly compiler: string;
+  readonly engineVersion?: string;
+  readonly latexmkVersion?: string;
+  readonly status: "succeeded" | "failed" | "cancelled";
+  readonly platform: NodeJS.Platform;
+  readonly diagnostics: readonly {
+    readonly severity: "error" | "warning";
+    readonly message: string;
+    readonly filePath?: string;
+    readonly line?: number;
+  }[];
+  readonly rawLog: string;
+  readonly pdfBase64?: string;
+  readonly pdfByteLength?: number;
+  readonly createdAt: string;
+}): SharedProjectBuildArtifactDetails {
+  return {
+    ...toSharedProjectBuildArtifactSummary(artifact),
+    rawLog: artifact.rawLog,
+    diagnostics: artifact.diagnostics.map((diagnostic) => ({
+      severity: diagnostic.severity,
+      message: diagnostic.message,
+      ...(diagnostic.filePath === undefined ? {} : { filePath: diagnostic.filePath }),
+      ...(diagnostic.line === undefined ? {} : { line: diagnostic.line })
+    })),
+    ...(artifact.pdfBase64 === undefined ? {} : { pdfBase64: artifact.pdfBase64 })
+  };
+}
+
+function toSharedProjectActivitySummary(activity: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly actorUserId: string;
+  readonly eventType: string;
+  readonly message: string;
+  readonly createdAt: string;
+}): SharedProjectActivitySummary {
+  return {
+    id: activity.id,
+    projectId: activity.projectId,
+    actorUserId: activity.actorUserId,
+    eventType: activity.eventType,
+    message: activity.message,
+    createdAt: activity.createdAt
+  };
+}
+
+function toSharedProjectCommentSummary(comment: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly authorUserId: string;
+  readonly body: string;
+  readonly filePath?: string;
+  readonly line?: number;
+  readonly resolved: boolean;
+  readonly resolvedByUserId?: string;
+  readonly resolvedAt?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}) {
+  return {
+    id: comment.id,
+    projectId: comment.projectId,
+    authorUserId: comment.authorUserId,
+    body: comment.body,
+    ...(comment.filePath === undefined ? {} : { filePath: comment.filePath }),
+    ...(comment.line === undefined ? {} : { line: comment.line }),
+    resolved: comment.resolved,
+    ...(comment.resolvedByUserId === undefined
+      ? {}
+      : { resolvedByUserId: comment.resolvedByUserId }),
+    ...(comment.resolvedAt === undefined ? {} : { resolvedAt: comment.resolvedAt }),
+    createdAt: comment.createdAt,
+    updatedAt: comment.updatedAt
+  };
+}
+
+function toSharedProjectFileRevisionDetails(revision: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly path: string;
+  readonly actorUserId: string;
+  readonly createdAt: string;
+  readonly contents: string;
+  readonly contentEncoding?: "utf8" | "base64";
+}) {
+  return {
+    id: revision.id,
+    projectId: revision.projectId,
+    path: revision.path,
+    actorUserId: revision.actorUserId,
+    createdAt: revision.createdAt,
+    contents: revision.contents,
+    ...(revision.contentEncoding === undefined
+      ? {}
+      : { contentEncoding: revision.contentEncoding }),
+    byteLength:
+      revision.contentEncoding === "base64"
+        ? Buffer.from(revision.contents, "base64").byteLength
+        : Buffer.byteLength(revision.contents, "utf8")
+  };
+}
+
+function toSharedProjectAuditEventSummary(event: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly actorUserId: string;
+  readonly eventType: string;
+  readonly message: string;
+  readonly agentRunId?: string;
+  readonly changesetId?: string;
+  readonly buildArtifactIds?: readonly string[];
+  readonly createdAt: string;
+}): SharedProjectAuditEventSummary {
+  return {
+    id: event.id,
+    projectId: event.projectId,
+    actorUserId: event.actorUserId,
+    eventType: event.eventType,
+    message: event.message,
+    ...(event.agentRunId === undefined ? {} : { agentRunId: event.agentRunId }),
+    ...(event.changesetId === undefined ? {} : { changesetId: event.changesetId }),
+    ...(event.buildArtifactIds === undefined
+      ? {}
+      : { buildArtifactIds: event.buildArtifactIds }),
+    createdAt: event.createdAt
+  };
+}
+
+function toSharedProjectAgentRunSummary(agentRun: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly actorUserId: string;
+  readonly providerId: string;
+  readonly mode: string;
+  readonly promptHash: string;
+  readonly status:
+    | "running"
+    | "waiting-for-review"
+    | "completed"
+    | "failed"
+    | "cancelled";
+  readonly changesetIds: readonly string[];
+  readonly buildArtifactIds: readonly string[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}): SharedProjectAgentRunSummary {
+  return {
+    id: agentRun.id,
+    projectId: agentRun.projectId,
+    actorUserId: agentRun.actorUserId,
+    providerId: agentRun.providerId,
+    mode: agentRun.mode,
+    promptHash: agentRun.promptHash,
+    status: agentRun.status,
+    changesetIds: agentRun.changesetIds,
+    buildArtifactIds: agentRun.buildArtifactIds,
+    createdAt: agentRun.createdAt,
+    updatedAt: agentRun.updatedAt
+  };
+}
+
+function toSharedProjectAgentChangeSetSummary(changeset: {
+  readonly id: string;
+  readonly projectId: string;
+  readonly agentRunId: string;
+  readonly actorUserId: string;
+  readonly filePath: string;
+  readonly summary: string;
+  readonly status: "proposed" | "applied" | "rejected" | "failed";
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly beforeContents: string;
+  readonly afterContents: string;
+  readonly appliedAt?: string;
+  readonly appliedRevisionId?: string;
+}): SharedProjectAgentChangeSetSummary {
+  return {
+    id: changeset.id,
+    projectId: changeset.projectId,
+    agentRunId: changeset.agentRunId,
+    actorUserId: changeset.actorUserId,
+    filePath: changeset.filePath,
+    summary: changeset.summary,
+    status: changeset.status,
+    createdAt: changeset.createdAt,
+    updatedAt: changeset.updatedAt,
+    patchPreview: createSharedChangeSetPatchPreview(
+      changeset.filePath,
+      changeset.beforeContents,
+      changeset.afterContents
+    ),
+    ...(changeset.appliedAt === undefined ? {} : { appliedAt: changeset.appliedAt }),
+    ...(changeset.appliedRevisionId === undefined
+      ? {}
+      : { appliedRevisionId: changeset.appliedRevisionId })
+  };
+}
+
+function createSharedChangeSetPatchPreview(
+  filePath: string,
+  beforeContents: string,
+  afterContents: string
+): string {
+  if (beforeContents === afterContents) {
+    return `--- a/${filePath}\n+++ b/${filePath}\n(no text changes)`;
+  }
+
+  const beforeLines = beforeContents.split(/\r?\n/u);
+  const afterLines = afterContents.split(/\r?\n/u);
+  const maxPreviewLines = 80;
+  const diffLines = [`--- a/${filePath}`, `+++ b/${filePath}`];
+  let beforeIndex = 0;
+  let afterIndex = 0;
+
+  while (
+    (beforeIndex < beforeLines.length || afterIndex < afterLines.length) &&
+    diffLines.length < maxPreviewLines
+  ) {
+    const beforeLine = beforeLines[beforeIndex];
+    const afterLine = afterLines[afterIndex];
+
+    if (beforeLine === afterLine) {
+      diffLines.push(` ${beforeLine ?? ""}`);
+      beforeIndex += 1;
+      afterIndex += 1;
+      continue;
+    }
+
+    if (beforeLine !== undefined) {
+      diffLines.push(`-${beforeLine}`);
+      beforeIndex += 1;
+    }
+    if (afterLine !== undefined) {
+      diffLines.push(`+${afterLine}`);
+      afterIndex += 1;
+    }
+  }
+
+  if (beforeIndex < beforeLines.length || afterIndex < afterLines.length) {
+    diffLines.push("...diff preview truncated...");
+  }
+
+  return diffLines.join("\n");
+}
+
+async function readOptionalBuildPdfBase64(
+  projectRoot: string,
+  pdfPath: string
+): Promise<string | undefined> {
+  const resolvedPdfPath = isAbsolute(pdfPath) ? pdfPath : join(projectRoot, pdfPath);
+
+  try {
+    return await readFile(resolvedPdfPath, "base64");
+  } catch {
+    return undefined;
+  }
+}
+
+function toSharedProjectDocumentSyncResult(
+  result: {
+    readonly revision: {
+      readonly projectId: string;
+      readonly path: string;
+      readonly contents: string;
+      readonly id: string;
+    };
+  },
+  mtimeMs: number,
+  metadata: {
+    readonly lastUpdateId?: string;
+    readonly remoteUpdateCount?: number;
+    readonly remoteTextOperations?: readonly SharedProjectDocumentTextOperation[];
+  } = {}
+): SharedProjectDocumentSyncResult {
+  return {
+    projectId: result.revision.projectId,
+    path: result.revision.path,
+    contents: result.revision.contents,
+    revisionId: result.revision.id,
+    mtimeMs,
+    ...metadata
+  };
+}
+
+async function writeSharedDocumentRevisionToActiveCache(result: {
+  readonly revision: {
+    readonly projectId: string;
+    readonly path: string;
+    readonly contents: string;
+    readonly id: string;
+  };
+  readonly update?: {
+    readonly id: string;
+  };
+  readonly remoteUpdateCount?: number;
+  readonly remoteTextOperations?: readonly SharedProjectDocumentTextOperation[];
+}): Promise<SharedProjectDocumentSyncResult> {
+  const sharedProject =
+    activeSharedProject?.projectId === result.revision.projectId
+      ? activeSharedProject
+      : undefined;
+  const localWrite =
+    sharedProject === undefined
+      ? { mtimeMs: Date.now() }
+      : await writeProjectFile(
+          sharedProject.localCachePath,
+          result.revision.path,
+          result.revision.contents
+        );
+  if (sharedProject !== undefined) {
+    await getSharedProjectCache().recordFileRevision(
+      result.revision.projectId,
+      result.revision.path,
+      result.revision.id
+    );
+  }
+
+  return toSharedProjectDocumentSyncResult(result, localWrite.mtimeMs, {
+    ...(result.update === undefined ? {} : { lastUpdateId: result.update.id }),
+    ...(result.remoteUpdateCount === undefined
+      ? {}
+      : { remoteUpdateCount: result.remoteUpdateCount }),
+    ...(result.remoteTextOperations === undefined
+      ? {}
+      : { remoteTextOperations: result.remoteTextOperations })
+  });
+}
+
+function requireSharedProjectClient(): SharedProjectHttpClient {
+  if (sharedProjectClient === undefined) {
+    throw new Error("Sign in to a shared project server before using shared projects.");
+  }
+
+  return sharedProjectClient;
+}
+
+async function startSharedRealtimeSession(
+  projectId: string,
+  reconnectAttempt = 0
+): Promise<{ readonly projectId: string; readonly subscribed: boolean }> {
+  if (
+    activeSharedRealtimeSession !== undefined &&
+    activeSharedRealtimeProjectId === projectId
+  ) {
+    return { projectId, subscribed: true };
+  }
+
+  clearSharedRealtimeReconnectTimer();
+  if (reconnectAttempt === 0) {
+    await stopSharedRealtimeSession();
+  }
+  const session = await requireSharedProjectClient().openRealtimeSession(projectId, {
+    onEvent: (event) => {
+      if (event.type === "tree.updated") {
+        clearSharedDocumentSessions();
+      }
+      broadcastSharedRealtimeEvent(toDesktopSharedRealtimeEvent(event));
+    },
+    onError: (error) => {
+      broadcastSharedRealtimeEvent({
+        type: "error",
+        projectId,
+        message: error.message
+      });
+    },
+    onClose: (event) => {
+      if (
+        activeSharedRealtimeProjectId === projectId &&
+        activeSharedRealtimeSession === session
+      ) {
+        activeSharedRealtimeSession = undefined;
+        activeSharedRealtimeProjectId = undefined;
+        scheduleSharedRealtimeReconnect(projectId, reconnectAttempt, event.code);
+      }
+    }
+  });
+  activeSharedRealtimeSession = session;
+  activeSharedRealtimeProjectId = projectId;
+
+  return { projectId, subscribed: true };
+}
+
+async function stopSharedRealtimeSession(
+  projectId = activeSharedRealtimeProjectId
+): Promise<{ readonly projectId: string; readonly subscribed: boolean }> {
+  clearSharedRealtimeReconnectTimer();
+  if (
+    activeSharedRealtimeSession === undefined ||
+    activeSharedRealtimeProjectId === undefined ||
+    (projectId !== undefined && activeSharedRealtimeProjectId !== projectId)
+  ) {
+    if (projectId === undefined || activeSharedRealtimeProjectId === projectId) {
+      activeSharedRealtimeProjectId = undefined;
+    }
+    return { projectId: projectId ?? "", subscribed: false };
+  }
+
+  const closingProjectId = activeSharedRealtimeProjectId;
+  const session = activeSharedRealtimeSession;
+  activeSharedRealtimeSession = undefined;
+  activeSharedRealtimeProjectId = undefined;
+  await session.close();
+
+  return { projectId: closingProjectId, subscribed: false };
+}
+
+function scheduleSharedRealtimeReconnect(
+  projectId: string,
+  previousAttempt: number,
+  closeCode: number
+): void {
+  if (closeCode === 4003 || sharedProjectClient === undefined) {
+    return;
+  }
+
+  const nextAttempt = previousAttempt + 1;
+  const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(nextAttempt - 1, 5));
+  broadcastSharedRealtimeEvent({
+    type: "error",
+    projectId,
+    message: `Shared realtime disconnected. Reconnecting in ${Math.round(
+      delayMs / 1000
+    )}s.`
+  });
+  activeSharedRealtimeProjectId = projectId;
+  activeSharedRealtimeReconnectTimer = setTimeout(() => {
+    activeSharedRealtimeReconnectTimer = undefined;
+    void startSharedRealtimeSession(projectId, nextAttempt).catch((error) => {
+      if (activeSharedRealtimeProjectId === projectId) {
+        broadcastSharedRealtimeEvent({
+          type: "error",
+          projectId,
+          message: `Shared realtime reconnect failed: ${getErrorMessage(error)}`
+        });
+        scheduleSharedRealtimeReconnect(projectId, nextAttempt, 1006);
+      }
+    });
+  }, delayMs);
+}
+
+function clearSharedRealtimeReconnectTimer(): void {
+  if (activeSharedRealtimeReconnectTimer === undefined) {
+    return;
+  }
+
+  clearTimeout(activeSharedRealtimeReconnectTimer);
+  activeSharedRealtimeReconnectTimer = undefined;
+}
+
+function broadcastSharedRealtimeEvent(event: SharedProjectRealtimeEvent): void {
+  BrowserWindow.getAllWindows().forEach((window) => {
+    window.webContents.send(ipcChannels.sharedRealtimeEvent, event);
+  });
+}
+
+function toDesktopSharedRealtimeEvent(
+  event: ServerSharedProjectRealtimeEvent
+): SharedProjectRealtimeEvent {
+  if (event.type === "presence.updated") {
+    return {
+      type: event.type,
+      projectId: event.projectId,
+      presence: toSharedProjectPresenceSummary(event.presence)
+    };
+  }
+
+  return event as SharedProjectRealtimeEvent;
+}
+
+function getSharedDocumentSessionKey(projectId: string, path: string): string {
+  return `${projectId}\0${path}`;
+}
+
+function clearSharedDocumentSessions(): void {
+  sharedDocumentSessions.clear();
+}
+
+async function getSharedDocumentSession(
+  projectId: string,
+  path: string
+): Promise<SharedProjectDocumentSession> {
+  const sessionKey = getSharedDocumentSessionKey(projectId, path);
+  const existingSession = sharedDocumentSessions.get(sessionKey);
+  if (existingSession !== undefined) {
+    return existingSession;
+  }
+
+  const session = await SharedProjectDocumentSession.open(
+    requireSharedProjectClient(),
+    projectId,
+    path
+  );
+  sharedDocumentSessions.set(sessionKey, session);
+  return session;
+}
+
+function createRemoteTextOperations(
+  beforeContents: string,
+  afterContents: string
+): readonly SharedProjectDocumentTextOperation[] {
+  if (beforeContents === afterContents) {
+    return [];
+  }
+
+  let sharedPrefixLength = 0;
+  while (
+    sharedPrefixLength < beforeContents.length &&
+    sharedPrefixLength < afterContents.length &&
+    beforeContents.charCodeAt(sharedPrefixLength) ===
+      afterContents.charCodeAt(sharedPrefixLength)
+  ) {
+    sharedPrefixLength += 1;
+  }
+
+  let beforeSuffixOffset = beforeContents.length;
+  let afterSuffixOffset = afterContents.length;
+  while (
+    beforeSuffixOffset > sharedPrefixLength &&
+    afterSuffixOffset > sharedPrefixLength &&
+    beforeContents.charCodeAt(beforeSuffixOffset - 1) ===
+      afterContents.charCodeAt(afterSuffixOffset - 1)
+  ) {
+    beforeSuffixOffset -= 1;
+    afterSuffixOffset -= 1;
+  }
+
+  return [
+    {
+      rangeOffset: sharedPrefixLength,
+      rangeLength: beforeSuffixOffset - sharedPrefixLength,
+      text: afterContents.slice(sharedPrefixLength, afterSuffixOffset)
+    }
+  ];
+}
+
+function getActiveSharedProject(projectRoot: string) {
+  return activeSharedProject?.localCachePath === projectRoot
+    ? activeSharedProject
+    : undefined;
+}
+
+async function refreshProjectThroughActiveBackend(projectRoot: string) {
+  const sharedProject = getActiveSharedProject(projectRoot);
+
+  if (sharedProject === undefined) {
+    const project = await refreshProject(projectRoot, getProjectMetadataStore());
+    startProjectWatcher(project.project.rootPath);
+    return project;
+  }
+
+  const client = requireSharedProjectClient();
+  const [materialized, serverProject] = await Promise.all([
+    getSharedProjectCache().materializeProject(client, sharedProject.projectId),
+    client.getProject(sharedProject.projectId)
+  ]);
+
+  if (serverProject.mainFilePath !== undefined) {
+    await setProjectMainFile(
+      materialized.workingPath,
+      getProjectMetadataStore(),
+      serverProject.mainFilePath
+    );
+  }
+
+  activeSharedProject = {
+    projectId: sharedProject.projectId,
+    localCachePath: materialized.workingPath
+  };
+  clearSharedDocumentSessions();
+
+  const project = await refreshProject(
+    materialized.workingPath,
+    getProjectMetadataStore()
+  );
+  startProjectWatcher(project.project.rootPath);
+  return project;
+}
+
+async function setProjectMainFileThroughActiveBackend(
+  projectRoot: string,
+  path: string
+) {
+  const sharedProject = getActiveSharedProject(projectRoot);
+
+  if (sharedProject === undefined) {
+    return setProjectMainFile(projectRoot, getProjectMetadataStore(), path);
+  }
+
+  await requireSharedProjectClient().updateProjectSettings(sharedProject.projectId, {
+    mainFilePath: path
+  });
+  return refreshProjectThroughActiveBackend(projectRoot);
+}
+
+function assertAgentProjectContextMatchesActiveProject(request: AgentStartRequest) {
+  const activeProject = getActiveSharedProject(request.projectRoot);
+
+  if (activeProject !== undefined && request.projectContext === undefined) {
+    throw new Error("Shared agent requests must include shared project context.");
+  }
+
+  if (request.projectContext === undefined) {
+    return;
+  }
+
+  if (
+    activeProject === undefined ||
+    request.projectContext.sharedProjectId !== activeProject.projectId ||
+    request.projectContext.localCachePath !== activeProject.localCachePath
+  ) {
+    throw new Error("Shared agent context does not match the active shared project.");
+  }
+
+  if (request.projectContext.role === "viewer" && request.mode !== "read-only") {
+    throw new Error("Shared viewers can only start read-only agent sessions.");
+  }
+}
+
+async function readProjectFileThroughActiveBackend(
+  projectRoot: string,
+  path: string
+): Promise<ProjectFileSnapshot> {
+  const sharedProject = getActiveSharedProject(projectRoot);
+
+  if (sharedProject === undefined) {
+    return await readProjectFile(projectRoot, path);
+  }
+
+  const revision = await requireSharedProjectClient().readFile(
+    sharedProject.projectId,
+    path
+  );
+  const syncResult = await writeSharedDocumentRevisionToActiveCache({ revision });
+
+  return {
+    path: revision.path,
+    contents: revision.contents,
+    mtimeMs: syncResult.mtimeMs
+  };
+}
+
+async function writeProjectFileThroughActiveBackend(
+  projectRoot: string,
+  path: string,
+  contents: string
+) {
+  const sharedProject = getActiveSharedProject(projectRoot);
+
+  if (sharedProject !== undefined) {
+    const cache = getSharedProjectCache();
+    const expectedRevisionId = await cache.getCachedRevisionId(
+      sharedProject.projectId,
+      path
+    );
+    const revision = isSharedProjectCollaborativeDocumentPath(path)
+      ? (
+          await requireSharedProjectClient().replaceDocumentContents(
+            sharedProject.projectId,
+            path,
+            contents,
+            expectedRevisionId
+          )
+        ).revision
+      : await requireSharedProjectClient().writeFile(
+          sharedProject.projectId,
+          path,
+          contents,
+          expectedRevisionId
+        );
+    await cache.recordFileRevision(sharedProject.projectId, revision.path, revision.id);
+    sharedDocumentSessions.delete(
+      getSharedDocumentSessionKey(sharedProject.projectId, path)
+    );
+  }
+
+  return await writeProjectFile(projectRoot, path, contents);
+}
+
+async function deleteProjectEntryThroughActiveBackend(
+  projectRoot: string,
+  path: string
+) {
+  const sharedProject = getActiveSharedProject(projectRoot);
+
+  if (sharedProject !== undefined) {
+    const deletedPaths = await requireSharedProjectClient().deleteEntry(
+      sharedProject.projectId,
+      path
+    );
+    await refreshProjectThroughActiveBackend(projectRoot);
+    return {
+      deletedPath: path,
+      backupPath: `shared-project:${sharedProject.projectId}:${deletedPaths.join(",")}`,
+      deletedAt: new Date().toISOString()
+    };
+  }
+
+  return await deleteProjectEntry(projectRoot, path);
+}
+
+async function moveProjectEntryThroughActiveBackend(
+  projectRoot: string,
+  fromPath: string,
+  toPath: string
+) {
+  const sharedProject = getActiveSharedProject(projectRoot);
+
+  if (sharedProject !== undefined) {
+    await requireSharedProjectClient().moveEntry(
+      sharedProject.projectId,
+      fromPath,
+      toPath
+    );
+    await refreshProjectThroughActiveBackend(projectRoot);
+    return;
+  }
+
+  await moveProjectEntry(projectRoot, fromPath, toPath);
+}
+
+async function syncHistoryChangeSetToActiveSharedBackend(
+  history: {
+    getChangeSetWithContents: (changesetId: string) => {
+      readonly projectRoot: string;
+      readonly filePath: string;
+      readonly afterContents: string;
+      readonly id: string;
+    };
+    rollbackChangeSet: (changesetId: string) => Promise<unknown>;
+  },
+  changesetId: string
+): Promise<void> {
+  const changeset = history.getChangeSetWithContents(changesetId);
+  const sharedProject = getActiveSharedProject(changeset.projectRoot);
+
+  if (sharedProject === undefined) {
+    return;
+  }
+
+  const expectedRevisionId = await getSharedProjectCache().getCachedRevisionId(
+    sharedProject.projectId,
+    changeset.filePath
+  );
+  try {
+    const result = await requireSharedProjectClient().replaceDocumentContents(
+      sharedProject.projectId,
+      changeset.filePath,
+      changeset.afterContents,
+      expectedRevisionId
+    );
+    await writeSharedDocumentRevisionToActiveCache(result);
+  } catch (error) {
+    if (isSharedRevisionConflict(error)) {
+      await history.rollbackChangeSet(changeset.id);
+      await refreshProjectThroughActiveBackend(changeset.projectRoot);
+    }
+
+    throw error;
+  }
+}
+
+function isSharedRevisionConflict(error: unknown): boolean {
+  return (
+    error instanceof SharedProjectClientError &&
+    error.status === 409 &&
+    error.code === "revision-conflict"
+  );
+}
+
+function joinProjectEntryPath(parentPath: string, name: string) {
+  return parentPath === "." ? name : `${parentPath.replace(/\/+$/u, "")}/${name}`;
 }
 
 function getHistoryDbPath() {
@@ -401,11 +1903,9 @@ function startProjectWatcher(projectRoot: string) {
   activeProjectWatcher?.close();
   projectChangeDebouncer?.dispose();
   activeProjectRoot = projectRoot;
-  const debouncer = new ProjectChangeDebouncer(projectRoot, (event) => {
-    BrowserWindow.getAllWindows().forEach((window) => {
-      window.webContents.send(ipcChannels.projectChanged, event);
-    });
-  });
+  const debouncer = new ProjectChangeDebouncer(projectRoot, (event) =>
+    dispatchProjectChange(event.projectRoot, event.paths)
+  );
   projectChangeDebouncer = debouncer;
 
   try {
@@ -421,6 +1921,15 @@ function startProjectWatcher(projectRoot: string) {
     debouncer.dispose();
     projectChangeDebouncer = undefined;
   }
+}
+
+function dispatchProjectChange(projectRoot: string, paths: readonly string[]): void {
+  BrowserWindow.getAllWindows().forEach((window) => {
+    window.webContents.send(ipcChannels.projectChanged, {
+      projectRoot,
+      paths
+    });
+  });
 }
 
 async function readEditorProjectState(
@@ -1233,26 +2742,48 @@ function registerIpcHandlers() {
     }
 
     const project = await openProject(result.filePaths[0], getProjectMetadataStore());
+    activeSharedProject = undefined;
+    clearSharedDocumentSessions();
     startProjectWatcher(project.project.rootPath);
     return project;
   });
 
   handleIpc(ipcChannels.projectOpenRecent, async (_event, request) => {
     const project = await openProject(request.rootPath, getProjectMetadataStore());
+    activeSharedProject = undefined;
+    clearSharedDocumentSessions();
     startProjectWatcher(project.project.rootPath);
     return project;
   });
 
+  handleIpc(ipcChannels.projectClearRecent, async () => ({
+    recentProjects: await getProjectMetadataStore().clearRecentProjects()
+  }));
+
   handleIpc(ipcChannels.projectRefresh, async (_event, request) => {
-    const project = await refreshProject(
-      request.projectRoot,
-      getProjectMetadataStore()
-    );
-    startProjectWatcher(project.project.rootPath);
-    return project;
+    return refreshProjectThroughActiveBackend(request.projectRoot);
   });
 
   handleIpc(ipcChannels.projectCreateEntry, async (_event, request) => {
+    const sharedProject = getActiveSharedProject(request.projectRoot);
+
+    if (sharedProject !== undefined) {
+      const path = joinProjectEntryPath(request.parentPath, request.name);
+      if (request.kind === "directory") {
+        await requireSharedProjectClient().createDirectory(
+          sharedProject.projectId,
+          path
+        );
+      } else {
+        await requireSharedProjectClient().createFile(
+          sharedProject.projectId,
+          path,
+          ""
+        );
+      }
+      return refreshProjectThroughActiveBackend(request.projectRoot);
+    }
+
     await createProjectEntry(
       request.projectRoot,
       request.parentPath,
@@ -1263,31 +2794,731 @@ function registerIpcHandlers() {
   });
 
   handleIpc(ipcChannels.projectRenameEntry, async (_event, request) => {
+    const sharedProject = getActiveSharedProject(request.projectRoot);
+    if (sharedProject !== undefined) {
+      await requireSharedProjectClient().renameEntry(
+        sharedProject.projectId,
+        request.path,
+        request.newName
+      );
+      return refreshProjectThroughActiveBackend(request.projectRoot);
+    }
     await renameProjectEntry(request.projectRoot, request.path, request.newName);
     return refreshProject(request.projectRoot, getProjectMetadataStore());
   });
 
   handleIpc(ipcChannels.projectMoveEntry, async (_event, request) => {
+    const sharedProject = getActiveSharedProject(request.projectRoot);
+    if (sharedProject !== undefined) {
+      await requireSharedProjectClient().moveEntry(
+        sharedProject.projectId,
+        request.path,
+        request.newPath
+      );
+      return refreshProjectThroughActiveBackend(request.projectRoot);
+    }
     await moveProjectEntry(request.projectRoot, request.path, request.newPath);
     return refreshProject(request.projectRoot, getProjectMetadataStore());
   });
 
   handleIpc(ipcChannels.projectDeleteEntry, async (_event, request) => {
+    const sharedProject = getActiveSharedProject(request.projectRoot);
+    if (sharedProject !== undefined) {
+      const deletedPaths = await requireSharedProjectClient().deleteEntry(
+        sharedProject.projectId,
+        request.path
+      );
+      const result = await refreshProjectThroughActiveBackend(request.projectRoot);
+      return {
+        ...result,
+        deletedEntry: {
+          deletedPath: request.path,
+          backupPath: `shared-project:${sharedProject.projectId}:${deletedPaths.join(
+            ","
+          )}`,
+          deletedAt: new Date().toISOString()
+        }
+      };
+    }
     const deletedEntry = await deleteProjectEntry(request.projectRoot, request.path);
     const result = await refreshProject(request.projectRoot, getProjectMetadataStore());
     return { ...result, deletedEntry };
   });
 
-  handleIpc(ipcChannels.projectSetMainFile, (_event, request) =>
-    setProjectMainFile(request.projectRoot, getProjectMetadataStore(), request.path)
+  handleIpc(ipcChannels.projectSetMainFile, async (_event, request) => {
+    return setProjectMainFileThroughActiveBackend(request.projectRoot, request.path);
+  });
+
+  handleIpc(ipcChannels.sharedGetConnection, () => restoreSharedProjectConnection());
+
+  handleIpc(ipcChannels.sharedSignIn, async (_event, request) => {
+    const client = createSharedProjectClient({ baseUrl: request.baseUrl });
+    const result = await client.signIn(request.email, request.name);
+    sharedProjectClient = client;
+    sharedProjectConnection = toSharedProjectConnection(request.baseUrl, result.user);
+    await writePersistedSharedProjectSession({
+      baseUrl: request.baseUrl,
+      refreshToken: result.refreshToken,
+      user: result.user
+    });
+
+    return sharedProjectConnection;
+  });
+
+  handleIpc(ipcChannels.sharedSignOut, async () => {
+    const client = sharedProjectClient;
+    await stopSharedRealtimeSession();
+    clearSharedDocumentSessions();
+    activeSharedProject = undefined;
+    sharedProjectClient = undefined;
+    sharedProjectConnection = { connected: false };
+    await clearPersistedSharedProjectSession();
+
+    try {
+      await client?.signOut();
+    } catch {
+      // Local sign-out must still clear credentials if the remote session is stale.
+    }
+
+    return sharedProjectConnection;
+  });
+
+  handleIpc(ipcChannels.sharedListSessions, async () =>
+    (await requireSharedProjectClient().listSessions()).map(
+      toSharedProjectSessionSummary
+    )
   );
+
+  handleIpc(ipcChannels.sharedRevokeSession, async (_event, request) =>
+    requireSharedProjectClient().revokeSession(request.sessionId)
+  );
+
+  handleIpc(ipcChannels.sharedListProjects, async () =>
+    (await requireSharedProjectClient().listProjects()).map(toSharedProjectSummary)
+  );
+
+  handleIpc(ipcChannels.sharedCreateProject, async (_event, request) =>
+    toSharedProjectSummary({
+      ...(await requireSharedProjectClient().createProject(request)),
+      role: "owner"
+    })
+  );
+
+  handleIpc(ipcChannels.sharedUpdateProjectSettings, async (_event, request) => {
+    const { projectId, ...settings } = request;
+    const [project, projects] = await Promise.all([
+      requireSharedProjectClient().updateProjectSettings(projectId, settings),
+      requireSharedProjectClient().listProjects()
+    ]);
+    const role = projects.find((candidate) => candidate.id === projectId)?.role;
+    return toSharedProjectSummary({
+      ...project,
+      ...(role === undefined ? {} : { role })
+    });
+  });
+
+  handleIpc(ipcChannels.sharedCreateFromLocalProject, async (_event, request) => {
+    const sourceFiles = await collectSharedProjectSourceFiles({
+      projectRoot: request.projectRoot
+    });
+
+    if (sourceFiles.files.length === 0) {
+      throw new Error("No shareable UTF-8 source files were found in this project.");
+    }
+
+    const localProject = await openProject(
+      request.projectRoot,
+      getProjectMetadataStore()
+    );
+    const mainFilePath =
+      localProject.project.mainFilePath !== undefined &&
+      sourceFiles.files.some((file) => file.path === localProject.project.mainFilePath)
+        ? localProject.project.mainFilePath
+        : undefined;
+    const project = await requireSharedProjectClient().createProject({
+      name: request.name,
+      ...(mainFilePath === undefined ? {} : { mainFilePath }),
+      directories: sourceFiles.directories,
+      files: sourceFiles.files
+    });
+
+    return {
+      project: toSharedProjectSummary({ ...project, role: "owner" }),
+      importedFileCount: sourceFiles.files.length,
+      importedDirectoryCount: sourceFiles.directories.length,
+      skippedFilePaths: sourceFiles.skippedFilePaths
+    };
+  });
+
+  handleIpc(ipcChannels.sharedCreateFromSourceZip, async (event, request) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const zipDialogOptions: OpenDialogOptions = {
+      title: "Import ZIP as Shared Project",
+      properties: ["openFile"],
+      filters: [{ name: "ZIP Archives", extensions: ["zip"] }]
+    };
+    const zipResult =
+      window === null
+        ? await dialog.showOpenDialog(zipDialogOptions)
+        : await dialog.showOpenDialog(window, zipDialogOptions);
+
+    if (zipResult.canceled || zipResult.filePaths[0] === undefined) {
+      return undefined;
+    }
+
+    const requestedName = request.name?.trim();
+    const tempParentPath = await mkdtemp(join(tmpdir(), "zeroleaf-shared-zip-"));
+    try {
+      const imported = await importProjectZip({
+        zipPath: zipResult.filePaths[0],
+        destinationParentPath: tempParentPath,
+        ...(requestedName === undefined || requestedName.length === 0
+          ? {}
+          : { projectName: requestedName })
+      });
+      const sourceFiles = await collectSharedProjectSourceFiles({
+        projectRoot: imported.projectRoot
+      });
+
+      if (sourceFiles.files.length === 0) {
+        throw new Error("No shareable source files were found in this ZIP archive.");
+      }
+
+      const mainFilePath = await detectShareableMainFilePath(
+        imported.projectRoot,
+        sourceFiles.files
+      );
+      const project = await requireSharedProjectClient().createProject({
+        name:
+          requestedName === undefined || requestedName.length === 0
+            ? basename(imported.projectRoot)
+            : requestedName,
+        ...(mainFilePath === undefined ? {} : { mainFilePath }),
+        directories: sourceFiles.directories,
+        files: sourceFiles.files
+      });
+
+      return {
+        project: toSharedProjectSummary({ ...project, role: "owner" }),
+        importedFileCount: sourceFiles.files.length,
+        importedDirectoryCount: sourceFiles.directories.length,
+        skippedFilePaths: sourceFiles.skippedFilePaths
+      };
+    } finally {
+      await rm(tempParentPath, { recursive: true, force: true });
+    }
+  });
+
+  handleIpc(ipcChannels.sharedDeleteProject, async (_event, request) => {
+    const deletedProject = await requireSharedProjectClient().deleteProject(
+      request.projectId
+    );
+    if (activeSharedProject?.projectId === request.projectId) {
+      activeSharedProject = undefined;
+      clearSharedDocumentSessions();
+      await stopSharedRealtimeSession(request.projectId);
+    }
+
+    return toSharedProjectSummary({ ...deletedProject, role: "owner" });
+  });
+
+  handleIpc(ipcChannels.sharedExportSourceZip, async (event, request) => {
+    const sourceExport = await requireSharedProjectClient().exportProjectSource(
+      request.projectId
+    );
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const defaultPath = join(
+      app.getPath("downloads"),
+      `${toSafeExportFileBaseName(sourceExport.project.name)}-shared-source.zip`
+    );
+    const dialogOptions = {
+      title: "Export Shared Source ZIP",
+      defaultPath,
+      filters: [{ name: "ZIP Archives", extensions: ["zip"] }]
+    };
+    const result =
+      window === null
+        ? await dialog.showSaveDialog(dialogOptions)
+        : await dialog.showSaveDialog(window, dialogOptions);
+
+    if (result.canceled || result.filePath === undefined) {
+      return undefined;
+    }
+
+    const tempRoot = await mkdtemp(join(tmpdir(), "zeroleaf-shared-export-"));
+    try {
+      await writeSharedProjectSourceExportFiles(
+        tempRoot,
+        sourceExport.files,
+        sourceExport.directories
+      );
+      return await exportSourceZip({
+        projectRoot: tempRoot,
+        destinationPath: result.filePath,
+        includeBuildArtifacts: false
+      });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  handleIpc(ipcChannels.sharedOpenProject, async (_event, request) => {
+    const client = requireSharedProjectClient();
+    const [materialized, sharedProject, sharedProjects] = await Promise.all([
+      getSharedProjectCache().materializeProject(client, request.projectId),
+      client.getProject(request.projectId),
+      client.listProjects()
+    ]);
+    const role =
+      sharedProjects.find((project) => project.id === request.projectId)?.role ??
+      "viewer";
+    if (sharedProject.mainFilePath !== undefined) {
+      await setProjectMainFile(
+        materialized.workingPath,
+        getProjectMetadataStore(),
+        sharedProject.mainFilePath
+      );
+    }
+    const project = await openProject(
+      materialized.workingPath,
+      getProjectMetadataStore()
+    );
+    activeSharedProject = {
+      projectId: request.projectId,
+      localCachePath: materialized.workingPath
+    };
+    clearSharedDocumentSessions();
+    startProjectWatcher(project.project.rootPath);
+
+    return {
+      ...project,
+      sharedProjectId: request.projectId,
+      localCachePath: materialized.workingPath,
+      role,
+      ...(sharedProject.compiler === undefined
+        ? {}
+        : { compiler: sharedProject.compiler })
+    };
+  });
+
+  handleIpc(ipcChannels.sharedStartRealtime, async (_event, request) =>
+    startSharedRealtimeSession(request.projectId)
+  );
+
+  handleIpc(ipcChannels.sharedStopRealtime, async (_event, request) =>
+    stopSharedRealtimeSession(request.projectId)
+  );
+
+  handleIpc(ipcChannels.sharedInvite, async (_event, request) =>
+    toSharedProjectInvitationSummary(
+      await requireSharedProjectClient().invite(
+        request.projectId,
+        request.email,
+        request.role
+      )
+    )
+  );
+
+  handleIpc(ipcChannels.sharedAcceptInvitation, async (_event, request) =>
+    toSharedProjectMemberSummary(
+      await requireSharedProjectClient().acceptInvitation(request.invitationId)
+    )
+  );
+
+  handleIpc(ipcChannels.sharedListMembers, async (_event, request) =>
+    (await requireSharedProjectClient().listMembers(request.projectId)).map(
+      toSharedProjectMemberSummary
+    )
+  );
+
+  handleIpc(ipcChannels.sharedUpdateMemberRole, async (_event, request) =>
+    toSharedProjectMemberSummary(
+      await requireSharedProjectClient().updateMemberRole(
+        request.projectId,
+        request.userId,
+        request.role
+      )
+    )
+  );
+
+  handleIpc(ipcChannels.sharedTransferOwnership, async (_event, request) =>
+    (
+      await requireSharedProjectClient().transferOwnership(
+        request.projectId,
+        request.userId
+      )
+    ).map(toSharedProjectMemberSummary)
+  );
+
+  handleIpc(ipcChannels.sharedRemoveMember, async (_event, request) =>
+    toSharedProjectMemberSummary(
+      await requireSharedProjectClient().removeMember(request.projectId, request.userId)
+    )
+  );
+
+  handleIpc(ipcChannels.sharedListPresence, async (_event, request) =>
+    (await requireSharedProjectClient().listPresence(request.projectId)).map(
+      toSharedProjectPresenceSummary
+    )
+  );
+
+  handleIpc(ipcChannels.sharedUpdatePresence, async (_event, request) =>
+    toSharedProjectPresenceSummary(
+      await requireSharedProjectClient().updatePresence(request.projectId, {
+        ...(request.filePath === undefined ? {} : { filePath: request.filePath }),
+        ...(request.cursorLine === undefined ? {} : { cursorLine: request.cursorLine }),
+        ...(request.cursorColumn === undefined
+          ? {}
+          : { cursorColumn: request.cursorColumn })
+      })
+    )
+  );
+
+  handleIpc(ipcChannels.sharedListActivity, async (_event, request) =>
+    (await requireSharedProjectClient().listActivity(request.projectId))
+      .map(toSharedProjectActivitySummary)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  );
+
+  handleIpc(ipcChannels.sharedListComments, async (_event, request) =>
+    (await requireSharedProjectClient().listComments(request.projectId))
+      .map(toSharedProjectCommentSummary)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  );
+
+  handleIpc(ipcChannels.sharedCreateComment, async (_event, request) =>
+    toSharedProjectCommentSummary(
+      await requireSharedProjectClient().createComment(request.projectId, {
+        body: request.body,
+        ...(request.filePath === undefined ? {} : { filePath: request.filePath }),
+        ...(request.line === undefined ? {} : { line: request.line })
+      })
+    )
+  );
+
+  handleIpc(ipcChannels.sharedResolveComment, async (_event, request) =>
+    toSharedProjectCommentSummary(
+      await requireSharedProjectClient().resolveComment(
+        request.projectId,
+        request.commentId
+      )
+    )
+  );
+
+  handleIpc(ipcChannels.sharedListAuditEvents, async (_event, request) =>
+    (await requireSharedProjectClient().listAuditEvents(request.projectId))
+      .map(toSharedProjectAuditEventSummary)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  );
+
+  handleIpc(ipcChannels.sharedPublishAgentRun, async (_event, request) => {
+    const client = requireSharedProjectClient();
+    const agentRun =
+      request.agentRunId === undefined
+        ? await client.createAgentRun(request.projectId, {
+            providerId: request.providerId,
+            mode: request.mode,
+            prompt: request.prompt,
+            status: request.status,
+            ...(request.buildArtifactIds === undefined
+              ? {}
+              : { buildArtifactIds: request.buildArtifactIds })
+          })
+        : await client.updateAgentRunStatus(request.projectId, request.agentRunId, {
+            status: "running"
+          });
+    const history = getHistoryStore();
+
+    try {
+      const changesets = [];
+      for (const localChangeSetId of request.changesetIds) {
+        const localChangeSet = history.getChangeSetWithContents(localChangeSetId);
+        const beforeRevisionId = await getSharedProjectCache().getCachedRevisionId(
+          request.projectId,
+          localChangeSet.filePath
+        );
+        const sharedChangeSet = await client.createChangeSet(request.projectId, {
+          agentRunId: agentRun.id,
+          filePath: localChangeSet.filePath,
+          ...(beforeRevisionId === undefined ? {} : { beforeRevisionId }),
+          beforeContents: localChangeSet.beforeContents,
+          afterContents: localChangeSet.afterContents,
+          summary: localChangeSet.summary
+        });
+
+        changesets.push({
+          ...toSharedProjectAgentChangeSetSummary(sharedChangeSet),
+          localChangeSetId
+        });
+      }
+
+      let updatedAgentRun = agentRun;
+      if (request.agentRunId !== undefined) {
+        for (const artifactId of request.buildArtifactIds ?? []) {
+          updatedAgentRun = await client.attachBuildArtifactToAgentRun(
+            request.projectId,
+            request.agentRunId,
+            { artifactId }
+          );
+        }
+
+        updatedAgentRun = await client.updateAgentRunStatus(
+          request.projectId,
+          request.agentRunId,
+          {
+            status:
+              request.changesetIds.length === 0 ? request.status : "waiting-for-review"
+          }
+        );
+      }
+
+      return {
+        agentRun: toSharedProjectAgentRunSummary(updatedAgentRun),
+        changesets
+      };
+    } finally {
+      history.close();
+    }
+  });
+
+  handleIpc(ipcChannels.sharedUpdateAgentRunStatus, async (_event, request) =>
+    toSharedProjectAgentRunSummary(
+      await requireSharedProjectClient().updateAgentRunStatus(
+        request.projectId,
+        request.agentRunId,
+        { status: request.status }
+      )
+    )
+  );
+
+  handleIpc(ipcChannels.sharedListAgentRuns, async (_event, request) =>
+    (await requireSharedProjectClient().listAgentRuns(request.projectId))
+      .map(toSharedProjectAgentRunSummary)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  );
+
+  handleIpc(ipcChannels.sharedListAgentChangeSets, async (_event, request) =>
+    (await requireSharedProjectClient().listChangeSets(request.projectId))
+      .map(toSharedProjectAgentChangeSetSummary)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  );
+
+  handleIpc(ipcChannels.sharedApplyAgentChangeSet, async (_event, request) => {
+    const client = requireSharedProjectClient();
+    const changeset = await client.applyChangeSet(
+      request.projectId,
+      request.changesetId
+    );
+    const revision = await client.readFile(request.projectId, changeset.filePath);
+    const fileRevision = await writeSharedDocumentRevisionToActiveCache({
+      revision: {
+        projectId: revision.projectId,
+        path: revision.path,
+        contents: revision.contents,
+        id: revision.id
+      }
+    });
+
+    return {
+      changeset: toSharedProjectAgentChangeSetSummary(changeset),
+      fileRevision
+    };
+  });
+
+  handleIpc(ipcChannels.sharedRejectAgentChangeSet, async (_event, request) =>
+    toSharedProjectAgentChangeSetSummary(
+      await requireSharedProjectClient().rejectChangeSet(
+        request.projectId,
+        request.changesetId
+      )
+    )
+  );
+
+  handleIpc(ipcChannels.sharedListBuildArtifacts, async (_event, request) =>
+    (await requireSharedProjectClient().listBuildArtifacts(request.projectId))
+      .map(toSharedProjectBuildArtifactSummary)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  );
+
+  handleIpc(ipcChannels.sharedGetBuildArtifact, async (_event, request) =>
+    toSharedProjectBuildArtifactDetails(
+      await requireSharedProjectClient().getBuildArtifact(
+        request.projectId,
+        request.artifactId
+      )
+    )
+  );
+
+  handleIpc(ipcChannels.sharedPublishBuildArtifact, async (_event, request) => {
+    if (request.buildResult.status === "running") {
+      throw new Error("Cannot publish a running build artifact.");
+    }
+
+    const client = requireSharedProjectClient();
+    const sourceRevisionId =
+      request.sourceRevisionId ??
+      (await client.readFile(request.projectId, request.mainFilePath)).id;
+    const toolchain = await detectLatexToolchain();
+    const pdfBase64 =
+      request.buildResult.status === "succeeded" &&
+      request.buildResult.artifact !== undefined
+        ? await readOptionalBuildPdfBase64(
+            request.projectRoot,
+            request.buildResult.artifact.pdfPath
+          )
+        : undefined;
+    const artifact = await client.uploadBuildArtifact(request.projectId, {
+      sourceRevisionId,
+      desktopClientId: await getSharedDesktopClientId(),
+      compiler: request.buildResult.compiler,
+      ...(toolchain.compilerVersions?.[request.buildResult.compiler] === undefined
+        ? {}
+        : {
+            engineVersion: toolchain.compilerVersions[request.buildResult.compiler]
+          }),
+      ...(toolchain.latexmkVersion === undefined
+        ? {}
+        : { latexmkVersion: toolchain.latexmkVersion }),
+      status: request.buildResult.status,
+      platform: process.platform,
+      rawLog: request.buildResult.rawLog,
+      diagnostics: request.buildResult.diagnostics.map((diagnostic) => ({
+        severity: diagnostic.severity,
+        message: diagnostic.message,
+        ...(diagnostic.filePath === undefined ? {} : { filePath: diagnostic.filePath }),
+        ...(diagnostic.line === undefined ? {} : { line: diagnostic.line })
+      })),
+      ...(pdfBase64 === undefined
+        ? {}
+        : {
+            pdfBase64,
+            pdfByteLength: Buffer.byteLength(pdfBase64, "base64")
+          })
+    });
+
+    return toSharedProjectBuildArtifactSummary(artifact);
+  });
+
+  handleIpc(ipcChannels.sharedAttachAgentRunBuildArtifact, async (_event, request) =>
+    toSharedProjectAgentRunSummary(
+      await requireSharedProjectClient().attachBuildArtifactToAgentRun(
+        request.projectId,
+        request.agentRunId,
+        { artifactId: request.artifactId }
+      )
+    )
+  );
+
+  handleIpc(ipcChannels.sharedGetFileRevision, async (_event, request) => {
+    const revision = await requireSharedProjectClient().readFile(
+      request.projectId,
+      request.path
+    );
+
+    return {
+      projectId: revision.projectId,
+      path: revision.path,
+      revisionId: revision.id
+    };
+  });
+
+  handleIpc(ipcChannels.sharedListFileRevisions, async (_event, request) =>
+    requireSharedProjectClient().listFileRevisions(request.projectId, request.path)
+  );
+
+  handleIpc(ipcChannels.sharedGetFileRevisionDetails, async (_event, request) =>
+    toSharedProjectFileRevisionDetails(
+      await requireSharedProjectClient().getFileRevision(
+        request.projectId,
+        request.revisionId
+      )
+    )
+  );
+
+  handleIpc(ipcChannels.sharedRestoreFileRevision, async (_event, request) => {
+    const revision = await requireSharedProjectClient().restoreFileRevision(
+      request.projectId,
+      request.revisionId
+    );
+
+    return writeSharedDocumentRevisionToActiveCache({
+      revision: {
+        projectId: revision.projectId,
+        path: revision.path,
+        contents: revision.contents,
+        id: revision.id
+      }
+    });
+  });
+
+  handleIpc(ipcChannels.sharedSyncDocumentContents, async (_event, request) => {
+    const cache = getSharedProjectCache();
+    const result = await requireSharedProjectClient().replaceDocumentContents(
+      request.projectId,
+      request.path,
+      request.contents,
+      await cache.getCachedRevisionId(request.projectId, request.path)
+    );
+    sharedDocumentSessions.delete(
+      getSharedDocumentSessionKey(request.projectId, request.path)
+    );
+
+    return writeSharedDocumentRevisionToActiveCache(result);
+  });
+
+  handleIpc(ipcChannels.sharedApplyDocumentTextOperations, async (_event, request) => {
+    const session = await getSharedDocumentSession(request.projectId, request.path);
+    const result = await session.applyTextOperations(
+      request.operations,
+      request.clientOperationId
+    );
+
+    return writeSharedDocumentRevisionToActiveCache(result);
+  });
+
+  handleIpc(ipcChannels.sharedPullDocumentContents, async (_event, request) => {
+    const session = await getSharedDocumentSession(request.projectId, request.path);
+    const beforeContents = session.contents;
+    const feed = await session.pullRemoteUpdates(request.afterUpdateId);
+    const remoteTextOperations = createRemoteTextOperations(
+      beforeContents,
+      session.contents
+    );
+    const state = feed.state;
+    const revision =
+      state.revisionId === undefined
+        ? await requireSharedProjectClient().writeFile(
+            request.projectId,
+            request.path,
+            session.contents
+          )
+        : await requireSharedProjectClient().readFile(request.projectId, request.path);
+
+    return writeSharedDocumentRevisionToActiveCache({
+      revision: {
+        projectId: revision.projectId,
+        path: revision.path,
+        contents: session.contents,
+        id: revision.id
+      },
+      ...(session.updateCursor === undefined
+        ? {}
+        : { update: { id: session.updateCursor } }),
+      remoteUpdateCount: feed.updates.length,
+      remoteTextOperations
+    });
+  });
 
   handleIpc(ipcChannels.fileRead, (_event, request) =>
     readProjectFile(request.projectRoot, request.path)
   );
 
   handleIpc(ipcChannels.fileWrite, (_event, request) =>
-    writeProjectFile(request.projectRoot, request.path, request.contents)
+    writeProjectFileThroughActiveBackend(
+      request.projectRoot,
+      request.path,
+      request.contents
+    )
   );
 
   handleIpc(ipcChannels.wordRead, (_event, request) =>
@@ -1347,6 +3578,26 @@ function registerIpcHandlers() {
     } finally {
       history.close();
     }
+  });
+
+  handleIpc(ipcChannels.onlyOfficeGetStatus, async () => {
+    await configureOnlyOfficeBridge();
+    return onlyOfficeBridge.getStatus();
+  });
+
+  handleIpc(ipcChannels.onlyOfficeCreateSession, async (_event, request) => {
+    await configureOnlyOfficeBridge();
+    return onlyOfficeBridge.createEditorSession(request);
+  });
+
+  handleIpc(ipcChannels.onlyOfficeForceSave, async (_event, request) => {
+    await configureOnlyOfficeBridge();
+    return onlyOfficeBridge.forceSave(request.sessionId);
+  });
+
+  handleIpc(ipcChannels.onlyOfficeExportPdf, async (_event, request) => {
+    await configureOnlyOfficeBridge();
+    return onlyOfficeBridge.exportPdf(request.sessionId);
   });
 
   handleIpc(ipcChannels.buildDetectToolchain, () => detectLatexToolchain());
@@ -1413,7 +3664,9 @@ function registerIpcHandlers() {
   handleIpc(ipcChannels.historyApplyChangeSet, async (_event, request) => {
     const history = getHistoryStore();
     try {
-      return await history.applyChangeSet(request.changesetId);
+      const changeset = await history.applyChangeSet(request.changesetId);
+      await syncHistoryChangeSetToActiveSharedBackend(history, changeset.id);
+      return changeset;
     } finally {
       history.close();
     }
@@ -1422,7 +3675,9 @@ function registerIpcHandlers() {
   handleIpc(ipcChannels.historyApplyChangeSetHunks, async (_event, request) => {
     const history = getHistoryStore();
     try {
-      return await history.applyChangeSetHunks(request);
+      const changeset = await history.applyChangeSetHunks(request);
+      await syncHistoryChangeSetToActiveSharedBackend(history, changeset.id);
+      return changeset;
     } finally {
       history.close();
     }
@@ -1607,6 +3862,37 @@ function registerIpcHandlers() {
       importedProject.projectRoot,
       getProjectMetadataStore()
     );
+    activeSharedProject = undefined;
+    clearSharedDocumentSessions();
+    startProjectWatcher(project.project.rootPath);
+    return project;
+  });
+
+  handleIpc(ipcChannels.lifecycleCreateForAgent, async (event, request) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const dialogOptions: OpenDialogOptions = {
+      title: "Choose Project Location",
+      properties: ["openDirectory", "createDirectory"]
+    };
+    const result =
+      window === null
+        ? await dialog.showOpenDialog(dialogOptions)
+        : await dialog.showOpenDialog(window, dialogOptions);
+
+    if (result.canceled || result.filePaths[0] === undefined) {
+      return undefined;
+    }
+
+    const createdProject = await createEmptyProject({
+      projectName: request.projectName,
+      destinationParentPath: result.filePaths[0]
+    });
+    const project = await openProject(
+      createdProject.projectRoot,
+      getProjectMetadataStore()
+    );
+    activeSharedProject = undefined;
+    clearSharedDocumentSessions();
     startProjectWatcher(project.project.rootPath);
     return project;
   });
@@ -1635,6 +3921,8 @@ function registerIpcHandlers() {
       createdProject.projectRoot,
       getProjectMetadataStore()
     );
+    activeSharedProject = undefined;
+    clearSharedDocumentSessions();
     startProjectWatcher(project.project.rootPath);
     return project;
   });
@@ -1671,6 +3959,8 @@ function registerIpcHandlers() {
       createdProject.projectRoot,
       getProjectMetadataStore()
     );
+    activeSharedProject = undefined;
+    clearSharedDocumentSessions();
     startProjectWatcher(project.project.rootPath);
     return project;
   });
@@ -1714,6 +4004,7 @@ function registerIpcHandlers() {
     if (!isKnownAgentProviderId(request.providerId)) {
       throw new Error("Unknown agent provider.");
     }
+    assertAgentProjectContextMatchesActiveProject(request);
 
     await recordAgentAudit(
       request.projectRoot,
@@ -1767,7 +4058,7 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
     switch (message.toolName) {
       case "read-file": {
         const payload = message.payload as AgentToolRequestPayloadMap["read-file"];
-        return await readProjectFile(projectRoot, payload.path);
+        return await readProjectFileThroughActiveBackend(projectRoot, payload.path);
       }
       case "search-project": {
         const payload = message.payload as AgentToolRequestPayloadMap["search-project"];
@@ -1777,19 +4068,25 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
         return await pdfPreviewCaptureStore.capture(projectRoot);
       case "delete-entry": {
         const payload = message.payload as AgentToolRequestPayloadMap["delete-entry"];
-        const deletedEntry = await deleteProjectEntry(projectRoot, payload.path);
+        const deletedEntry = await deleteProjectEntryThroughActiveBackend(
+          projectRoot,
+          payload.path
+        );
         if (activeProjectRoot === projectRoot) {
-          const refreshed = await refreshProject(
-            projectRoot,
-            getProjectMetadataStore()
-          );
-          startProjectWatcher(refreshed.project.rootPath);
+          await refreshProjectThroughActiveBackend(projectRoot);
         }
         return { path: deletedEntry.deletedPath };
       }
       case "move-entry": {
         const payload = message.payload as AgentToolRequestPayloadMap["move-entry"];
-        await moveProjectEntry(projectRoot, payload.fromPath, payload.toPath);
+        await moveProjectEntryThroughActiveBackend(
+          projectRoot,
+          payload.fromPath,
+          payload.toPath
+        );
+        if (activeProjectRoot === projectRoot) {
+          await refreshProjectThroughActiveBackend(projectRoot);
+        }
         return {
           fromPath: payload.fromPath,
           toPath: payload.toPath
@@ -1797,9 +4094,8 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
       }
       case "set-main-file": {
         const payload = message.payload as AgentToolRequestPayloadMap["set-main-file"];
-        const result = await setProjectMainFile(
+        const result = await setProjectMainFileThroughActiveBackend(
           projectRoot,
-          getProjectMetadataStore(),
           payload.path
         );
         return { path: result.project.mainFilePath ?? payload.path };
@@ -1843,7 +4139,9 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
         const payload = message.payload as AgentToolRequestPayloadMap["apply-patch"];
         const history = getHistoryStore();
         try {
-          return await history.applyChangeSet(payload.changesetId);
+          const changeset = await history.applyChangeSet(payload.changesetId);
+          await syncHistoryChangeSetToActiveSharedBackend(history, changeset.id);
+          return changeset;
         } finally {
           history.close();
         }
@@ -1873,11 +4171,7 @@ async function handleAgentHostToolRequest(message: AgentHostToolRequestMessage) 
 async function detectAgentCompileMainFile(
   projectRoot: string
 ): Promise<string | undefined> {
-  const refreshed = await refreshProject(projectRoot, getProjectMetadataStore());
-
-  if (activeProjectRoot === projectRoot) {
-    startProjectWatcher(refreshed.project.rootPath);
-  }
+  const refreshed = await refreshProjectThroughActiveBackend(projectRoot);
 
   return refreshed.project.mainFilePath;
 }
@@ -1889,13 +4183,19 @@ async function searchProjectFiles(projectRoot: string, query: string) {
     return [];
   }
 
-  const tree = await listProjectTree(projectRoot);
+  const sharedProject = getActiveSharedProject(projectRoot);
+  const tree =
+    sharedProject === undefined
+      ? await listProjectTree(projectRoot)
+      : await requireSharedProjectClient().getTree(sharedProject.projectId);
   const searchableFiles = flattenProjectTree(tree)
     .filter((node) => node.kind === "file")
     .filter((node) => /\.(bib|cls|sty|tex)$/u.test(node.path))
     .slice(0, 200);
   const snapshots = await Promise.all(
-    searchableFiles.map((node) => readProjectFile(projectRoot, node.path))
+    searchableFiles.map((node) =>
+      readProjectFileThroughActiveBackend(projectRoot, node.path)
+    )
   );
 
   return snapshots
@@ -2038,6 +4338,19 @@ async function recordAgentAudit(
   message: string,
   changesetId?: string
 ) {
+  const sharedProject = getActiveSharedProject(projectRoot);
+  if (sharedProject !== undefined) {
+    try {
+      await requireSharedProjectClient().recordAuditEvent(sharedProject.projectId, {
+        eventType,
+        message,
+        ...(changesetId === undefined ? {} : { changesetId })
+      });
+    } catch {
+      // Local audit remains authoritative if the collaboration audit endpoint is unavailable.
+    }
+  }
+
   const history = getHistoryStore();
   try {
     await history.recordAuditEvent({
@@ -2109,13 +4422,24 @@ async function createMainWindow() {
   if (rendererDevServerUrl !== undefined) {
     await mainWindow.loadURL(rendererDevServerUrl);
   } else {
-    await mainWindow.loadFile(rendererIndexPath);
+    await mainWindow.loadURL(packagedRendererUrl);
   }
 }
 
 registerIpcHandlers();
 
 void app.whenReady().then(async () => {
+  if (rendererDevServerUrl === undefined) {
+    registerPackagedRendererProtocol();
+  }
+  await configureOnlyOfficeBridge();
+  try {
+    await onlyOfficeBridge.start();
+  } catch (error) {
+    console.warn(
+      `[OnlyOfficeBridge] Startup bridge warm-up failed: ${getErrorMessage(error)}`
+    );
+  }
   await createMainWindow();
 
   app.on("activate", () => {
@@ -2129,10 +4453,15 @@ app.on("window-all-closed", () => {
   activeProjectWatcher?.close();
   projectChangeDebouncer?.dispose();
   agentHostClient.stop();
+  void onlyOfficeBridge.stop();
 
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", () => {
+  void onlyOfficeBridge.stop();
 });
 
 function getErrorMessage(error: unknown): string {

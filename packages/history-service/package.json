@@ -9,5 +9,8 @@
     "build": "tsc -b",
     "typecheck": "tsc -b --pretty",
     "test": "vitest run"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1"
   }
 }

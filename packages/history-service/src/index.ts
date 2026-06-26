@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 export type ChangeSetStatus =
   | "proposed"
@@ -30,6 +30,11 @@ export type HistoryChangeSet = {
   readonly updatedAt: string;
   readonly appliedAt?: string;
   readonly revertedAt?: string;
+};
+
+export type HistoryChangeSetWithContents = HistoryChangeSet & {
+  readonly beforeContents: string;
+  readonly afterContents: string;
 };
 
 export type WordDocumentBlockKind = "paragraph";
@@ -224,11 +229,62 @@ type WordDocumentSnapshotRow = {
   readonly created_at: string;
 };
 
+type SqliteStatement = {
+  run(...params: readonly unknown[]): unknown;
+  get(...params: readonly unknown[]): unknown;
+  all(...params: readonly unknown[]): readonly unknown[];
+};
+
+type SqliteDatabase = {
+  exec(sql: string): unknown;
+  prepare(sql: string): SqliteStatement;
+  close(): void;
+};
+
+const requireRuntimeModule = createRequire(import.meta.url);
+
+function openHistoryDatabase(dbPath: string): SqliteDatabase {
+  try {
+    const sqlite = requireRuntimeModule("node:sqlite") as {
+      readonly DatabaseSync: new (path: string) => SqliteDatabase;
+    };
+    return new sqlite.DatabaseSync(dbPath);
+  } catch (error) {
+    if (!isMissingRuntimeModuleError(error)) {
+      throw error;
+    }
+  }
+
+  const betterSqliteModule = requireRuntimeModule("better-sqlite3") as
+    | (new (path: string) => SqliteDatabase)
+    | { readonly default?: new (path: string) => SqliteDatabase };
+  const BetterSqliteDatabase =
+    typeof betterSqliteModule === "function"
+      ? betterSqliteModule
+      : betterSqliteModule.default;
+
+  if (BetterSqliteDatabase === undefined) {
+    throw new Error("better-sqlite3 did not export a database constructor.");
+  }
+
+  return new BetterSqliteDatabase(dbPath);
+}
+
+function isMissingRuntimeModuleError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    ((error as { readonly code?: unknown }).code === "ERR_UNKNOWN_BUILTIN_MODULE" ||
+      (error as { readonly code?: unknown }).code === "MODULE_NOT_FOUND")
+  );
+}
+
 export class HistoryStore {
-  private readonly db: DatabaseSync;
+  private readonly db: SqliteDatabase;
 
   constructor(readonly dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openHistoryDatabase(dbPath);
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate();
   }
@@ -652,6 +708,16 @@ export class HistoryStore {
 
   getChangeSet(changesetId: string): HistoryChangeSet {
     return toChangeSet(this.getChangeSetRow(changesetId));
+  }
+
+  getChangeSetWithContents(changesetId: string): HistoryChangeSetWithContents {
+    const row = this.getChangeSetRowWithContents(changesetId);
+
+    return {
+      ...toChangeSet(row),
+      beforeContents: row.before_contents,
+      afterContents: row.after_contents
+    };
   }
 
   async applyChangeSet(changesetId: string): Promise<HistoryChangeSet> {
@@ -1793,13 +1859,61 @@ async function resolveWritableProjectPath(
   projectPath: string
 ): Promise<string> {
   const lexicalPath = resolveLexicalProjectPath(rootPath, projectPath);
-  const parentPath = await realpath(dirname(lexicalPath));
+  const parentPath = await ensureWritableParentPath(rootPath, dirname(lexicalPath));
 
   if (!isInsideRoot(rootPath, parentPath) || !isInsideRoot(rootPath, lexicalPath)) {
     throw new HistoryServiceError("Path resolves outside root.", "outside-root");
   }
 
   return lexicalPath;
+}
+
+async function ensureWritableParentPath(
+  rootPath: string,
+  parentPath: string
+): Promise<string> {
+  try {
+    return await realpath(parentPath);
+  } catch (error) {
+    if (!isNodeErrorCode(error, "ENOENT")) {
+      throw error;
+    }
+  }
+
+  const existingAncestor = await findExistingAncestor(parentPath);
+
+  if (!isInsideRoot(rootPath, existingAncestor)) {
+    throw new HistoryServiceError("Path resolves outside root.", "outside-root");
+  }
+
+  await mkdir(parentPath, { recursive: true });
+  const resolvedParent = await realpath(parentPath);
+
+  if (!isInsideRoot(rootPath, resolvedParent)) {
+    throw new HistoryServiceError("Path resolves outside root.", "outside-root");
+  }
+
+  return resolvedParent;
+}
+
+async function findExistingAncestor(path: string): Promise<string> {
+  let currentPath = path;
+
+  for (;;) {
+    try {
+      return await realpath(currentPath);
+    } catch (error) {
+      if (!isNodeErrorCode(error, "ENOENT")) {
+        throw error;
+      }
+
+      const parentPath = dirname(currentPath);
+      if (parentPath === currentPath) {
+        throw error;
+      }
+      currentPath = parentPath;
+    }
+  }
 }
 
 function normalizeProjectPath(rootPath: string, projectPath: string): string {
@@ -1824,6 +1938,15 @@ function resolveLexicalProjectPath(rootPath: string, projectPath: string): strin
   }
 
   return resolvedPath;
+}
+
+function isNodeErrorCode(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { readonly code?: unknown }).code === code
+  );
 }
 
 function toProjectPath(rootPath: string, absolutePath: string): string {

@@ -20,6 +20,195 @@ describe("ipc contracts", () => {
     expect(ipcChannels.lifecycleCreateFromExternalTemplate).toBe(
       "lifecycle.createFromExternalTemplate"
     );
+    expect(ipcChannels.onlyOfficeExportPdf).toBe("onlyoffice.exportPdf");
+    expect(ipcChannels.sharedSignIn).toBe("shared.signIn");
+    expect(ipcChannels.sharedSignOut).toBe("shared.signOut");
+    expect(ipcChannels.sharedListSessions).toBe("shared.listSessions");
+    expect(ipcChannels.sharedRevokeSession).toBe("shared.revokeSession");
+    expect(ipcChannels.sharedOpenProject).toBe("shared.openProject");
+    expect(ipcChannels.sharedUpdateProjectSettings).toBe(
+      "shared.updateProjectSettings"
+    );
+    expect(ipcChannels.sharedCreateFromLocalProject).toBe(
+      "shared.createFromLocalProject"
+    );
+    expect(ipcChannels.sharedCreateFromSourceZip).toBe("shared.createFromSourceZip");
+    expect(ipcChannels.sharedDeleteProject).toBe("shared.deleteProject");
+    expect(ipcChannels.sharedExportSourceZip).toBe("shared.exportSourceZip");
+    expect(ipcChannels.sharedInvite).toBe("shared.invite");
+    expect(ipcChannels.sharedAcceptInvitation).toBe("shared.acceptInvitation");
+    expect(ipcChannels.sharedListMembers).toBe("shared.listMembers");
+    expect(ipcChannels.sharedTransferOwnership).toBe("shared.transferOwnership");
+    expect(ipcChannels.sharedListPresence).toBe("shared.listPresence");
+    expect(ipcChannels.sharedUpdatePresence).toBe("shared.updatePresence");
+    expect(ipcChannels.sharedListActivity).toBe("shared.listActivity");
+    expect(ipcChannels.sharedListComments).toBe("shared.listComments");
+    expect(ipcChannels.sharedCreateComment).toBe("shared.createComment");
+    expect(ipcChannels.sharedResolveComment).toBe("shared.resolveComment");
+    expect(ipcChannels.sharedListAuditEvents).toBe("shared.listAuditEvents");
+    expect(ipcChannels.sharedPublishAgentRun).toBe("shared.publishAgentRun");
+    expect(ipcChannels.sharedUpdateAgentRunStatus).toBe("shared.updateAgentRunStatus");
+    expect(ipcChannels.sharedListAgentRuns).toBe("shared.listAgentRuns");
+    expect(ipcChannels.sharedListAgentChangeSets).toBe("shared.listAgentChangeSets");
+    expect(ipcChannels.sharedApplyAgentChangeSet).toBe("shared.applyAgentChangeSet");
+    expect(ipcChannels.sharedRejectAgentChangeSet).toBe("shared.rejectAgentChangeSet");
+    expect(ipcChannels.sharedListBuildArtifacts).toBe("shared.listBuildArtifacts");
+    expect(ipcChannels.sharedGetBuildArtifact).toBe("shared.getBuildArtifact");
+    expect(ipcChannels.sharedPublishBuildArtifact).toBe("shared.publishBuildArtifact");
+    expect(ipcChannels.sharedAttachAgentRunBuildArtifact).toBe(
+      "shared.attachAgentRunBuildArtifact"
+    );
+    expect(ipcChannels.sharedListFileRevisions).toBe("shared.listFileRevisions");
+    expect(ipcChannels.sharedGetFileRevisionDetails).toBe(
+      "shared.getFileRevisionDetails"
+    );
+    expect(ipcChannels.sharedRestoreFileRevision).toBe("shared.restoreFileRevision");
+    expect(ipcChannels.sharedSyncDocumentContents).toBe("shared.syncDocumentContents");
+    expect(ipcChannels.sharedApplyDocumentTextOperations).toBe(
+      "shared.applyDocumentTextOperations"
+    );
+    expect(ipcChannels.sharedPullDocumentContents).toBe("shared.pullDocumentContents");
+    expect(ipcChannels.sharedStartRealtime).toBe("shared.startRealtime");
+    expect(ipcChannels.sharedStopRealtime).toBe("shared.stopRealtime");
+    expect(ipcChannels.sharedRealtimeEvent).toBe("shared.realtimeEvent");
+    expect(
+      "presence" satisfies keyof Extract<
+        import("./index.js").SharedProjectRealtimeEvent,
+        { readonly type: "presence.updated" }
+      >
+    ).toBe("presence");
+    expect(
+      "operations" satisfies keyof import("./index.js").SharedProjectDocumentTextOperationRequest
+    ).toBe("operations");
+    expect(
+      "projectContext" satisfies keyof import("./index.js").AgentStartRequest
+    ).toBe("projectContext");
+    expect(
+      "clientOperationId" satisfies keyof import("./index.js").SharedProjectDocumentTextOperationRequest
+    ).toBe("clientOperationId");
+    expect(
+      "fileRevision" satisfies keyof import("./index.js").SharedProjectAppliedAgentChangeSetResult
+    ).toBe("fileRevision");
+    expect(
+      "contents" satisfies keyof import("./index.js").SharedProjectAppliedAgentChangeSetResult["fileRevision"]
+    ).toBe("contents");
+    expect(
+      "patchPreview" satisfies keyof import("./index.js").SharedProjectAgentChangeSetSummary
+    ).toBe("patchPreview");
+    expect(
+      "buildArtifactIds" satisfies keyof import("./index.js").SharedProjectAgentRunSummary
+    ).toBe("buildArtifactIds");
+    expect("role" satisfies keyof import("./index.js").SharedProjectSummary).toBe(
+      "role"
+    );
+    expect("role" satisfies keyof import("./index.js").SharedProjectOpenResult).toBe(
+      "role"
+    );
+    expect(
+      "compiler" satisfies keyof import("./index.js").SharedProjectOpenResult
+    ).toBe("compiler");
+    expect(
+      "compiler" satisfies keyof import("./index.js").SharedProjectSettingsUpdateRequest
+    ).toBe("compiler");
+    expect(
+      "mainFilePath" satisfies keyof import("./index.js").SharedProjectSettingsUpdateRequest
+    ).toBe("mainFilePath");
+    expect(
+      "projectRoot" satisfies keyof import("./index.js").SharedProjectCreateFromLocalProjectRequest
+    ).toBe("projectRoot");
+    expect(
+      "name" satisfies keyof import("./index.js").SharedProjectCreateFromSourceZipRequest
+    ).toBe("name");
+    expect(
+      "refreshTokenExpiresAt" satisfies keyof import("./index.js").SharedProjectSessionSummary
+    ).toBe("refreshTokenExpiresAt");
+    expect(
+      "current" satisfies keyof import("./index.js").SharedProjectSessionSummary
+    ).toBe("current");
+    expect(
+      "sessionId" satisfies keyof import("./index.js").SharedProjectSessionRevokeRequest
+    ).toBe("sessionId");
+    expect(
+      "revoked" satisfies keyof import("./index.js").SharedProjectSessionRevokeResult
+    ).toBe("revoked");
+    expect(
+      "projectId" satisfies keyof import("./index.js").SharedProjectDeleteRequest
+    ).toBe("projectId");
+    expect(
+      "projectId" satisfies keyof import("./index.js").SharedProjectExportSourceZipRequest
+    ).toBe("projectId");
+    expect(
+      "importedFileCount" satisfies keyof import("./index.js").SharedProjectCreateFromLocalProjectResult
+    ).toBe("importedFileCount");
+    expect(
+      "email" satisfies keyof import("./index.js").SharedProjectMemberSummary
+    ).toBe("email");
+    expect(
+      "userId" satisfies keyof import("./index.js").SharedProjectOwnershipTransferRequest
+    ).toBe("userId");
+    expect(
+      "diagnosticCount" satisfies keyof import("./index.js").SharedProjectBuildArtifactSummary
+    ).toBe("diagnosticCount");
+    expect(
+      "rawLog" satisfies keyof import("./index.js").SharedProjectBuildArtifactDetails
+    ).toBe("rawLog");
+    expect(
+      "artifactId" satisfies keyof import("./index.js").IpcRequestMap[typeof ipcChannels.sharedGetBuildArtifact]
+    ).toBe("artifactId");
+    expect(
+      "byteLength" satisfies keyof import("./index.js").SharedProjectFileRevisionSummary
+    ).toBe("byteLength");
+    expect(
+      "contents" satisfies keyof import("./index.js").SharedProjectFileRevisionDetails
+    ).toBe("contents");
+    expect(
+      "revisionId" satisfies keyof import("./index.js").SharedProjectFileRevisionRequest
+    ).toBe("revisionId");
+    expect(
+      "agentRunId" satisfies keyof import("./index.js").SharedProjectAgentRunBuildArtifactAttachRequest
+    ).toBe("agentRunId");
+    expect(
+      "eventType" satisfies keyof import("./index.js").SharedProjectActivitySummary
+    ).toBe("eventType");
+    expect(
+      "body" satisfies keyof import("./index.js").SharedProjectCommentSummary
+    ).toBe("body");
+    expect(
+      "commentId" satisfies keyof import("./index.js").SharedProjectCommentResolveRequest
+    ).toBe("commentId");
+    expect(
+      "changesetIds" satisfies keyof import("./index.js").SharedProjectAgentRunPublishRequest
+    ).toBe("changesetIds");
+    expect(
+      "agentRunId" satisfies keyof import("./index.js").SharedProjectAgentRunPublishRequest
+    ).toBe("agentRunId");
+    expect(
+      "status" satisfies keyof import("./index.js").SharedProjectAgentRunStatusUpdateRequest
+    ).toBe("status");
+    expect(
+      "localChangeSetId" satisfies keyof import("./index.js").SharedProjectAgentRunPublishResult["changesets"][number]
+    ).toBe("localChangeSetId");
+    expect(
+      "summary" satisfies keyof import("./index.js").SharedProjectAgentChangeSetSummary
+    ).toBe("summary");
+    expect(
+      "changesetId" satisfies keyof import("./index.js").SharedProjectAgentChangeSetStatusRequest
+    ).toBe("changesetId");
+    expect(
+      "buildResult" satisfies keyof import("./index.js").SharedProjectBuildArtifactPublishRequest
+    ).toBe("buildResult");
+    expect(
+      "afterUpdateId" satisfies keyof import("./index.js").SharedProjectDocumentPullRequest
+    ).toBe("afterUpdateId");
+    expect(
+      "lastUpdateId" satisfies keyof import("./index.js").SharedProjectDocumentSyncResult
+    ).toBe("lastUpdateId");
+    expect(
+      "remoteUpdateCount" satisfies keyof import("./index.js").SharedProjectDocumentSyncResult
+    ).toBe("remoteUpdateCount");
+    expect(
+      "remoteTextOperations" satisfies keyof import("./index.js").SharedProjectDocumentSyncResult
+    ).toBe("remoteTextOperations");
   });
 
   it("defines default workbench pane sizes", () => {
@@ -35,6 +224,16 @@ describe("ipc contracts", () => {
 
   it("defaults new agent sessions to suggest mode", () => {
     expect(defaultAppSettings.agentPermissions.defaultMode).toBe("suggest");
+  });
+
+  it("defaults ONLYOFFICE to a local Document Server setup", () => {
+    expect(defaultAppSettings.onlyOffice.enabled).toBe(true);
+    expect(defaultAppSettings.onlyOffice.documentServerUrl).toBe(
+      "http://127.0.0.1:8082"
+    );
+    expect(defaultAppSettings.onlyOffice.bridgePublicBaseUrl).toContain(
+      "host.docker.internal"
+    );
   });
 
   it("formats selected text with containing paragraph context", () => {

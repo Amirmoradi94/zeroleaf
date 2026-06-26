@@ -42,6 +42,7 @@ const localWorkspacePackages = [
   "history-service",
   "ipc-contracts",
   "latex-service",
+  "onlyoffice-service",
   "pdf-service",
   "project-lifecycle-service",
   "project-service",

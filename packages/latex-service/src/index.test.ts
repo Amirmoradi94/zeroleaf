@@ -231,6 +231,33 @@ describe("latex-service toolchain preflight", () => {
   });
 });
 
+describe("latex-service toolchain metadata", () => {
+  it("reports latexmk and compiler version strings for available tools", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "latex-toolchain-metadata-"));
+    const binPath = join(projectRoot, "bin");
+    const originalPath = process.env.PATH;
+    const originalTexPathDiscovery = disableTexPathDiscovery();
+
+    try {
+      await installFakeLatexToolchain(binPath);
+      process.env.PATH = binPath;
+
+      const toolchain = await detectLatexToolchain();
+
+      expect(toolchain.latexmkVersion).toBe("Latexmk fake 1.0");
+      expect(toolchain.compilerVersions?.pdflatex).toBe("pdfTeX fake 1.0");
+      expect(toolchain.compilerVersions?.xelatex).toBeUndefined();
+    } finally {
+      process.env.PATH = originalPath;
+      restoreOptionalEnv(
+        "ZEROLEAF_DISABLE_TEX_PATH_DISCOVERY",
+        originalTexPathDiscovery
+      );
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("latex-service build cancellation", () => {
   it("stops a runaway build process tree without killing unrelated processes", async () => {
     if (process.platform === "win32") {

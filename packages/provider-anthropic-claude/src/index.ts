@@ -44,6 +44,7 @@ export type ClaudeCodeToolBroker = {
 };
 
 export type ClaudeCodeRequest = {
+  readonly mode: AgentStartRequest["mode"];
   readonly projectRoot: string;
   readonly prompt: string;
   readonly timeoutMs: number;
@@ -146,7 +147,9 @@ export class ClaudeProvider {
       createMessageEvent(
         sessionId,
         "assistant",
-        "I will ask the installed Claude Code CLI to inspect the project and decide whether to answer or propose a reviewable patch."
+        request.mode === "autonomous-local"
+          ? "I will ask the installed Claude Code CLI to edit the open project directly and report what changed."
+          : "I will ask the installed Claude Code CLI to inspect the project and decide whether to answer or propose a reviewable patch."
       )
     ];
     const activeDocumentSnapshot = createActiveDocumentSnapshot(request);
@@ -167,6 +170,7 @@ export class ClaudeProvider {
       )
     );
     const claudeResponse = await this.runClaudeCode({
+      mode: request.mode,
       projectRoot: request.projectRoot,
       timeoutMs: this.timeoutMs,
       prompt: createClaudePrompt(request, snapshot)
@@ -386,7 +390,9 @@ async function runClaudeCode(
       "local",
       "--disable-slash-commands",
       "--tools",
-      "",
+      getClaudeToolsForMode(request.mode),
+      "--add-dir",
+      request.projectRoot,
       "--no-session-persistence",
       "--model",
       model,
@@ -398,6 +404,14 @@ async function runClaudeCode(
   );
 
   return parseClaudeAgentResponseFromCli(stdout);
+}
+
+export function getClaudeToolsForMode(mode: AgentStartRequest["mode"]): string {
+  if (mode === "autonomous-local") {
+    return "Read,Grep,Glob,LS,Edit,MultiEdit,Write";
+  }
+
+  return "Read,Grep,Glob,LS";
 }
 
 async function runCommand(
@@ -635,7 +649,13 @@ function createClaudePrompt(
   return [
     "You are the Claude Code provider inside a local-first LaTeX editor.",
     "Use your own judgment to decide how to complete the user's task.",
-    "You may inspect the project from the current working directory, but do not modify files.",
+    request.mode === "autonomous-local"
+      ? "You have direct project-scoped access to inspect, create, edit, overwrite, move, and delete files under the current project root. Do not write outside the project root."
+      : "You may inspect the project from the current working directory, but do not modify files.",
+    request.mode === "autonomous-local"
+      ? 'For project-scoped edit requests, use the available file tools directly instead of merely describing the edit. After direct source edits, return action "answer" with the files changed and what you did.'
+      : "",
+    "If a search command or pattern fails, retry with a simpler literal search, list files, or read likely source files directly before concluding the task cannot be completed.",
     "Return only JSON matching the provided schema.",
     'Set action to "answer" when the task is best completed by explanation, summary, review, diagnosis, or guidance.',
     'Use action "answer" for planning and scholarly-advice tasks such as literature review plans, paper outlines, manuscript critiques, reading plans, methodology suggestions, and submission checklists unless the user explicitly asks you to insert, rewrite, patch, compile, or change project files.',
@@ -644,7 +664,10 @@ function createClaudePrompt(
     "Requests to merge, combine, consolidate, split, reorganize, or restructure sections/subsections are source-edit requests.",
     request.mode === "read-only"
       ? 'The current ZeroLeaf mode is read-only, so action must be "answer". You may describe suggested edits in message, but do not return a patch action.'
-      : "ZeroLeaf will convert patch actions into a reviewable local changeset before any file is changed.",
+      : request.mode === "autonomous-local"
+        ? 'The current ZeroLeaf mode is autonomous-local. Prefer direct project-root file edits for any safe project-scoped edit. Use action "answer" after direct edits, or action "patch" only if direct editing is not possible.'
+        : "ZeroLeaf will convert patch actions into a reviewable local changeset before any file is changed.",
+    "Write message like a person reporting back after doing the task: first person, concrete, concise, and warm. Say what you changed or checked, mention verification when relevant, and avoid generic boilerplate such as build-log directions.",
     "In message, always explain the result in user-facing terms: list the files or sections changed and the purpose of the change. If no source file changed, say why no change was made and do not imply that an edit happened.",
     "Preserve all unrelated text and formatting when returning a patch.",
     request.activeDocument?.kind === "word"
@@ -652,6 +675,9 @@ function createClaudePrompt(
       : "",
     snapshot.path === newFileSnapshotPath
       ? 'No active TeX file is open. If the user asks to create a .tex file, return action "patch", choose a clear project-relative targetFilePath ending in .tex, set afterContents to the complete new file contents, and use an empty original file.'
+      : "",
+    snapshot.path === newFileSnapshotPath
+      ? 'If the project root is empty and the user asks to create, start, make, or set up a project, treat the prompt as a project bootstrap request. Return action "patch" with a complete compilable main .tex file. Default to a LaTeX project when the requested format is ambiguous. Do not answer with instructions or ask the user to open a template picker.'
       : "",
     request.selectedText === undefined
       ? ""
