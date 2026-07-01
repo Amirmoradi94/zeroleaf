@@ -317,8 +317,9 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("latexmk is missing.");
     expect(appSource).toContain("is not available. Set one of:");
     expect(appSource).toContain("Delete selected entry");
+    expect(appSource).toContain('message: `Delete "${selectedProjectEntryPath}"?`');
     expect(appSource).toContain(
-      "window.confirm(`Delete ${selectedProjectEntryPath}?`)"
+      "A backup will be kept in the project's local history."
     );
     expect(appSource).toContain("backup saved to");
     expect(appSource).toContain("found ${referenceCount} references");
@@ -334,7 +335,9 @@ describe("App renderer shell", () => {
     expect(appSource).toContain(
       "onJumpToOutlineItem={(item) => jumpToFileLine(item.path, item.line)}"
     );
-    expect(appSource).toContain("No outline for the current project.");
+    expect(appSource).toContain(
+      "The outline is built from section and chapter commands in your .tex files."
+    );
     expect(appSource).toContain("Could not save ${file.path}");
     expect(appSource).toContain(
       "shouldMarkPdfStaleForProjectChange(staleCandidatePaths)"
@@ -367,7 +370,7 @@ describe("App renderer shell", () => {
     expect(rendererSource).toContain("Next PDF match");
     expect(appSource).toContain('No PDF search match for "${query}"');
     expect(rendererSource).toContain("Save PDF");
-    expect(appSource).toContain("Include generated build artifacts and cache files");
+    expect(appSource).toContain("Include build artifacts");
     expect(appSource).toContain("The current PDF preview is stale");
     expect(appSource).toContain("Agent");
     expect(appSource).toContain("Connect an AI provider once on this computer");

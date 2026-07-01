@@ -3,6 +3,7 @@ export const ipcChannels = {
   appCheckForUpdates: "app.checkForUpdates",
   appOpenUpdateDownload: "app.openUpdateDownload",
   appInstallUpdate: "app.installUpdate",
+  appShowMessageDialog: "app.showMessageDialog",
   workbenchLoadLayout: "workbench.loadLayout",
   workbenchSaveLayout: "workbench.saveLayout",
   editorLoadProjectState: "editor.loadProjectState",
@@ -153,6 +154,19 @@ export type AppUpdateInstallResult = {
   readonly installerPath: string;
   readonly targetAppPath: string;
   readonly message: string;
+};
+
+export type AppMessageDialogRequest = {
+  readonly message: string;
+  readonly detail?: string;
+  readonly buttons: readonly string[];
+  readonly cancelId?: number;
+  readonly defaultId?: number;
+  readonly warning?: boolean;
+};
+
+export type AppMessageDialogResult = {
+  readonly buttonIndex: number;
 };
 
 export type WorkbenchLayout = {
@@ -2803,6 +2817,7 @@ export type IpcRequestMap = {
   readonly [ipcChannels.appCheckForUpdates]: undefined;
   readonly [ipcChannels.appOpenUpdateDownload]: { readonly url: string };
   readonly [ipcChannels.appInstallUpdate]: { readonly url: string };
+  readonly [ipcChannels.appShowMessageDialog]: AppMessageDialogRequest;
   readonly [ipcChannels.workbenchLoadLayout]: undefined;
   readonly [ipcChannels.workbenchSaveLayout]: WorkbenchLayout;
   readonly [ipcChannels.editorLoadProjectState]: { readonly projectRoot: string };
@@ -3029,6 +3044,7 @@ export type IpcResponseMap = {
   readonly [ipcChannels.appCheckForUpdates]: AppUpdateCheckResult;
   readonly [ipcChannels.appOpenUpdateDownload]: { readonly opened: true };
   readonly [ipcChannels.appInstallUpdate]: AppUpdateInstallResult;
+  readonly [ipcChannels.appShowMessageDialog]: AppMessageDialogResult;
   readonly [ipcChannels.workbenchLoadLayout]: WorkbenchLayout;
   readonly [ipcChannels.workbenchSaveLayout]: WorkbenchLayout;
   readonly [ipcChannels.editorLoadProjectState]: EditorProjectState;
@@ -3167,6 +3183,9 @@ export type DesktopApi = {
     readonly checkForUpdates: () => Promise<AppUpdateCheckResult>;
     readonly openUpdateDownload: (url: string) => Promise<{ readonly opened: true }>;
     readonly installUpdate: (url: string) => Promise<AppUpdateInstallResult>;
+    readonly showMessageDialog: (
+      request: AppMessageDialogRequest
+    ) => Promise<AppMessageDialogResult>;
   };
   readonly workbench: {
     readonly loadLayout: () => Promise<WorkbenchLayout>;

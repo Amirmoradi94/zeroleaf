@@ -17,6 +17,7 @@ import {
   safeStorage,
   shell,
   type IpcMainInvokeEvent,
+  type MessageBoxOptions,
   type OpenDialogOptions
 } from "electron";
 import {
@@ -2704,6 +2705,25 @@ function registerIpcHandlers() {
   handleIpc(ipcChannels.appInstallUpdate, async (_event, request) =>
     installAppUpdateFromDmg(request.url)
   );
+
+  handleIpc(ipcChannels.appShowMessageDialog, async (event, request) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const options: MessageBoxOptions = {
+      type: request.warning === true ? "warning" : "question",
+      buttons: [...request.buttons],
+      defaultId: request.defaultId ?? 0,
+      cancelId: request.cancelId ?? request.buttons.length - 1,
+      message: request.message,
+      noLink: true,
+      ...(request.detail === undefined ? {} : { detail: request.detail })
+    };
+    const result =
+      window === null
+        ? await dialog.showMessageBox(options)
+        : await dialog.showMessageBox(window, options);
+
+    return { buttonIndex: result.response };
+  });
 
   handleIpc(ipcChannels.workbenchLoadLayout, () => readWorkbenchLayout());
   handleIpc(ipcChannels.workbenchSaveLayout, (_event, layout) =>

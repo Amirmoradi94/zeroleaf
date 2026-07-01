@@ -94,6 +94,7 @@ import {
   FolderOpen,
   ImagePlus,
   MessageSquareText,
+  PanelBottom,
   Pencil,
   Plus,
   Play,
@@ -102,6 +103,7 @@ import {
   Save,
   Search,
   Settings,
+  Share2,
   Sparkles,
   Terminal,
   Trash2,
@@ -183,7 +185,6 @@ type SettingsTab = (typeof settingsTabs)[number];
 type BottomTab =
   | "Problems"
   | "References"
-  | "Search"
   | "Outline"
   | "History"
   | "Log"
@@ -473,6 +474,7 @@ export function App() {
   const [projectError, setProjectError] = useState<string | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shareModalOpen, setShareModalOpen] = useState(false);
   const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("Editor");
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings);
   const [updateCheckResult, setUpdateCheckResult] =
@@ -2105,17 +2107,23 @@ export function App() {
   }, [currentProject, editableProjectFiles]);
 
   const closeProject = useCallback(() => {
-    if (buildRunning) {
-      setStatusMessage("Stop the active compile before closing the project.");
-      return;
-    }
+    void (async () => {
+      if (buildRunning) {
+        setStatusMessage("Stop the active compile before closing the project.");
+        return;
+      }
 
-    if (
-      dirtyFileCount > 0 &&
-      !window.confirm("Close project and discard unsaved changes?")
-    ) {
-      return;
-    }
+      if (dirtyFileCount > 0) {
+        const confirmed = await confirmAction({
+          message: "Close project and discard unsaved changes?",
+          detail: `${dirtyFileCount} unsaved file${dirtyFileCount === 1 ? "" : "s"} will be lost.`,
+          confirmLabel: "Discard and close",
+          destructive: true
+        });
+        if (!confirmed) {
+          return;
+        }
+      }
 
     setProjectResult(null);
     setActiveSharedProject(null);
@@ -2164,6 +2172,7 @@ export function App() {
     setAgentSessionProjectRoot(null);
     setAgentSessionProviderId(null);
     setStatusMessage("Project closed");
+    })();
   }, [buildRunning, dirtyFileCount, toolchainStatus]);
 
   const readProjectFile = useCallback(
@@ -2860,11 +2869,14 @@ export function App() {
           return;
         }
 
-        if (
-          !window.confirm(
-            `Delete shared project "${project.name}" from the server for all collaborators?`
-          )
-        ) {
+        const confirmed = await confirmAction({
+          message: `Delete shared project "${project.name}"?`,
+          detail:
+            "This can't be undone. All collaborators will lose access immediately.",
+          confirmLabel: "Delete project",
+          destructive: true
+        });
+        if (!confirmed) {
           return;
         }
 
@@ -2997,11 +3009,12 @@ export function App() {
         }
 
         const memberLabel = member.email ?? member.name ?? member.userId;
-        if (
-          !window.confirm(
-            `Transfer ownership to ${memberLabel}? You will become an editor.`
-          )
-        ) {
+        const confirmed = await confirmAction({
+          message: `Transfer ownership to ${memberLabel}?`,
+          detail: "You will become an editor on this project.",
+          confirmLabel: "Transfer ownership"
+        });
+        if (!confirmed) {
           return;
         }
 
@@ -3387,11 +3400,13 @@ export function App() {
 
       if (
         pdfStale &&
-        !window.confirm(
-          `The current PDF preview is stale (${formatPdfStaleReason(
+        !(await confirmAction({
+          message: "Export the last successful PDF anyway?",
+          detail: `The current PDF preview is stale (${formatPdfStaleReason(
             pdfStaleReason
-          ).toLowerCase()}). Export the last successful PDF anyway?`
-        )
+          ).toLowerCase()}).`,
+          confirmLabel: "Export anyway"
+        }))
       ) {
         setStatusMessage("PDF export cancelled. Recompile first for a current PDF.");
         return;
@@ -3915,9 +3930,20 @@ export function App() {
       }
 
       await saveDirtyFiles();
-      const includeBuildArtifacts = window.confirm(
-        "Include generated build artifacts and cache files in this ZIP? Choose Cancel to export source only."
-      );
+      const exportChoice = await desktopApi.app.showMessageDialog({
+        message: "Export the project source as a ZIP",
+        detail: "Choose whether to include generated build artifacts and cache files.",
+        buttons: ["Include build artifacts", "Source only", "Cancel"],
+        defaultId: 1,
+        cancelId: 2
+      });
+
+      if (exportChoice.buttonIndex === 2) {
+        setStatusMessage("Export cancelled.");
+        return;
+      }
+
+      const includeBuildArtifacts = exportChoice.buttonIndex === 0;
       const result = await desktopApi.lifecycle.exportSourceZip({
         projectRoot: currentProject.rootPath,
         includeBuildArtifacts
@@ -5537,7 +5563,7 @@ export function App() {
           const approvalToolName = getRequestedApprovalToolName(result.events);
           setStatusMessage(
             result.status === "failed"
-              ? `${providerLabel} could not complete the task.`
+              ? `${providerLabel} could not complete the task — see the agent panel for details.`
               : result.status === "awaiting-approval" &&
                   approvalToolName === "network-fetch"
                 ? `${providerLabel} is waiting for web access approval.`
@@ -5601,7 +5627,9 @@ export function App() {
               ...failureEvents.filter((event) => !existingEventIds.has(event.id))
             ];
           });
-          setStatusMessage(`${providerLabel} could not complete the task.`);
+          setStatusMessage(
+            `${providerLabel} could not complete the task — see the agent panel for details.`
+          );
           setAgentLiveStatus({
             detail: errorMessage,
             title: `${providerLabel} stopped with an error`,
@@ -6566,7 +6594,7 @@ export function App() {
       ).flat();
 
       setProjectSearchResults(results.slice(0, 200));
-      setActiveBottomTab("Search");
+      setActiveSidebarTab("search");
       return results.length;
     },
     [currentProject, editableProjectFiles]
@@ -6585,7 +6613,13 @@ export function App() {
         return;
       }
 
-      if (!window.confirm(`Delete ${selectedProjectEntryPath}?`)) {
+      const confirmedDelete = await confirmAction({
+        message: `Delete "${selectedProjectEntryPath}"?`,
+        detail: "A backup will be kept in the project's local history.",
+        confirmLabel: "Delete file",
+        destructive: true
+      });
+      if (!confirmedDelete) {
         return;
       }
 
@@ -6620,25 +6654,31 @@ export function App() {
 
   const closeFile = useCallback(
     (path: string) => {
-      const file = openFiles.find((candidate) => candidate.path === path);
+      void (async () => {
+        const file = openFiles.find((candidate) => candidate.path === path);
 
-      if (
-        file !== undefined &&
-        isFileDirty(file) &&
-        !window.confirm(`Discard unsaved changes in ${path}?`)
-      ) {
-        return;
-      }
+        if (file !== undefined && isFileDirty(file)) {
+          const confirmed = await confirmAction({
+            message: `Discard unsaved changes in "${path}"?`,
+            detail: "These changes will be lost.",
+            confirmLabel: "Discard changes",
+            destructive: true
+          });
+          if (!confirmed) {
+            return;
+          }
+        }
 
-      const remainingFiles = removeOpenFile(openFiles, path);
-      setOpenFiles(remainingFiles);
-      setOnlyOfficeWordFileStates((states) => {
-        const { [path]: _removed, ...remainingStates } = states;
-        return remainingStates;
-      });
-      setActiveFilePath((currentPath) =>
-        currentPath === path ? (remainingFiles.at(-1)?.path ?? null) : currentPath
-      );
+        const remainingFiles = removeOpenFile(openFiles, path);
+        setOpenFiles(remainingFiles);
+        setOnlyOfficeWordFileStates((states) => {
+          const { [path]: _removed, ...remainingStates } = states;
+          return remainingStates;
+        });
+        setActiveFilePath((currentPath) =>
+          currentPath === path ? (remainingFiles.at(-1)?.path ?? null) : currentPath
+        );
+      })();
     },
     [isFileDirty, openFiles]
   );
@@ -7022,11 +7062,12 @@ export function App() {
           return;
         }
 
-        if (
-          !window.confirm(
-            `Remove unused bibliography entry ${entry.key} from ${entry.filePath} and compile?`
-          )
-        ) {
+        const confirmedRemoval = await confirmAction({
+          message: `Remove unused bibliography entry "${entry.key}"?`,
+          detail: `This will edit ${entry.filePath} and recompile the project.`,
+          confirmLabel: "Remove and compile"
+        });
+        if (!confirmedRemoval) {
           return;
         }
 
@@ -7607,10 +7648,10 @@ export function App() {
 
         <nav className="titlebar-actions" aria-label="Application actions">
           <IconButton
-            label={bottomPanelOpen ? "Hide terminal" : "Show terminal"}
+            label={bottomPanelOpen ? "Hide panels" : "Show panels"}
             onClick={() => setBottomPanelOpen((isOpen) => !isOpen)}
           >
-            <Terminal size={17} />
+            <PanelBottom size={17} />
           </IconButton>
           <IconButton label="Open project" onClick={openProject}>
             <FolderOpen size={17} />
@@ -7654,20 +7695,6 @@ export function App() {
             sharedComments={sharedComments}
             sharedFileRevisions={sharedFileRevisions}
             selectedSharedFileRevision={selectedSharedFileRevision}
-            sharedConnection={sharedConnection}
-            sharedDocumentSyncStatus={sharedDocumentSyncStatus}
-            sharedEmail={sharedEmail}
-            sharedInvitationId={sharedInvitationId}
-            sharedInviteEmail={sharedInviteEmail}
-            sharedInviteRole={sharedInviteRole}
-            sharedMembers={sharedMembers}
-            sharedName={sharedName}
-            sharedPresence={sharedPresence}
-            sharedProjectName={sharedProjectName}
-            sharedProjects={sharedProjects}
-            sharedServerUrl={sharedServerUrl}
-            sharedSessions={sharedSessions}
-            sharedStatus={sharedStatus}
             submissionCheckResult={submissionCheckResult}
             tree={projectResult?.tree ?? []}
             onApplySharedAgentChangeSet={applySharedAgentChangeSetFromPanel}
@@ -7683,6 +7710,7 @@ export function App() {
             onCloseProject={closeProject}
             onOpenProject={openProject}
             onOpenRecentProject={openRecentProject}
+            onOpenShareModal={() => setShareModalOpen(true)}
             onClearRecentProjects={clearRecentProjects}
             onRefreshProject={refreshProjectTree}
             onRejectSharedAgentChangeSet={rejectSharedAgentChangeSetFromPanel}
@@ -7692,28 +7720,6 @@ export function App() {
             onSelectDirectory={selectProjectDirectory}
             onSelectFile={selectFile}
             onSetMainFile={setTreeFileAsMain}
-            onSharedCreateFromLocalProject={createSharedProjectFromLocalProject}
-            onSharedCreateFromSourceZip={createSharedProjectFromSourceZip}
-            onSharedCreateProject={createSharedProject}
-            onSharedEmailChange={setSharedEmail}
-            onSharedInvitationIdChange={setSharedInvitationId}
-            onSharedInviteEmailChange={setSharedInviteEmail}
-            onSharedInviteRoleChange={setSharedInviteRole}
-            onSharedInviteToActiveProject={inviteToActiveSharedProject}
-            onSharedMemberRoleChange={updateSharedMemberRole}
-            onSharedMemberRemove={removeSharedMember}
-            onSharedOwnershipTransfer={transferSharedOwnership}
-            onSharedNameChange={setSharedName}
-            onSharedDeleteProject={deleteSharedProject}
-            onSharedExportSourceZip={exportSharedProjectSourceZip}
-            onSharedOpenProject={openSharedProject}
-            onSharedProjectNameChange={setSharedProjectName}
-            onSharedRefreshProjects={refreshSharedProjects}
-            onSharedServerUrlChange={setSharedServerUrl}
-            onSharedSessionRevoke={revokeSharedSession}
-            onSharedSignIn={signInToSharedProjects}
-            onSharedSignOut={signOutFromSharedProjects}
-            onSharedAcceptInvitation={acceptSharedInvitation}
             onResolveSharedComment={resolveSharedComment}
             onSharedCommentDraftChange={setSharedCommentDraft}
           />
@@ -7995,8 +8001,6 @@ export function App() {
                 wordChangeSets={wordChangeSets}
                 onExplainChangeSetHunk={explainChangeSetHunk}
                 outline={projectOutline}
-                projectSearchQuery={projectSearchQuery}
-                projectSearchResults={projectSearchResults}
                 referenceAnalysis={referenceAnalysis}
                 referenceMessage={referenceMessage}
                 referenceSearchQuery={referenceSearchQuery}
@@ -8011,7 +8015,6 @@ export function App() {
                 onInsertCitation={insertCitation}
                 onKeepUnusedReference={keepUnusedReference}
                 onJumpToOutlineItem={(item) => jumpToFileLine(item.path, item.line)}
-                onProjectSearchQueryChange={setProjectSearchQuery}
                 onReferenceSearchQueryChange={setReferenceSearchQuery}
                 onRefreshReferences={() => {
                   void runProjectOperation(refreshReferences);
@@ -8024,7 +8027,6 @@ export function App() {
                 onRollbackChangeSet={rollbackChangeSet}
                 onRollbackWordChangeSet={rollbackWordChangeSet}
                 onRunReferenceSearch={runReferenceSearch}
-                onRunProjectSearch={runProjectSearch}
                 onSelectChangeSet={(changesetId) => {
                   setSelectedChangeSetId(changesetId);
                   setSelectedWordChangeSetId(null);
@@ -8044,9 +8046,6 @@ export function App() {
                 }
                 onSelectReferenceCitation={(citation) =>
                   jumpToFileLine(citation.filePath, citation.line)
-                }
-                onSelectSearchResult={(result) =>
-                  jumpToFileLine(result.path, result.line)
                 }
                 onSnapshotActiveFile={snapshotActiveFile}
                 onSuggestCitations={suggestCitationsWithAgent}
@@ -8119,6 +8118,50 @@ export function App() {
         updateCheckResult={updateCheckResult}
         updateCheckRunning={updateCheckRunning}
         updateInstallRunning={updateInstallRunning}
+      />
+
+      <ShareDialog
+        activeSharedProject={activeSharedProject}
+        hasProject={currentProject !== undefined}
+        open={shareModalOpen}
+        sharedBusy={sharedBusy}
+        sharedConnection={sharedConnection}
+        sharedDocumentSyncStatus={sharedDocumentSyncStatus}
+        sharedEmail={sharedEmail}
+        sharedInvitationId={sharedInvitationId}
+        sharedInviteEmail={sharedInviteEmail}
+        sharedInviteRole={sharedInviteRole}
+        sharedMembers={sharedMembers}
+        sharedName={sharedName}
+        sharedPresence={sharedPresence}
+        sharedProjectName={sharedProjectName}
+        sharedProjects={sharedProjects}
+        sharedServerUrl={sharedServerUrl}
+        sharedSessions={sharedSessions}
+        sharedStatus={sharedStatus}
+        onClose={() => setShareModalOpen(false)}
+        onSharedAcceptInvitation={acceptSharedInvitation}
+        onSharedCreateFromLocalProject={createSharedProjectFromLocalProject}
+        onSharedCreateFromSourceZip={createSharedProjectFromSourceZip}
+        onSharedCreateProject={createSharedProject}
+        onSharedDeleteProject={deleteSharedProject}
+        onSharedEmailChange={setSharedEmail}
+        onSharedExportSourceZip={exportSharedProjectSourceZip}
+        onSharedInvitationIdChange={setSharedInvitationId}
+        onSharedInviteEmailChange={setSharedInviteEmail}
+        onSharedInviteRoleChange={setSharedInviteRole}
+        onSharedInviteToActiveProject={inviteToActiveSharedProject}
+        onSharedMemberRoleChange={updateSharedMemberRole}
+        onSharedMemberRemove={removeSharedMember}
+        onSharedNameChange={setSharedName}
+        onSharedOpenProject={openSharedProject}
+        onSharedOwnershipTransfer={transferSharedOwnership}
+        onSharedProjectNameChange={setSharedProjectName}
+        onSharedRefreshProjects={refreshSharedProjects}
+        onSharedServerUrlChange={setSharedServerUrl}
+        onSharedSessionRevoke={revokeSharedSession}
+        onSharedSignIn={signInToSharedProjects}
+        onSharedSignOut={signOutFromSharedProjects}
       />
     </div>
   );
@@ -8287,6 +8330,7 @@ function ProjectSidebar({
   onCloseProject,
   onOpenProject,
   onOpenRecentProject,
+  onOpenShareModal,
   onClearRecentProjects,
   onRefreshProject,
   onRejectSharedAgentChangeSet,
@@ -8296,28 +8340,6 @@ function ProjectSidebar({
   onSelectDirectory,
   onSelectFile,
   onSetMainFile,
-  onSharedCreateFromLocalProject,
-  onSharedCreateFromSourceZip,
-  onSharedCreateProject,
-  onSharedEmailChange,
-  onSharedInvitationIdChange,
-  onSharedInviteEmailChange,
-  onSharedInviteRoleChange,
-  onSharedInviteToActiveProject,
-  onSharedMemberRoleChange,
-  onSharedMemberRemove,
-  onSharedOwnershipTransfer,
-  onSharedNameChange,
-  onSharedDeleteProject,
-  onSharedExportSourceZip,
-  onSharedOpenProject,
-  onSharedProjectNameChange,
-  onSharedRefreshProjects,
-  onSharedServerUrlChange,
-  onSharedSessionRevoke,
-  onSharedSignIn,
-  onSharedSignOut,
-  onSharedAcceptInvitation,
   onResolveSharedComment,
   onSharedCommentDraftChange,
   project,
@@ -8331,20 +8353,6 @@ function ProjectSidebar({
   sharedCommentDraft,
   sharedComments,
   sharedFileRevisions,
-  sharedConnection,
-  sharedDocumentSyncStatus,
-  sharedEmail,
-  sharedInvitationId,
-  sharedInviteEmail,
-  sharedInviteRole,
-  sharedMembers,
-  sharedName,
-  sharedPresence,
-  sharedProjectName,
-  sharedProjects,
-  sharedServerUrl,
-  sharedSessions,
-  sharedStatus,
   tree
 }: {
   readonly activeFilePath: string | undefined;
@@ -8369,6 +8377,7 @@ function ProjectSidebar({
   readonly onCloseProject: () => void;
   readonly onOpenProject: () => void;
   readonly onOpenRecentProject: (rootPath: string) => void;
+  readonly onOpenShareModal: () => void;
   readonly onClearRecentProjects: () => void;
   readonly onRefreshProject: () => void;
   readonly onRejectSharedAgentChangeSet: (
@@ -8380,33 +8389,6 @@ function ProjectSidebar({
   readonly onSelectDirectory: (path: string) => void;
   readonly onSelectFile: (path: string) => void;
   readonly onSetMainFile: (path: string) => void;
-  readonly onSharedCreateFromLocalProject: () => void;
-  readonly onSharedCreateFromSourceZip: () => void;
-  readonly onSharedCreateProject: () => void;
-  readonly onSharedEmailChange: (email: string) => void;
-  readonly onSharedInvitationIdChange: (invitationId: string) => void;
-  readonly onSharedInviteEmailChange: (email: string) => void;
-  readonly onSharedInviteRoleChange: (
-    role: Exclude<SharedProjectRole, "owner">
-  ) => void;
-  readonly onSharedInviteToActiveProject: () => void;
-  readonly onSharedMemberRoleChange: (
-    userId: string,
-    role: Exclude<SharedProjectRole, "owner">
-  ) => void;
-  readonly onSharedMemberRemove: (userId: string) => void;
-  readonly onSharedOwnershipTransfer: (member: SharedProjectMemberSummary) => void;
-  readonly onSharedNameChange: (name: string) => void;
-  readonly onSharedDeleteProject: (project: SharedProjectSummary) => void;
-  readonly onSharedExportSourceZip: (project: SharedProjectSummary) => void;
-  readonly onSharedOpenProject: (projectId: string) => void;
-  readonly onSharedProjectNameChange: (name: string) => void;
-  readonly onSharedRefreshProjects: () => void;
-  readonly onSharedServerUrlChange: (serverUrl: string) => void;
-  readonly onSharedSessionRevoke: (sessionId: string) => void;
-  readonly onSharedSignIn: () => void;
-  readonly onSharedSignOut: () => void;
-  readonly onSharedAcceptInvitation: () => void;
   readonly onResolveSharedComment: (commentId: string) => void;
   readonly onSharedCommentDraftChange: (draft: string) => void;
   readonly project: ProjectOpenResult["project"] | undefined;
@@ -8420,20 +8402,6 @@ function ProjectSidebar({
   readonly sharedCommentDraft: string;
   readonly sharedComments: readonly SharedProjectCommentSummary[];
   readonly sharedFileRevisions: readonly SharedProjectFileRevisionSummary[];
-  readonly sharedConnection: SharedProjectConnection;
-  readonly sharedDocumentSyncStatus: string;
-  readonly sharedEmail: string;
-  readonly sharedInvitationId: string;
-  readonly sharedInviteEmail: string;
-  readonly sharedInviteRole: Exclude<SharedProjectRole, "owner">;
-  readonly sharedMembers: readonly SharedProjectMemberSummary[];
-  readonly sharedName: string;
-  readonly sharedPresence: readonly SharedProjectPresenceSummary[];
-  readonly sharedProjectName: string;
-  readonly sharedProjects: readonly SharedProjectSummary[];
-  readonly sharedServerUrl: string;
-  readonly sharedSessions: readonly SharedProjectSessionSummary[];
-  readonly sharedStatus: string;
   readonly tree: readonly ProjectFileTreeNode[];
 }) {
   const [collapsedDirectoryPaths, setCollapsedDirectoryPaths] = useState<
@@ -8464,7 +8432,6 @@ function ProjectSidebar({
 
   const sharedProjectCanEdit =
     activeSharedProject === null || activeSharedProject.role !== "viewer";
-  const sharedProjectCanInvite = activeSharedProject?.role === "owner";
 
   const toggleDirectory = useCallback((path: string) => {
     setCollapsedDirectoryPaths((currentPaths) => {
@@ -8503,6 +8470,11 @@ function ProjectSidebar({
           <FolderOpen size={16} />
         </IconButton>
         {project !== undefined && (
+          <IconButton label="Share project" onClick={onOpenShareModal}>
+            <Share2 size={16} />
+          </IconButton>
+        )}
+        {project !== undefined && (
           <IconButton label="Close project" onClick={onCloseProject}>
             <X size={16} />
           </IconButton>
@@ -8512,459 +8484,13 @@ function ProjectSidebar({
       {project === undefined ? (
         <RecentProjects
           recentProjects={recentProjects}
-          sharedBusy={sharedBusy}
-          sharedConnection={sharedConnection}
-          sharedEmail={sharedEmail}
-          sharedInvitationId={sharedInvitationId}
-          sharedName={sharedName}
-          sharedProjectName={sharedProjectName}
-          sharedProjects={sharedProjects}
-          sharedServerUrl={sharedServerUrl}
-          sharedSessions={sharedSessions}
-          sharedStatus={sharedStatus}
           onOpenProject={onOpenProject}
           onOpenRecentProject={onOpenRecentProject}
+          onOpenShareModal={onOpenShareModal}
           onClearRecentProjects={onClearRecentProjects}
-          onSharedCreateProject={onSharedCreateProject}
-          onSharedCreateFromSourceZip={onSharedCreateFromSourceZip}
-          onSharedEmailChange={onSharedEmailChange}
-          onSharedInvitationIdChange={onSharedInvitationIdChange}
-          onSharedNameChange={onSharedNameChange}
-          onSharedDeleteProject={onSharedDeleteProject}
-          onSharedExportSourceZip={onSharedExportSourceZip}
-          onSharedOpenProject={onSharedOpenProject}
-          onSharedProjectNameChange={onSharedProjectNameChange}
-          onSharedRefreshProjects={onSharedRefreshProjects}
-          onSharedServerUrlChange={onSharedServerUrlChange}
-          onSharedSessionRevoke={onSharedSessionRevoke}
-          onSharedSignIn={onSharedSignIn}
-          onSharedSignOut={onSharedSignOut}
-          onSharedAcceptInvitation={onSharedAcceptInvitation}
         />
       ) : (
         <>
-          {activeSharedProject !== null && (
-            <div className="shared-projects shared-projects--active">
-              <div>
-                <span className="eyebrow">Share</span>
-                <strong>{activeSharedProject.id}</strong>
-                <span className="project-origin-badge">
-                  {formatSharedProjectRole(activeSharedProject.role)}
-                </span>
-                <span className="shared-projects__status">
-                  {activeSharedProject.role === "viewer"
-                    ? "Read-only shared project. Local compile remains available."
-                    : sharedDocumentSyncStatus}
-                </span>
-                <IconButton
-                  label="Sign out of shared projects"
-                  disabled={sharedBusy}
-                  onClick={onSharedSignOut}
-                >
-                  <X size={14} />
-                </IconButton>
-              </div>
-              <div className="shared-projects__create">
-                <label className="template-picker__field">
-                  <span className="eyebrow">Collaborator email</span>
-                  <input
-                    type="email"
-                    value={sharedInviteEmail}
-                    disabled={sharedBusy || !sharedProjectCanInvite}
-                    onChange={(event) => onSharedInviteEmailChange(event.target.value)}
-                  />
-                </label>
-                <select
-                  className="compact-select"
-                  aria-label="Collaborator role"
-                  value={sharedInviteRole}
-                  disabled={sharedBusy || !sharedProjectCanInvite}
-                  onChange={(event) =>
-                    onSharedInviteRoleChange(
-                      event.target.value === "viewer" ? "viewer" : "editor"
-                    )
-                  }
-                >
-                  <option value="editor">Editor</option>
-                  <option value="viewer">Viewer</option>
-                </select>
-              </div>
-              <button
-                className="text-button"
-                type="button"
-                disabled={sharedBusy || !sharedProjectCanInvite}
-                onClick={onSharedInviteToActiveProject}
-              >
-                <Plus aria-hidden="true" size={14} />
-                Invite
-              </button>
-              <div className="shared-presence" aria-label="Shared members">
-                <span className="eyebrow">Members</span>
-                {sharedMembers.length === 0 ? (
-                  <p className="empty-state">No project members loaded.</p>
-                ) : (
-                  sharedMembers.map((member) => (
-                    <div className="shared-presence__row" key={member.userId}>
-                      <span>{member.name ?? member.email ?? member.userId}</span>
-                      <span className="shared-member-controls">
-                        {sharedProjectCanInvite && member.role !== "owner" ? (
-                          <>
-                            <select
-                              className="compact-select shared-member-role-select"
-                              aria-label={`Role for ${member.email ?? member.userId}`}
-                              value={member.role}
-                              disabled={sharedBusy}
-                              onChange={(event) =>
-                                onSharedMemberRoleChange(
-                                  member.userId,
-                                  event.target.value === "viewer" ? "viewer" : "editor"
-                                )
-                              }
-                            >
-                              <option value="editor">Editor</option>
-                              <option value="viewer">Viewer</option>
-                            </select>
-                            <button
-                              className="inline-text-button"
-                              type="button"
-                              disabled={sharedBusy}
-                              onClick={() => onSharedOwnershipTransfer(member)}
-                            >
-                              Transfer ownership
-                            </button>
-                            <button
-                              className="inline-text-button"
-                              type="button"
-                              disabled={sharedBusy}
-                              onClick={() => onSharedMemberRemove(member.userId)}
-                            >
-                              Remove
-                            </button>
-                          </>
-                        ) : (
-                          formatSharedProjectRole(member.role)
-                        )}
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
-              <div className="shared-presence" aria-label="Active shared collaborators">
-                <span className="eyebrow">Active now</span>
-                {sharedPresence.length === 0 ? (
-                  <p className="empty-state">No active collaborators.</p>
-                ) : (
-                  sharedPresence.map((presence) => (
-                    <div className="shared-presence__row" key={presence.userId}>
-                      <span>{presence.displayName}</span>
-                      <span>{presence.filePath ?? "Project"}</span>
-                    </div>
-                  ))
-                )}
-              </div>
-              <div className="shared-presence" aria-label="Shared comments">
-                <span className="eyebrow">Comments</span>
-                <label className="template-picker__field">
-                  <span className="eyebrow">
-                    {activeFilePath === undefined
-                      ? "Project comment"
-                      : `Comment on ${activeFilePath}`}
-                  </span>
-                  <textarea
-                    rows={3}
-                    value={sharedCommentDraft}
-                    disabled={sharedBusy || activeSharedProject === null}
-                    onChange={(event) => onSharedCommentDraftChange(event.target.value)}
-                  />
-                </label>
-                <button
-                  className="text-button"
-                  type="button"
-                  disabled={
-                    sharedBusy ||
-                    activeSharedProject === null ||
-                    sharedCommentDraft.trim().length === 0
-                  }
-                  onClick={onCreateSharedComment}
-                >
-                  <Plus aria-hidden="true" size={14} />
-                  Comment
-                </button>
-                {sharedComments.length === 0 ? (
-                  <p className="empty-state">No shared comments yet.</p>
-                ) : (
-                  sharedComments.map((comment) => (
-                    <div className="shared-presence__row" key={comment.id}>
-                      <span>{formatSharedCommentTitle(comment)}</span>
-                      <span>
-                        {formatSharedCommentDetails(comment)}
-                        {comment.resolved ? null : (
-                          <button
-                            className="inline-text-button"
-                            type="button"
-                            disabled={sharedBusy}
-                            onClick={() => onResolveSharedComment(comment.id)}
-                          >
-                            Resolve
-                          </button>
-                        )}
-                      </span>
-                      <pre className="shared-agent-changeset-preview">
-                        {comment.body}
-                      </pre>
-                    </div>
-                  ))
-                )}
-              </div>
-              <div className="shared-presence" aria-label="Shared file revisions">
-                <span className="eyebrow">File revisions</span>
-                {activeFilePath === null ? (
-                  <p className="empty-state">Open a shared file to see revisions.</p>
-                ) : sharedFileRevisions.length === 0 ? (
-                  <p className="empty-state">No revision history loaded.</p>
-                ) : (
-                  sharedFileRevisions.map((revision) => (
-                    <div className="shared-presence__row" key={revision.id}>
-                      <span>{formatSharedRevisionLabel(revision.id)}</span>
-                      <span>
-                        {formatSharedFileRevisionDetails(revision)}
-                        <button
-                          className="inline-text-button"
-                          type="button"
-                          onClick={() => onInspectSharedFileRevision(revision.id)}
-                        >
-                          Inspect
-                        </button>
-                        <button
-                          className="inline-text-button"
-                          type="button"
-                          disabled={sharedBusy || !sharedProjectCanEdit}
-                          onClick={() => onRestoreSharedFileRevision(revision.id)}
-                        >
-                          Restore
-                        </button>
-                      </span>
-                    </div>
-                  ))
-                )}
-                {selectedSharedFileRevision === null ? null : (
-                  <pre className="shared-agent-changeset-preview">
-                    {formatSharedFileRevisionPreview(selectedSharedFileRevision)}
-                  </pre>
-                )}
-              </div>
-              <div className="shared-presence" aria-label="Shared compile history">
-                <span className="eyebrow">Recent local compiles</span>
-                {sharedBuildArtifacts.length === 0 ? (
-                  <p className="empty-state">No shared compile history yet.</p>
-                ) : (
-                  sharedBuildArtifacts.map((artifact) => (
-                    <div className="shared-presence__row" key={artifact.id}>
-                      <span>
-                        {artifact.compiler} {artifact.status}
-                      </span>
-                      <span>
-                        {formatSharedBuildArtifactDetails(artifact)}
-                        <button
-                          className="inline-text-button"
-                          type="button"
-                          onClick={() => onInspectSharedBuildArtifact(artifact.id)}
-                        >
-                          Inspect
-                        </button>
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
-              <div className="shared-presence" aria-label="Shared agent runs">
-                <span className="eyebrow">Agent runs</span>
-                {sharedAgentRuns.length === 0 ? (
-                  <p className="empty-state">No shared agent runs yet.</p>
-                ) : (
-                  sharedAgentRuns.map((agentRun) => (
-                    <div className="shared-presence__row" key={agentRun.id}>
-                      <span>{formatSharedAgentRunTitle(agentRun)}</span>
-                      <span>
-                        {formatSharedAgentRunDetails(agentRun)}
-                        {agentRun.changesetIds.map((changesetId, index) => (
-                          <button
-                            className="inline-text-button"
-                            disabled={
-                              !sharedAgentChangeSets.some(
-                                (changeset) => changeset.id === changesetId
-                              )
-                            }
-                            key={changesetId}
-                            type="button"
-                            onClick={() =>
-                              setSelectedSharedAgentChangeSetId(changesetId)
-                            }
-                          >
-                            {formatSharedAgentChangeSetLinkLabel(
-                              index,
-                              agentRun.changesetIds.length
-                            )}
-                          </button>
-                        ))}
-                        {agentRun.buildArtifactIds.map((artifactId, index) => (
-                          <button
-                            className="inline-text-button"
-                            key={artifactId}
-                            type="button"
-                            onClick={() => onInspectSharedBuildArtifact(artifactId)}
-                          >
-                            {formatSharedAgentRunBuildArtifactLabel(
-                              index,
-                              agentRun.buildArtifactIds.length
-                            )}
-                          </button>
-                        ))}
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
-              <div className="shared-presence" aria-label="Shared agent changesets">
-                <span className="eyebrow">Agent changesets</span>
-                {sharedAgentChangeSets.length === 0 ? (
-                  <p className="empty-state">No shared agent changesets yet.</p>
-                ) : (
-                  sharedAgentChangeSets.map((changeset) => {
-                    const isSelected = changeset.id === selectedSharedAgentChangeSetId;
-
-                    return (
-                      <div
-                        aria-current={isSelected ? "true" : undefined}
-                        className={`shared-presence__row${isSelected ? " shared-presence__row--selected" : ""}`}
-                        key={changeset.id}
-                      >
-                        <span>{formatSharedAgentChangeSetTitle(changeset)}</span>
-                        <span>
-                          {formatSharedAgentChangeSetDetails(changeset)}
-                          {changeset.status === "proposed" ? (
-                            <>
-                              <button
-                                className="inline-text-button"
-                                type="button"
-                                disabled={sharedBusy || !sharedProjectCanEdit}
-                                onClick={() => onApplySharedAgentChangeSet(changeset)}
-                              >
-                                Apply
-                              </button>
-                              <button
-                                className="inline-text-button"
-                                type="button"
-                                disabled={sharedBusy || !sharedProjectCanEdit}
-                                onClick={() => onRejectSharedAgentChangeSet(changeset)}
-                              >
-                                Reject
-                              </button>
-                            </>
-                          ) : null}
-                        </span>
-                        <pre className="shared-agent-changeset-preview">
-                          {changeset.patchPreview}
-                        </pre>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-              <div className="shared-presence" aria-label="Shared agent audit">
-                <span className="eyebrow">Agent audit</span>
-                {sharedAuditEvents.length === 0 ? (
-                  <p className="empty-state">No shared agent audit events yet.</p>
-                ) : (
-                  sharedAuditEvents.map((event) => (
-                    <div className="shared-presence__row" key={event.id}>
-                      <span>{formatSharedAgentAuditTitle(event)}</span>
-                      <span>
-                        {formatSharedAgentAuditDetails(event)}
-                        {event.changesetId === undefined ? null : (
-                          <button
-                            className="inline-text-button"
-                            disabled={
-                              !sharedAgentChangeSets.some(
-                                (changeset) => changeset.id === event.changesetId
-                              )
-                            }
-                            type="button"
-                            onClick={() =>
-                              event.changesetId === undefined
-                                ? undefined
-                                : setSelectedSharedAgentChangeSetId(event.changesetId)
-                            }
-                          >
-                            Show changeset
-                          </button>
-                        )}
-                        {(event.buildArtifactIds ?? []).map((artifactId, index) => (
-                          <button
-                            className="inline-text-button"
-                            key={artifactId}
-                            type="button"
-                            onClick={() => onInspectSharedBuildArtifact(artifactId)}
-                          >
-                            {formatSharedAgentRunBuildArtifactLabel(
-                              index,
-                              event.buildArtifactIds?.length ?? 0
-                            )}
-                          </button>
-                        ))}
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
-              <div className="shared-presence" aria-label="Shared activity">
-                <span className="eyebrow">Shared activity</span>
-                {sharedActivity.length === 0 ? (
-                  <p className="empty-state">No shared activity yet.</p>
-                ) : (
-                  sharedActivity.map((activity) => (
-                    <div className="shared-presence__row" key={activity.id}>
-                      <span>{formatSharedActivityTitle(activity)}</span>
-                      <span>{formatSharedActivityDetails(activity)}</span>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          )}
-          {activeSharedProject === null && (
-            <div className="shared-projects shared-projects--active">
-              <div>
-                <span className="eyebrow">Share</span>
-                <strong>Local project</strong>
-                <span className="shared-projects__status">{sharedStatus}</span>
-              </div>
-              <div className="shared-projects__create">
-                <label className="template-picker__field">
-                  <span className="eyebrow">Shared name</span>
-                  <input
-                    type="text"
-                    value={sharedProjectName}
-                    disabled={sharedBusy}
-                    onChange={(event) => onSharedProjectNameChange(event.target.value)}
-                  />
-                </label>
-                <button
-                  className="text-button"
-                  type="button"
-                  disabled={
-                    sharedBusy ||
-                    !sharedConnection.connected ||
-                    sharedProjectName.trim().length === 0
-                  }
-                  onClick={onSharedCreateFromLocalProject}
-                >
-                  <Plus aria-hidden="true" size={14} />
-                  Share project
-                </button>
-              </div>
-            </div>
-          )}
           <div className="file-actions" aria-label="File actions">
             <IconButton
               label="New file"
@@ -9069,6 +8595,278 @@ function ProjectSidebar({
               ))
             )}
           </nav>
+          {activeSharedProject !== null && (
+            <>
+              <div className="shared-presence" aria-label="Shared comments">
+                <span className="eyebrow">Comments</span>
+                <label className="template-picker__field">
+                  <span className="eyebrow">
+                    {activeFilePath === undefined
+                      ? "Project comment"
+                      : `Comment on ${activeFilePath}`}
+                  </span>
+                  <textarea
+                    rows={3}
+                    value={sharedCommentDraft}
+                    disabled={sharedBusy || activeSharedProject === null}
+                    onChange={(event) => onSharedCommentDraftChange(event.target.value)}
+                  />
+                </label>
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={
+                    sharedBusy ||
+                    activeSharedProject === null ||
+                    sharedCommentDraft.trim().length === 0
+                  }
+                  onClick={onCreateSharedComment}
+                >
+                  <Plus aria-hidden="true" size={14} />
+                  Comment
+                </button>
+                {sharedComments.length === 0 ? (
+                  <p className="empty-state">Select text and leave a comment to start a discussion here.</p>
+                ) : (
+                  sharedComments.map((comment) => (
+                    <div className="shared-presence__row" key={comment.id}>
+                      <span>{formatSharedCommentTitle(comment)}</span>
+                      <span>
+                        {formatSharedCommentDetails(comment)}
+                        {comment.resolved ? null : (
+                          <button
+                            className="inline-text-button"
+                            type="button"
+                            disabled={sharedBusy}
+                            onClick={() => onResolveSharedComment(comment.id)}
+                          >
+                            Resolve
+                          </button>
+                        )}
+                      </span>
+                      <pre className="shared-agent-changeset-preview">
+                        {comment.body}
+                      </pre>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared file revisions">
+                <span className="eyebrow">File revisions</span>
+                {activeFilePath === null ? (
+                  <p className="empty-state">Open a shared file to see revisions.</p>
+                ) : sharedFileRevisions.length === 0 ? (
+                  <p className="empty-state">Revisions appear here after you save changes to this shared file.</p>
+                ) : (
+                  sharedFileRevisions.map((revision) => (
+                    <div className="shared-presence__row" key={revision.id}>
+                      <span>{formatSharedRevisionLabel(revision.id)}</span>
+                      <span>
+                        {formatSharedFileRevisionDetails(revision)}
+                        <button
+                          className="inline-text-button"
+                          type="button"
+                          onClick={() => onInspectSharedFileRevision(revision.id)}
+                        >
+                          Inspect
+                        </button>
+                        <button
+                          className="inline-text-button"
+                          type="button"
+                          disabled={sharedBusy || !sharedProjectCanEdit}
+                          onClick={() => onRestoreSharedFileRevision(revision.id)}
+                        >
+                          Restore
+                        </button>
+                      </span>
+                    </div>
+                  ))
+                )}
+                {selectedSharedFileRevision === null ? null : (
+                  <pre className="shared-agent-changeset-preview">
+                    {formatSharedFileRevisionPreview(selectedSharedFileRevision)}
+                  </pre>
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared compile history">
+                <span className="eyebrow">Recent local compiles</span>
+                {sharedBuildArtifacts.length === 0 ? (
+                  <p className="empty-state">Compile history appears here after you compile this shared project.</p>
+                ) : (
+                  sharedBuildArtifacts.map((artifact) => (
+                    <div className="shared-presence__row" key={artifact.id}>
+                      <span>
+                        {artifact.compiler} {artifact.status}
+                      </span>
+                      <span>
+                        {formatSharedBuildArtifactDetails(artifact)}
+                        <button
+                          className="inline-text-button"
+                          type="button"
+                          onClick={() => onInspectSharedBuildArtifact(artifact.id)}
+                        >
+                          Inspect
+                        </button>
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared agent runs">
+                <span className="eyebrow">Agent runs</span>
+                {sharedAgentRuns.length === 0 ? (
+                  <p className="empty-state">Runs appear here after you ask the agent to do something.</p>
+                ) : (
+                  sharedAgentRuns.map((agentRun) => (
+                    <div className="shared-presence__row" key={agentRun.id}>
+                      <span>{formatSharedAgentRunTitle(agentRun)}</span>
+                      <span>
+                        {formatSharedAgentRunDetails(agentRun)}
+                        {agentRun.changesetIds.map((changesetId, index) => (
+                          <button
+                            className="inline-text-button"
+                            disabled={
+                              !sharedAgentChangeSets.some(
+                                (changeset) => changeset.id === changesetId
+                              )
+                            }
+                            key={changesetId}
+                            type="button"
+                            onClick={() =>
+                              setSelectedSharedAgentChangeSetId(changesetId)
+                            }
+                          >
+                            {formatSharedAgentChangeSetLinkLabel(
+                              index,
+                              agentRun.changesetIds.length
+                            )}
+                          </button>
+                        ))}
+                        {agentRun.buildArtifactIds.map((artifactId, index) => (
+                          <button
+                            className="inline-text-button"
+                            key={artifactId}
+                            type="button"
+                            onClick={() => onInspectSharedBuildArtifact(artifactId)}
+                          >
+                            {formatSharedAgentRunBuildArtifactLabel(
+                              index,
+                              agentRun.buildArtifactIds.length
+                            )}
+                          </button>
+                        ))}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared agent changesets">
+                <span className="eyebrow">Agent changesets</span>
+                {sharedAgentChangeSets.length === 0 ? (
+                  <p className="empty-state">Changesets appear here after the agent proposes an edit.</p>
+                ) : (
+                  sharedAgentChangeSets.map((changeset) => {
+                    const isSelected = changeset.id === selectedSharedAgentChangeSetId;
+
+                    return (
+                      <div
+                        aria-current={isSelected ? "true" : undefined}
+                        className={`shared-presence__row${isSelected ? " shared-presence__row--selected" : ""}`}
+                        key={changeset.id}
+                      >
+                        <span>{formatSharedAgentChangeSetTitle(changeset)}</span>
+                        <span>
+                          {formatSharedAgentChangeSetDetails(changeset)}
+                          {changeset.status === "proposed" ? (
+                            <>
+                              <button
+                                className="inline-text-button"
+                                type="button"
+                                disabled={sharedBusy || !sharedProjectCanEdit}
+                                onClick={() => onApplySharedAgentChangeSet(changeset)}
+                              >
+                                Apply
+                              </button>
+                              <button
+                                className="inline-text-button"
+                                type="button"
+                                disabled={sharedBusy || !sharedProjectCanEdit}
+                                onClick={() => onRejectSharedAgentChangeSet(changeset)}
+                              >
+                                Reject
+                              </button>
+                            </>
+                          ) : null}
+                        </span>
+                        <pre className="shared-agent-changeset-preview">
+                          {changeset.patchPreview}
+                        </pre>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared agent audit">
+                <span className="eyebrow">Agent audit</span>
+                {sharedAuditEvents.length === 0 ? (
+                  <p className="empty-state">Entries appear here as agent actions are approved or rejected.</p>
+                ) : (
+                  sharedAuditEvents.map((event) => (
+                    <div className="shared-presence__row" key={event.id}>
+                      <span>{formatSharedAgentAuditTitle(event)}</span>
+                      <span>
+                        {formatSharedAgentAuditDetails(event)}
+                        {event.changesetId === undefined ? null : (
+                          <button
+                            className="inline-text-button"
+                            disabled={
+                              !sharedAgentChangeSets.some(
+                                (changeset) => changeset.id === event.changesetId
+                              )
+                            }
+                            type="button"
+                            onClick={() =>
+                              event.changesetId === undefined
+                                ? undefined
+                                : setSelectedSharedAgentChangeSetId(event.changesetId)
+                            }
+                          >
+                            Show changeset
+                          </button>
+                        )}
+                        {(event.buildArtifactIds ?? []).map((artifactId, index) => (
+                          <button
+                            className="inline-text-button"
+                            key={artifactId}
+                            type="button"
+                            onClick={() => onInspectSharedBuildArtifact(artifactId)}
+                          >
+                            {formatSharedAgentRunBuildArtifactLabel(
+                              index,
+                              event.buildArtifactIds?.length ?? 0
+                            )}
+                          </button>
+                        ))}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Shared activity">
+                <span className="eyebrow">Shared activity</span>
+                {sharedActivity.length === 0 ? (
+                  <p className="empty-state">This fills in as collaborators make changes to the project.</p>
+                ) : (
+                  sharedActivity.map((activity) => (
+                    <div className="shared-presence__row" key={activity.id}>
+                      <span>{formatSharedActivityTitle(activity)}</span>
+                      <span>{formatSharedActivityDetails(activity)}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </>
+          )}
         </>
       )}
     </aside>
@@ -9079,68 +8877,15 @@ function RecentProjects({
   onClearRecentProjects,
   onOpenProject,
   onOpenRecentProject,
-  onSharedAcceptInvitation,
-  onSharedCreateProject,
-  onSharedCreateFromSourceZip,
-  onSharedEmailChange,
-  onSharedInvitationIdChange,
-  onSharedNameChange,
-  onSharedDeleteProject,
-  onSharedExportSourceZip,
-  onSharedOpenProject,
-  onSharedProjectNameChange,
-  onSharedRefreshProjects,
-  onSharedServerUrlChange,
-  onSharedSessionRevoke,
-  onSharedSignIn,
-  onSharedSignOut,
-  recentProjects,
-  sharedBusy,
-  sharedConnection,
-  sharedEmail,
-  sharedInvitationId,
-  sharedName,
-  sharedProjectName,
-  sharedProjects,
-  sharedServerUrl,
-  sharedSessions,
-  sharedStatus
+  onOpenShareModal,
+  recentProjects
 }: {
   readonly onClearRecentProjects: () => void;
   readonly onOpenProject: () => void;
   readonly onOpenRecentProject: (rootPath: string) => void;
-  readonly onSharedAcceptInvitation: () => void;
-  readonly onSharedCreateProject: () => void;
-  readonly onSharedCreateFromSourceZip: () => void;
-  readonly onSharedEmailChange: (email: string) => void;
-  readonly onSharedInvitationIdChange: (invitationId: string) => void;
-  readonly onSharedNameChange: (name: string) => void;
-  readonly onSharedDeleteProject: (project: SharedProjectSummary) => void;
-  readonly onSharedExportSourceZip: (project: SharedProjectSummary) => void;
-  readonly onSharedOpenProject: (projectId: string) => void;
-  readonly onSharedProjectNameChange: (name: string) => void;
-  readonly onSharedRefreshProjects: () => void;
-  readonly onSharedServerUrlChange: (serverUrl: string) => void;
-  readonly onSharedSessionRevoke: (sessionId: string) => void;
-  readonly onSharedSignIn: () => void;
-  readonly onSharedSignOut: () => void;
+  readonly onOpenShareModal: () => void;
   readonly recentProjects: readonly RecentProject[];
-  readonly sharedBusy: boolean;
-  readonly sharedConnection: SharedProjectConnection;
-  readonly sharedEmail: string;
-  readonly sharedInvitationId: string;
-  readonly sharedName: string;
-  readonly sharedProjectName: string;
-  readonly sharedProjects: readonly SharedProjectSummary[];
-  readonly sharedServerUrl: string;
-  readonly sharedSessions: readonly SharedProjectSessionSummary[];
-  readonly sharedStatus: string;
 }) {
-  const sharedConnectionLabel =
-    sharedConnection.connected && sharedConnection.user !== undefined
-      ? sharedConnection.user.email
-      : "Not connected";
-
   return (
     <div className="recent-projects">
       <section className="recent-header">
@@ -9158,206 +8903,15 @@ function RecentProjects({
           <FolderOpen aria-hidden="true" size={15} />
           Open Folder
         </button>
-      </div>
-
-      <section className="shared-projects" aria-label="Shared projects">
-        <div className="recent-list__header">
-          <div>
-            <span className="eyebrow">Shared Projects</span>
-            <strong>{sharedConnectionLabel}</strong>
-          </div>
-          <IconButton
-            label="Refresh shared projects"
-            disabled={!sharedConnection.connected || sharedBusy}
-            onClick={onSharedRefreshProjects}
-          >
-            <RefreshCw size={14} />
-          </IconButton>
-        </div>
-
-        <div className="shared-projects__fields">
-          <label className="template-picker__field">
-            <span className="eyebrow">Server URL</span>
-            <input
-              type="url"
-              value={sharedServerUrl}
-              disabled={sharedBusy}
-              onChange={(event) => onSharedServerUrlChange(event.target.value)}
-            />
-          </label>
-          <label className="template-picker__field">
-            <span className="eyebrow">Email</span>
-            <input
-              type="email"
-              value={sharedEmail}
-              disabled={sharedBusy}
-              onChange={(event) => onSharedEmailChange(event.target.value)}
-            />
-          </label>
-          <label className="template-picker__field">
-            <span className="eyebrow">Name</span>
-            <input
-              type="text"
-              value={sharedName}
-              disabled={sharedBusy}
-              onChange={(event) => onSharedNameChange(event.target.value)}
-            />
-          </label>
-        </div>
-
         <button
-          className="primary-button"
+          className="text-button recent-open-share-modal"
           type="button"
-          disabled={sharedBusy}
-          onClick={onSharedSignIn}
+          onClick={onOpenShareModal}
         >
-          <Check aria-hidden="true" size={15} />
-          Sign In
+          <Share2 aria-hidden="true" size={15} />
+          Shared Projects
         </button>
-
-        {sharedConnection.connected && (
-          <button
-            className="text-button"
-            type="button"
-            disabled={sharedBusy}
-            onClick={onSharedSignOut}
-          >
-            <X aria-hidden="true" size={14} />
-            Sign Out
-          </button>
-        )}
-
-        {sharedConnection.connected && (
-          <div className="shared-presence" aria-label="Shared sessions">
-            <span className="eyebrow">Sessions</span>
-            {sharedSessions.length === 0 ? (
-              <p className="empty-state">No active sessions loaded.</p>
-            ) : (
-              sharedSessions.map((session) => (
-                <div className="shared-presence__row" key={session.id}>
-                  <span>{formatSharedSessionLabel(session)}</span>
-                  <span>{formatSharedSessionDetails(session)}</span>
-                  {!session.current && (
-                    <button
-                      className="inline-text-button"
-                      type="button"
-                      disabled={sharedBusy}
-                      onClick={() => onSharedSessionRevoke(session.id)}
-                    >
-                      Revoke
-                    </button>
-                  )}
-                </div>
-              ))
-            )}
-          </div>
-        )}
-
-        {sharedConnection.connected && (
-          <div className="shared-projects__create">
-            <label className="template-picker__field">
-              <span className="eyebrow">Project name</span>
-              <input
-                type="text"
-                value={sharedProjectName}
-                disabled={sharedBusy}
-                onChange={(event) => onSharedProjectNameChange(event.target.value)}
-              />
-            </label>
-            <button
-              className="text-button"
-              type="button"
-              disabled={sharedBusy}
-              onClick={onSharedCreateProject}
-            >
-              <Plus aria-hidden="true" size={14} />
-              Create
-            </button>
-            <button
-              className="text-button"
-              type="button"
-              disabled={sharedBusy}
-              onClick={onSharedCreateFromSourceZip}
-            >
-              <FolderOpen aria-hidden="true" size={14} />
-              Import ZIP
-            </button>
-          </div>
-        )}
-
-        {sharedConnection.connected && (
-          <div className="shared-projects__create">
-            <label className="template-picker__field">
-              <span className="eyebrow">Invitation id</span>
-              <input
-                type="text"
-                value={sharedInvitationId}
-                disabled={sharedBusy}
-                onChange={(event) => onSharedInvitationIdChange(event.target.value)}
-              />
-            </label>
-            <button
-              className="text-button"
-              type="button"
-              disabled={sharedBusy}
-              onClick={onSharedAcceptInvitation}
-            >
-              <Check aria-hidden="true" size={14} />
-              Accept
-            </button>
-          </div>
-        )}
-
-        <p className="shared-projects__status">{sharedStatus}</p>
-
-        {sharedConnection.connected && (
-          <div className="recent-list" aria-label="Shared project list">
-            {sharedProjects.length === 0 ? (
-              <p className="empty-state">No shared projects yet.</p>
-            ) : (
-              sharedProjects.map((project) => (
-                <div className="shared-project-row" key={project.id}>
-                  <button
-                    className="recent-row shared-project-row__open"
-                    type="button"
-                    disabled={sharedBusy}
-                    onClick={() => onSharedOpenProject(project.id)}
-                  >
-                    <span className="recent-row__title">{project.name}</span>
-                    <span className="recent-row__path">{project.id}</span>
-                    <span className="recent-row__meta">
-                      {formatSharedProjectRole(project.role)} ·{" "}
-                      {formatSharedProjectDetails(project)}
-                    </span>
-                  </button>
-                  <IconButton
-                    label={
-                      project.role === "owner"
-                        ? `Export shared source ZIP for ${project.name}`
-                        : "Only owners can export shared projects"
-                    }
-                    disabled={sharedBusy || project.role !== "owner"}
-                    onClick={() => onSharedExportSourceZip(project)}
-                  >
-                    <Download size={14} />
-                  </IconButton>
-                  <IconButton
-                    label={
-                      project.role === "owner"
-                        ? `Delete shared project ${project.name}`
-                        : "Only owners can delete shared projects"
-                    }
-                    disabled={sharedBusy || project.role !== "owner"}
-                    onClick={() => onSharedDeleteProject(project)}
-                  >
-                    <Trash2 size={14} />
-                  </IconButton>
-                </div>
-              ))
-            )}
-          </div>
-        )}
-      </section>
+      </div>
 
       <div className="recent-list" aria-label="Recent projects">
         <div className="recent-list__header">
@@ -9389,6 +8943,504 @@ function RecentProjects({
           ))
         )}
       </div>
+    </div>
+  );
+}
+
+function ShareDialog({
+  activeSharedProject,
+  hasProject,
+  onClose,
+  onSharedAcceptInvitation,
+  onSharedCreateFromLocalProject,
+  onSharedCreateFromSourceZip,
+  onSharedCreateProject,
+  onSharedDeleteProject,
+  onSharedEmailChange,
+  onSharedExportSourceZip,
+  onSharedInvitationIdChange,
+  onSharedInviteEmailChange,
+  onSharedInviteRoleChange,
+  onSharedInviteToActiveProject,
+  onSharedMemberRoleChange,
+  onSharedMemberRemove,
+  onSharedNameChange,
+  onSharedOpenProject,
+  onSharedOwnershipTransfer,
+  onSharedProjectNameChange,
+  onSharedRefreshProjects,
+  onSharedServerUrlChange,
+  onSharedSessionRevoke,
+  onSharedSignIn,
+  onSharedSignOut,
+  open,
+  sharedBusy,
+  sharedConnection,
+  sharedDocumentSyncStatus,
+  sharedEmail,
+  sharedInvitationId,
+  sharedInviteEmail,
+  sharedInviteRole,
+  sharedMembers,
+  sharedName,
+  sharedPresence,
+  sharedProjectName,
+  sharedProjects,
+  sharedServerUrl,
+  sharedSessions,
+  sharedStatus
+}: {
+  readonly activeSharedProject: ActiveSharedProject | null;
+  readonly hasProject: boolean;
+  readonly onClose: () => void;
+  readonly onSharedAcceptInvitation: () => void;
+  readonly onSharedCreateFromLocalProject: () => void;
+  readonly onSharedCreateFromSourceZip: () => void;
+  readonly onSharedCreateProject: () => void;
+  readonly onSharedDeleteProject: (project: SharedProjectSummary) => void;
+  readonly onSharedEmailChange: (email: string) => void;
+  readonly onSharedExportSourceZip: (project: SharedProjectSummary) => void;
+  readonly onSharedInvitationIdChange: (invitationId: string) => void;
+  readonly onSharedInviteEmailChange: (email: string) => void;
+  readonly onSharedInviteRoleChange: (
+    role: Exclude<SharedProjectRole, "owner">
+  ) => void;
+  readonly onSharedInviteToActiveProject: () => void;
+  readonly onSharedMemberRoleChange: (
+    userId: string,
+    role: Exclude<SharedProjectRole, "owner">
+  ) => void;
+  readonly onSharedMemberRemove: (userId: string) => void;
+  readonly onSharedNameChange: (name: string) => void;
+  readonly onSharedOpenProject: (projectId: string) => void;
+  readonly onSharedOwnershipTransfer: (member: SharedProjectMemberSummary) => void;
+  readonly onSharedProjectNameChange: (name: string) => void;
+  readonly onSharedRefreshProjects: () => void;
+  readonly onSharedServerUrlChange: (serverUrl: string) => void;
+  readonly onSharedSessionRevoke: (sessionId: string) => void;
+  readonly onSharedSignIn: () => void;
+  readonly onSharedSignOut: () => void;
+  readonly open: boolean;
+  readonly sharedBusy: boolean;
+  readonly sharedConnection: SharedProjectConnection;
+  readonly sharedDocumentSyncStatus: string;
+  readonly sharedEmail: string;
+  readonly sharedInvitationId: string;
+  readonly sharedInviteEmail: string;
+  readonly sharedInviteRole: Exclude<SharedProjectRole, "owner">;
+  readonly sharedMembers: readonly SharedProjectMemberSummary[];
+  readonly sharedName: string;
+  readonly sharedPresence: readonly SharedProjectPresenceSummary[];
+  readonly sharedProjectName: string;
+  readonly sharedProjects: readonly SharedProjectSummary[];
+  readonly sharedServerUrl: string;
+  readonly sharedSessions: readonly SharedProjectSessionSummary[];
+  readonly sharedStatus: string;
+}) {
+  const sharedProjectCanInvite = activeSharedProject?.role === "owner";
+  const sharedConnectionLabel =
+    sharedConnection.connected && sharedConnection.user !== undefined
+      ? sharedConnection.user.email
+      : "Not connected";
+  const initialFocusRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      window.setTimeout(() => initialFocusRef.current?.focus(), 0);
+    }
+  }, [open, hasProject]);
+
+  if (!open) {
+    return null;
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        className="settings-dialog share-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="share-dialog-title"
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            onClose();
+          }
+        }}
+      >
+        <header className="dialog-header">
+          <div>
+            <span className="eyebrow">Collaboration</span>
+            <h2 id="share-dialog-title">
+              {hasProject ? "Share project" : "Shared Projects"}
+            </h2>
+          </div>
+          <IconButton label="Close share dialog" onClick={onClose}>
+            <X size={17} />
+          </IconButton>
+        </header>
+
+        <div className="settings-body share-dialog__body">
+          {!hasProject && (
+            <section className="shared-projects" aria-label="Shared projects">
+              <div className="recent-list__header">
+                <div>
+                  <span className="eyebrow">Shared Projects</span>
+                  <strong>{sharedConnectionLabel}</strong>
+                </div>
+                <IconButton
+                  label="Refresh shared projects"
+                  disabled={!sharedConnection.connected || sharedBusy}
+                  onClick={onSharedRefreshProjects}
+                >
+                  <RefreshCw size={14} />
+                </IconButton>
+              </div>
+
+              <div className="shared-projects__fields">
+                <label className="template-picker__field">
+                  <span className="eyebrow">Server URL</span>
+                  <input
+                    ref={initialFocusRef}
+                    type="url"
+                    value={sharedServerUrl}
+                    disabled={sharedBusy}
+                    onChange={(event) => onSharedServerUrlChange(event.target.value)}
+                  />
+                </label>
+                <label className="template-picker__field">
+                  <span className="eyebrow">Email</span>
+                  <input
+                    type="email"
+                    value={sharedEmail}
+                    disabled={sharedBusy}
+                    onChange={(event) => onSharedEmailChange(event.target.value)}
+                  />
+                </label>
+                <label className="template-picker__field">
+                  <span className="eyebrow">Name</span>
+                  <input
+                    type="text"
+                    value={sharedName}
+                    disabled={sharedBusy}
+                    onChange={(event) => onSharedNameChange(event.target.value)}
+                  />
+                </label>
+              </div>
+
+              <button
+                className="primary-button"
+                type="button"
+                disabled={sharedBusy}
+                onClick={onSharedSignIn}
+              >
+                <Check aria-hidden="true" size={15} />
+                Sign In
+              </button>
+
+              {sharedConnection.connected && (
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={sharedBusy}
+                  onClick={onSharedSignOut}
+                >
+                  <X aria-hidden="true" size={14} />
+                  Sign Out
+                </button>
+              )}
+
+              {sharedConnection.connected && (
+                <div className="shared-presence" aria-label="Shared sessions">
+                  <span className="eyebrow">Sessions</span>
+                  {sharedSessions.length === 0 ? (
+                    <p className="empty-state">Devices currently signed in to your shared account are listed here.</p>
+                  ) : (
+                    sharedSessions.map((session) => (
+                      <div className="shared-presence__row" key={session.id}>
+                        <span>{formatSharedSessionLabel(session)}</span>
+                        <span>{formatSharedSessionDetails(session)}</span>
+                        {!session.current && (
+                          <button
+                            className="inline-text-button"
+                            type="button"
+                            disabled={sharedBusy}
+                            onClick={() => onSharedSessionRevoke(session.id)}
+                          >
+                            Revoke
+                          </button>
+                        )}
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              {sharedConnection.connected && (
+                <div className="shared-projects__create">
+                  <label className="template-picker__field">
+                    <span className="eyebrow">Project name</span>
+                    <input
+                      type="text"
+                      value={sharedProjectName}
+                      disabled={sharedBusy}
+                      onChange={(event) => onSharedProjectNameChange(event.target.value)}
+                    />
+                  </label>
+                  <button
+                    className="text-button"
+                    type="button"
+                    disabled={sharedBusy}
+                    onClick={onSharedCreateProject}
+                  >
+                    <Plus aria-hidden="true" size={14} />
+                    Create
+                  </button>
+                  <button
+                    className="text-button"
+                    type="button"
+                    disabled={sharedBusy}
+                    onClick={onSharedCreateFromSourceZip}
+                  >
+                    <FolderOpen aria-hidden="true" size={14} />
+                    Import ZIP
+                  </button>
+                </div>
+              )}
+
+              {sharedConnection.connected && (
+                <div className="shared-projects__create">
+                  <label className="template-picker__field">
+                    <span className="eyebrow">Invitation id</span>
+                    <input
+                      type="text"
+                      value={sharedInvitationId}
+                      disabled={sharedBusy}
+                      onChange={(event) => onSharedInvitationIdChange(event.target.value)}
+                    />
+                  </label>
+                  <button
+                    className="text-button"
+                    type="button"
+                    disabled={sharedBusy}
+                    onClick={onSharedAcceptInvitation}
+                  >
+                    <Check aria-hidden="true" size={14} />
+                    Accept
+                  </button>
+                </div>
+              )}
+
+              <p className="shared-projects__status">{sharedStatus}</p>
+
+              {sharedConnection.connected && (
+                <div className="recent-list" aria-label="Shared project list">
+                  {sharedProjects.length === 0 ? (
+                    <p className="empty-state">Create a project above to start collaborating with others.</p>
+                  ) : (
+                    sharedProjects.map((project) => (
+                      <div className="shared-project-row" key={project.id}>
+                        <button
+                          className="recent-row shared-project-row__open"
+                          type="button"
+                          disabled={sharedBusy}
+                          onClick={() => onSharedOpenProject(project.id)}
+                        >
+                          <span className="recent-row__title">{project.name}</span>
+                          <span className="recent-row__path">{project.id}</span>
+                          <span className="recent-row__meta">
+                            {formatSharedProjectRole(project.role)} ·{" "}
+                            {formatSharedProjectDetails(project)}
+                          </span>
+                        </button>
+                        <IconButton
+                          label={
+                            project.role === "owner"
+                              ? `Export shared source ZIP for ${project.name}`
+                              : "Only owners can export shared projects"
+                          }
+                          disabled={sharedBusy || project.role !== "owner"}
+                          onClick={() => onSharedExportSourceZip(project)}
+                        >
+                          <Download size={14} />
+                        </IconButton>
+                        <IconButton
+                          label={
+                            project.role === "owner"
+                              ? `Delete shared project ${project.name}`
+                              : "Only owners can delete shared projects"
+                          }
+                          disabled={sharedBusy || project.role !== "owner"}
+                          onClick={() => onSharedDeleteProject(project)}
+                        >
+                          <Trash2 size={14} />
+                        </IconButton>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </section>
+          )}
+
+          {hasProject && activeSharedProject !== null && (
+            <div className="shared-projects shared-projects--active">
+              <div>
+                <span className="eyebrow">Share</span>
+                <strong>{activeSharedProject.id}</strong>
+                <span className="project-origin-badge">
+                  {formatSharedProjectRole(activeSharedProject.role)}
+                </span>
+                <span className="shared-projects__status">
+                  {activeSharedProject.role === "viewer"
+                    ? "Read-only shared project. Local compile remains available."
+                    : sharedDocumentSyncStatus}
+                </span>
+                <IconButton
+                  label="Sign out of shared projects"
+                  disabled={sharedBusy}
+                  onClick={onSharedSignOut}
+                >
+                  <X size={14} />
+                </IconButton>
+              </div>
+              <div className="shared-projects__create">
+                <label className="template-picker__field">
+                  <span className="eyebrow">Collaborator email</span>
+                  <input
+                    ref={initialFocusRef}
+                    type="email"
+                    value={sharedInviteEmail}
+                    disabled={sharedBusy || !sharedProjectCanInvite}
+                    onChange={(event) => onSharedInviteEmailChange(event.target.value)}
+                  />
+                </label>
+                <select
+                  className="compact-select"
+                  aria-label="Collaborator role"
+                  value={sharedInviteRole}
+                  disabled={sharedBusy || !sharedProjectCanInvite}
+                  onChange={(event) =>
+                    onSharedInviteRoleChange(
+                      event.target.value === "viewer" ? "viewer" : "editor"
+                    )
+                  }
+                >
+                  <option value="editor">Editor</option>
+                  <option value="viewer">Viewer</option>
+                </select>
+              </div>
+              <button
+                className="text-button"
+                type="button"
+                disabled={sharedBusy || !sharedProjectCanInvite}
+                onClick={onSharedInviteToActiveProject}
+              >
+                <Plus aria-hidden="true" size={14} />
+                Invite
+              </button>
+              <div className="shared-presence" aria-label="Shared members">
+                <span className="eyebrow">Members</span>
+                {sharedMembers.length === 0 ? (
+                  <p className="empty-state">Members appear once you invite collaborators to this shared project.</p>
+                ) : (
+                  sharedMembers.map((member) => (
+                    <div className="shared-presence__row" key={member.userId}>
+                      <span>{member.name ?? member.email ?? member.userId}</span>
+                      <span className="shared-member-controls">
+                        {sharedProjectCanInvite && member.role !== "owner" ? (
+                          <>
+                            <select
+                              className="compact-select shared-member-role-select"
+                              aria-label={`Role for ${member.email ?? member.userId}`}
+                              value={member.role}
+                              disabled={sharedBusy}
+                              onChange={(event) =>
+                                onSharedMemberRoleChange(
+                                  member.userId,
+                                  event.target.value === "viewer" ? "viewer" : "editor"
+                                )
+                              }
+                            >
+                              <option value="editor">Editor</option>
+                              <option value="viewer">Viewer</option>
+                            </select>
+                            <button
+                              className="inline-text-button"
+                              type="button"
+                              disabled={sharedBusy}
+                              onClick={() => onSharedOwnershipTransfer(member)}
+                            >
+                              Transfer ownership
+                            </button>
+                            <button
+                              className="inline-text-button"
+                              type="button"
+                              disabled={sharedBusy}
+                              onClick={() => onSharedMemberRemove(member.userId)}
+                            >
+                              Remove
+                            </button>
+                          </>
+                        ) : (
+                          formatSharedProjectRole(member.role)
+                        )}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="shared-presence" aria-label="Active shared collaborators">
+                <span className="eyebrow">Active now</span>
+                {sharedPresence.length === 0 ? (
+                  <p className="empty-state">Collaborators currently viewing or editing this project show up here.</p>
+                ) : (
+                  sharedPresence.map((presence) => (
+                    <div className="shared-presence__row" key={presence.userId}>
+                      <span>{presence.displayName}</span>
+                      <span>{presence.filePath ?? "Project"}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+
+          {hasProject && activeSharedProject === null && (
+            <div className="shared-projects shared-projects--active">
+              <div>
+                <span className="eyebrow">Share</span>
+                <strong>Local project</strong>
+                <span className="shared-projects__status">{sharedStatus}</span>
+              </div>
+              <div className="shared-projects__create">
+                <label className="template-picker__field">
+                  <span className="eyebrow">Shared name</span>
+                  <input
+                    ref={initialFocusRef}
+                    type="text"
+                    value={sharedProjectName}
+                    disabled={sharedBusy}
+                    onChange={(event) => onSharedProjectNameChange(event.target.value)}
+                  />
+                </label>
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={
+                    sharedBusy ||
+                    !sharedConnection.connected ||
+                    sharedProjectName.trim().length === 0
+                  }
+                  onClick={onSharedCreateFromLocalProject}
+                >
+                  <Plus aria-hidden="true" size={14} />
+                  Share project
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
     </div>
   );
 }
@@ -10716,7 +10768,6 @@ function BottomPanel({
   onInsertCitation,
   onKeepUnusedReference,
   onJumpToOutlineItem,
-  onProjectSearchQueryChange,
   onReferenceSearchQueryChange,
   onRefreshReferences,
   onRejectChangeSet,
@@ -10727,18 +10778,14 @@ function BottomPanel({
   onRollbackChangeSet,
   onRollbackWordChangeSet,
   onRunReferenceSearch,
-  onRunProjectSearch,
   onSelectChangeSet,
   onSelectWordChangeSet,
   onSelectDiagnostic,
   onSelectReferenceCitation,
   onSelectReferenceEntry,
-  onSelectSearchResult,
   onSnapshotActiveFile,
   onSuggestCitations,
   outline,
-  projectSearchQuery,
-  projectSearchResults,
   referenceAnalysis,
   referenceMessage,
   referenceSearchQuery,
@@ -10768,7 +10815,6 @@ function BottomPanel({
   readonly onInsertCitation: (key: string) => void;
   readonly onKeepUnusedReference: (entry: BibliographyEntry) => void;
   readonly onJumpToOutlineItem: (item: LatexOutlineItem) => void;
-  readonly onProjectSearchQueryChange: (query: string) => void;
   readonly onReferenceSearchQueryChange: (query: string) => void;
   readonly onRefreshReferences: () => void;
   readonly onRejectChangeSet: (changesetId: string) => void;
@@ -10783,18 +10829,14 @@ function BottomPanel({
   readonly onRollbackChangeSet: (changesetId: string) => void;
   readonly onRollbackWordChangeSet: (changesetId: string) => void;
   readonly onRunReferenceSearch: () => void;
-  readonly onRunProjectSearch: () => void;
   readonly onSelectChangeSet: (changesetId: string) => void;
   readonly onSelectWordChangeSet: (changesetId: string | null) => void;
   readonly onSelectDiagnostic: (diagnostic: LatexDiagnostic) => void;
   readonly onSelectReferenceCitation: (citation: CitationOccurrence) => void;
   readonly onSelectReferenceEntry: (entry: BibliographyEntry) => void;
-  readonly onSelectSearchResult: (result: ProjectSearchResult) => void;
   readonly onSnapshotActiveFile: () => void;
   readonly onSuggestCitations: () => void;
   readonly outline: readonly LatexOutlineItem[];
-  readonly projectSearchQuery: string;
-  readonly projectSearchResults: readonly ProjectSearchResult[];
   readonly referenceAnalysis: ReferenceAnalysis;
   readonly referenceMessage: string;
   readonly referenceSearchQuery: string;
@@ -10807,7 +10849,6 @@ function BottomPanel({
   const tabs: readonly BottomTab[] = [
     "Problems",
     "References",
-    "Search",
     "Outline",
     "History",
     "Log",
@@ -10828,8 +10869,6 @@ function BottomPanel({
           >
             {tab === "Problems" ? (
               <TriangleAlert aria-hidden="true" size={15} />
-            ) : tab === "Search" ? (
-              <Search aria-hidden="true" size={15} />
             ) : tab === "References" ? (
               <BookOpen aria-hidden="true" size={15} />
             ) : tab === "Outline" ? (
@@ -10849,15 +10888,6 @@ function BottomPanel({
             diagnostics={buildResult?.diagnostics ?? []}
             onFixDiagnostic={onFixDiagnostic}
             onSelectDiagnostic={onSelectDiagnostic}
-          />
-        )}
-        {activeTab === "Search" && (
-          <ProjectSearchPanel
-            query={projectSearchQuery}
-            results={projectSearchResults}
-            onQueryChange={onProjectSearchQueryChange}
-            onRunSearch={onRunProjectSearch}
-            onSelectResult={onSelectSearchResult}
           />
         )}
         {activeTab === "References" && (
@@ -11176,7 +11206,7 @@ function ReferencePanel({
           <h3>Entries</h3>
           <div className="result-list" role="list">
             {visibleEntries.length === 0 ? (
-              <p>No bibliography entries found.</p>
+              <p>Entries come from .bib files in the project.</p>
             ) : (
               visibleEntries.map((entry) => (
                 <article
@@ -11311,7 +11341,7 @@ function OutlinePanel({
   return (
     <div className="result-list" role="list">
       {outline.length === 0 ? (
-        <p>No outline for the current project.</p>
+        <p>The outline is built from section and chapter commands in your .tex files.</p>
       ) : (
         outline.map((item) => (
           <button
@@ -11438,7 +11468,7 @@ function HistoryPanel({
       <div className="history-grid">
         <div className="history-list" role="list" aria-label="Changesets">
           {changesets.length === 0 && wordChangeSets.length === 0 ? (
-            <p>No changesets yet.</p>
+            <p>Changesets appear here after the agent proposes an edit you can review.</p>
           ) : null}
           {changesets.length > 0 ? (
             <>
@@ -11625,7 +11655,7 @@ function HistoryPanel({
         <div className="audit-list" aria-label="Audit log">
           <strong>Action Timeline</strong>
           {auditEvents.length === 0 ? (
-            <p>No audit events.</p>
+            <p>Entries appear here as agent actions occur.</p>
           ) : (
             auditEvents.slice(0, 50).map((event) => {
               const timelineEvent = formatAuditTimelineEvent(event);
@@ -12314,6 +12344,7 @@ function SettingsTabPanel({
           />
           <TextField
             label="Document Server URL"
+            placeholder="e.g. https://your-onlyoffice-server.com"
             value={settings.onlyOffice.documentServerUrl}
             onChange={(documentServerUrl) =>
               onSettingsChange((current) => ({
@@ -12324,6 +12355,7 @@ function SettingsTabPanel({
           />
           <TextField
             label="Bridge callback URL"
+            placeholder="Leave blank to auto-detect"
             value={settings.onlyOffice.bridgePublicBaseUrl}
             onChange={(bridgePublicBaseUrl) =>
               onSettingsChange((current) => ({
@@ -12343,6 +12375,15 @@ function SettingsTabPanel({
               }))
             }
           />
+          <p className="settings-note">
+            These settings only matter if you're running your own ONLYOFFICE
+            Document Server. If you're just testing locally, you can leave
+            Bridge callback URL and JWT secret blank. The bridge callback URL
+            is the address ZeroLeaf's local bridge tells your Document Server
+            to call back on; leaving it blank lets ZeroLeaf detect it
+            automatically. The JWT secret is only needed if your Document
+            Server is configured to require signed requests.
+          </p>
           <section className="update-status-panel" aria-label="ONLYOFFICE status">
             <div className="update-status-heading">
               <div>
@@ -15910,6 +15951,26 @@ function formatBuildSecurityPolicy(buildResult: BuildResult): string {
 
 function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Project operation failed.";
+}
+
+async function confirmAction(options: {
+  readonly message: string;
+  readonly detail?: string;
+  readonly confirmLabel: string;
+  readonly cancelLabel?: string;
+  readonly destructive?: boolean;
+}): Promise<boolean> {
+  const cancelLabel = options.cancelLabel ?? "Cancel";
+  const result = await desktopApi.app.showMessageDialog({
+    message: options.message,
+    buttons: [options.confirmLabel, cancelLabel],
+    cancelId: 1,
+    defaultId: options.destructive === true ? 1 : 0,
+    ...(options.detail === undefined ? {} : { detail: options.detail }),
+    ...(options.destructive === undefined ? {} : { warning: options.destructive })
+  });
+
+  return result.buttonIndex === 0;
 }
 
 function formatRecentProjectDetails(project: RecentProject) {

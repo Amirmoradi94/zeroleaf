@@ -69,7 +69,7 @@ export const commandDefinitions: readonly CommandDefinition[] = [
   },
   {
     id: "toggle-problems",
-    title: "Toggle Bottom Panel",
+    title: "Toggle Panels",
     group: "Workbench"
   },
   {

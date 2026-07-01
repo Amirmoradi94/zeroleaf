@@ -119,7 +119,13 @@ const fallbackApi: DesktopApi = {
     openUpdateDownload: () =>
       Promise.reject(new Error("Electron app update API unavailable.")),
     installUpdate: () =>
-      Promise.reject(new Error("Electron app update install API unavailable."))
+      Promise.reject(new Error("Electron app update install API unavailable.")),
+    showMessageDialog: (request) => {
+      const text = [request.message, request.detail].filter(Boolean).join("\n\n");
+      const confirmed = window.confirm(text);
+      const cancelId = request.cancelId ?? request.buttons.length - 1;
+      return Promise.resolve({ buttonIndex: confirmed ? 0 : cancelId });
+    }
   },
   workbench: {
     loadLayout: () => Promise.resolve(readFallbackLayout()),
