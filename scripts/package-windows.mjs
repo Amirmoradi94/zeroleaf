@@ -36,9 +36,11 @@ const zipPath = resolve(releaseRoot, `ZeroLeaf-${appVersion}-win-x64.zip`);
 const localWorkspacePackages = [
   "agent-host",
   "core-domain",
+  "document-service",
   "history-service",
   "ipc-contracts",
   "latex-service",
+  "onlyoffice-service",
   "pdf-service",
   "project-lifecycle-service",
   "project-service",
@@ -46,7 +48,37 @@ const localWorkspacePackages = [
   "provider-openai-codex",
   "reference-service",
   "security",
+  "shared-project-client",
+  "shared-project-server",
   "ui"
+];
+const externalRuntimePackages = [
+  "@types/node",
+  "core-util-is",
+  "docx",
+  "hash.js",
+  "immediate",
+  "inherits",
+  "isarray",
+  "isomorphic.js",
+  "jszip",
+  "lib0",
+  "lie",
+  "minimalistic-assert",
+  "nanoid",
+  "pako",
+  "process-nextick-args",
+  "readable-stream",
+  "safe-buffer",
+  "sax",
+  "setimmediate",
+  "string_decoder",
+  "undici-types",
+  "util-deprecate",
+  "ws",
+  "xml",
+  "xml-js",
+  "yjs"
 ];
 
 async function copyTree(source, destination) {
@@ -228,6 +260,13 @@ for (const packageName of localWorkspacePackages) {
     resolve(bundledPackageRoot, "package.json")
   );
   await copyTree(resolve(packageRoot, "dist"), resolve(bundledPackageRoot, "dist"));
+}
+
+for (const packageName of externalRuntimePackages) {
+  await copyTree(
+    resolve(repoRoot, "node_modules", ...packageName.split("/")),
+    resolve(resourcesRoot, "node_modules", ...packageName.split("/"))
+  );
 }
 
 await createReleaseZip(appRoot, zipPath);

@@ -50,6 +50,8 @@ const localWorkspacePackages = [
   "provider-openai-codex",
   "reference-service",
   "security",
+  "shared-project-client",
+  "shared-project-server",
   "ui"
 ];
 const externalRuntimePackages = [
@@ -60,7 +62,9 @@ const externalRuntimePackages = [
   "immediate",
   "inherits",
   "isarray",
+  "isomorphic.js",
   "jszip",
+  "lib0",
   "lie",
   "minimalistic-assert",
   "nanoid",
@@ -73,8 +77,10 @@ const externalRuntimePackages = [
   "string_decoder",
   "undici-types",
   "util-deprecate",
+  "ws",
   "xml",
-  "xml-js"
+  "xml-js",
+  "yjs"
 ];
 
 async function copyTree(source, destination) {
