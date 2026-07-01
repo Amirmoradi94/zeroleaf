@@ -2780,6 +2780,12 @@ function registerIpcHandlers() {
     recentProjects: await getProjectMetadataStore().clearRecentProjects()
   }));
 
+  handleIpc(ipcChannels.projectRemoveRecent, async (_event, request) => ({
+    recentProjects: await getProjectMetadataStore().removeRecentProject(
+      request.rootPath
+    )
+  }));
+
   handleIpc(ipcChannels.projectRefresh, async (_event, request) => {
     return refreshProjectThroughActiveBackend(request.projectRoot);
   });

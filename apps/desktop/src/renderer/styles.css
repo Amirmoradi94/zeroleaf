@@ -738,6 +738,18 @@ h2 {
   font-size: 13px;
 }
 
+.recent-project-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.recent-project-row .icon-button {
+  align-self: start;
+  margin-top: 4px;
+}
+
 .recent-row {
   display: grid;
   gap: 5px;
@@ -2431,6 +2443,10 @@ input {
 .bottom-tabs button.active {
   background: #eaf3f1;
   color: #235b5f;
+}
+
+.bottom-tabs .icon-button {
+  margin-left: auto;
 }
 
 .bottom-content {

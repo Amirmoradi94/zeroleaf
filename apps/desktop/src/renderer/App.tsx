@@ -2583,6 +2583,17 @@ export function App() {
     });
   }, [runProjectOperation]);
 
+  const removeRecentProject = useCallback(
+    (rootPath: string) => {
+      void runProjectOperation(async () => {
+        const result = await desktopApi.project.removeRecent(rootPath);
+        setProjectState(result);
+        setStatusMessage("Removed project from recent.");
+      });
+    },
+    [runProjectOperation]
+  );
+
   const refreshSharedProjects = useCallback(() => {
     void runProjectOperation(async () => {
       if (!sharedConnection.connected) {
@@ -7712,6 +7723,7 @@ export function App() {
             onOpenRecentProject={openRecentProject}
             onOpenShareModal={() => setShareModalOpen(true)}
             onClearRecentProjects={clearRecentProjects}
+            onRemoveRecentProject={removeRecentProject}
             onRefreshProject={refreshProjectTree}
             onRejectSharedAgentChangeSet={rejectSharedAgentChangeSetFromPanel}
             onRestoreSharedFileRevision={restoreSharedFileRevision}
@@ -8008,6 +8020,7 @@ export function App() {
                 selectedChangeSetId={selectedChangeSetId}
                 submissionCheckResult={submissionCheckResult}
                 onActiveTabChange={setActiveBottomTab}
+                onClose={() => setBottomPanelOpen(false)}
                 onApplyChangeSet={applyChangeSet}
                 onApplyWordChangeSet={applyWordChangeSet}
                 onAttachReferenceEntry={attachReferenceEntryToAgent}
@@ -8332,6 +8345,7 @@ function ProjectSidebar({
   onOpenRecentProject,
   onOpenShareModal,
   onClearRecentProjects,
+  onRemoveRecentProject,
   onRefreshProject,
   onRejectSharedAgentChangeSet,
   onRestoreSharedFileRevision,
@@ -8379,6 +8393,7 @@ function ProjectSidebar({
   readonly onOpenRecentProject: (rootPath: string) => void;
   readonly onOpenShareModal: () => void;
   readonly onClearRecentProjects: () => void;
+  readonly onRemoveRecentProject: (rootPath: string) => void;
   readonly onRefreshProject: () => void;
   readonly onRejectSharedAgentChangeSet: (
     changeset: SharedProjectAgentChangeSetSummary
@@ -8451,20 +8466,7 @@ function ProjectSidebar({
     <aside className="project-sidebar" aria-label="Project files">
       <div className="panel-header">
         <div>
-          <span className="eyebrow">Project</span>
           <h2>{project?.displayName ?? "No Project"}</h2>
-          {project !== undefined && (
-            <span
-              className="project-origin-badge"
-              title={
-                activeSharedProject === null
-                  ? project.rootPath
-                  : activeSharedProject.localCachePath
-              }
-            >
-              {activeSharedProject === null ? "Local project" : "Shared project"}
-            </span>
-          )}
         </div>
         <IconButton label="Open project" onClick={onOpenProject}>
           <FolderOpen size={16} />
@@ -8488,6 +8490,7 @@ function ProjectSidebar({
           onOpenRecentProject={onOpenRecentProject}
           onOpenShareModal={onOpenShareModal}
           onClearRecentProjects={onClearRecentProjects}
+          onRemoveRecentProject={onRemoveRecentProject}
         />
       ) : (
         <>
@@ -8878,12 +8881,14 @@ function RecentProjects({
   onOpenProject,
   onOpenRecentProject,
   onOpenShareModal,
+  onRemoveRecentProject,
   recentProjects
 }: {
   readonly onClearRecentProjects: () => void;
   readonly onOpenProject: () => void;
   readonly onOpenRecentProject: (rootPath: string) => void;
   readonly onOpenShareModal: () => void;
+  readonly onRemoveRecentProject: (rootPath: string) => void;
   readonly recentProjects: readonly RecentProject[];
 }) {
   return (
@@ -8928,18 +8933,25 @@ function RecentProjects({
           <p className="empty-state">No recent projects yet. Open a folder to start.</p>
         ) : (
           recentProjects.map((project) => (
-            <button
-              className="recent-row"
-              key={project.rootPath}
-              type="button"
-              onClick={() => onOpenRecentProject(project.rootPath)}
-            >
-              <span className="recent-row__title">{project.displayName}</span>
-              <span className="recent-row__path">{project.rootPath}</span>
-              <span className="recent-row__meta">
-                {formatRecentProjectDetails(project)}
-              </span>
-            </button>
+            <div className="recent-project-row" key={project.rootPath}>
+              <button
+                className="recent-row"
+                type="button"
+                onClick={() => onOpenRecentProject(project.rootPath)}
+              >
+                <span className="recent-row__title">{project.displayName}</span>
+                <span className="recent-row__path">{project.rootPath}</span>
+                <span className="recent-row__meta">
+                  {formatRecentProjectDetails(project)}
+                </span>
+              </button>
+              <IconButton
+                label={`Remove ${project.displayName} from recent projects`}
+                onClick={() => onRemoveRecentProject(project.rootPath)}
+              >
+                <X size={14} />
+              </IconButton>
+            </div>
           ))
         )}
       </div>
@@ -10764,6 +10776,7 @@ function BottomPanel({
   onCreateChangeSet,
   onExplainChangeSetHunk,
   onActiveTabChange,
+  onClose,
   onFixDiagnostic,
   onInsertCitation,
   onKeepUnusedReference,
@@ -10804,6 +10817,7 @@ function BottomPanel({
   readonly buildRunning: boolean;
   readonly changeSetVerifications: Readonly<Record<string, ChangeSetVerification>>;
   readonly onActiveTabChange: (tab: BottomTab) => void;
+  readonly onClose: () => void;
   readonly historyChangeSets: readonly HistoryChangeSet[];
   readonly historyMessage: string;
   readonly onApplyChangeSet: (changesetId: string) => void;
@@ -10881,6 +10895,9 @@ function BottomPanel({
             {tab}
           </button>
         ))}
+        <IconButton label="Hide panels" onClick={onClose}>
+          <X size={15} />
+        </IconButton>
       </div>
       <div className="bottom-content" role="tabpanel">
         {activeTab === "Problems" && (
@@ -15091,7 +15108,52 @@ function formatAgentModelExecutionTitle(
     return "Retrying analysis";
   }
 
+  if (summary.startsWith("Claude is thinking:")) {
+    return "Thinking";
+  }
+
+  if (summary.startsWith("Claude is drafting a response:")) {
+    return "Drafting response";
+  }
+
+  if (summary.startsWith("Claude is using a tool:")) {
+    return formatClaudeLiveToolTitle(
+      summary.slice("Claude is using a tool:".length).trim()
+    );
+  }
+
+  if (summary.startsWith("Claude progress:")) {
+    return "Progress";
+  }
+
   return "Analyzing project";
+}
+
+function formatClaudeLiveToolTitle(toolDescription: string): string {
+  if (toolDescription.startsWith("Reading ")) {
+    return "Reading file";
+  }
+
+  if (toolDescription.startsWith("Editing ")) {
+    return "Editing file";
+  }
+
+  if (toolDescription.startsWith("Writing ")) {
+    return "Writing file";
+  }
+
+  if (
+    toolDescription.startsWith("Searching for ") ||
+    toolDescription.startsWith("Searching project for")
+  ) {
+    return "Searching project";
+  }
+
+  if (toolDescription.startsWith("Listing ")) {
+    return "Listing directory";
+  }
+
+  return "Using a tool";
 }
 
 function formatAgentModelExecutionDetail(summary: string): string {
@@ -15130,6 +15192,22 @@ function formatAgentModelExecutionDetail(summary: string): string {
 
   if (normalizedSummary.includes("retry")) {
     return "The agent is retrying with a narrower project-scoped prompt.";
+  }
+
+  if (summary.startsWith("Claude is thinking:")) {
+    return summary.slice("Claude is thinking:".length).trim();
+  }
+
+  if (summary.startsWith("Claude is drafting a response:")) {
+    return summary.slice("Claude is drafting a response:".length).trim();
+  }
+
+  if (summary.startsWith("Claude is using a tool:")) {
+    return summary.slice("Claude is using a tool:".length).trim();
+  }
+
+  if (summary.startsWith("Claude progress:")) {
+    return summary.slice("Claude progress:".length).trim();
   }
 
   return elapsedText === undefined

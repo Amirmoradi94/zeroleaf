@@ -140,6 +140,17 @@ export class ProjectMetadataStore {
     return [];
   }
 
+  async removeRecentProject(rootPath: string): Promise<readonly RecentProject[]> {
+    const metadata = await this.read();
+    const recentProjects = metadata.recentProjects.filter(
+      (storedProject) => storedProject.rootPath !== rootPath
+    );
+
+    await this.write({ ...metadata, recentProjects });
+
+    return recentProjects;
+  }
+
   async recordProjectOpened(
     project: ProjectSummary
   ): Promise<readonly RecentProject[]> {

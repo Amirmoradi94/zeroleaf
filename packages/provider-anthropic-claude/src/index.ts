@@ -33,6 +33,7 @@ const commonProviderCliDirs = [
 ] as const;
 
 export type ClaudeCodeToolBroker = {
+  readonly emitEvent?: (event: AgentEvent) => void;
   readonly readFile: (path: string) => Promise<ProjectFileSnapshot>;
   readonly searchProject: (query: string) => Promise<readonly ProjectFileSnapshot[]>;
   readonly proposePatch: (
@@ -48,6 +49,7 @@ export type ClaudeCodeRequest = {
   readonly projectRoot: string;
   readonly prompt: string;
   readonly timeoutMs: number;
+  readonly onProgress?: (summary: string) => void;
 };
 
 export type ClaudeAgentWordChangeSet = {
@@ -173,7 +175,10 @@ export class ClaudeProvider {
       mode: request.mode,
       projectRoot: request.projectRoot,
       timeoutMs: this.timeoutMs,
-      prompt: createClaudePrompt(request, snapshot)
+      prompt: createClaudePrompt(request, snapshot),
+      onProgress: (summary) => {
+        broker.emitEvent?.(createToolEvent(sessionId, "claude-code", "running", summary, "low"));
+      }
     });
     events.push(
       createToolEvent(
@@ -376,12 +381,14 @@ async function runClaudeCode(
   model: string,
   request: ClaudeCodeRequest
 ): Promise<ClaudeAgentResponse> {
-  const { stdout } = await runCommand(
+  const finalResult = await runClaudeCodeStream(
     claudeBinary,
     [
       "-p",
       "--output-format",
-      "json",
+      "stream-json",
+      "--include-partial-messages",
+      "--verbose",
       "--json-schema",
       JSON.stringify(claudeOutputSchema),
       "--permission-mode",
@@ -398,12 +405,176 @@ async function runClaudeCode(
       model,
       "-"
     ],
-    request.timeoutMs,
-    request.prompt,
-    request.projectRoot
+    request
   );
 
-  return parseClaudeAgentResponseFromCli(stdout);
+  return parseClaudeAgentResponseFromParsedResult(finalResult);
+}
+
+function runClaudeCodeStream(
+  command: string,
+  args: readonly string[],
+  request: ClaudeCodeRequest
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: request.projectRoot,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: createProviderCliEnv()
+    });
+    let pendingLine = "";
+    let stderr = "";
+    let finalResult: unknown;
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error(`${command} timed out after ${request.timeoutMs}ms.`));
+    }, request.timeoutMs);
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      pendingLine += chunk;
+      const lines = pendingLine.split("\n");
+      pendingLine = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const parsedLine = parseClaudeStreamLine(line);
+        if (parsedLine === undefined) {
+          continue;
+        }
+
+        if (parsedLine["type"] === "result") {
+          finalResult = parsedLine;
+          continue;
+        }
+
+        const progress = describeClaudeStreamEvent(parsedLine);
+        if (progress !== undefined) {
+          request.onProgress?.(progress);
+        }
+      }
+    });
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr = appendCapped(stderr, chunk, 240_000);
+    });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+
+      if (code !== 0) {
+        reject(
+          new Error(`${command} exited with ${code}: ${formatCommandFailure(stderr)}`)
+        );
+        return;
+      }
+
+      if (finalResult === undefined) {
+        reject(new Error("Claude Code returned no output."));
+        return;
+      }
+
+      resolve(finalResult);
+    });
+    child.stdin.end(request.prompt);
+  });
+}
+
+function parseClaudeStreamLine(line: string): Record<string, unknown> | undefined {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function describeClaudeStreamEvent(record: Record<string, unknown>): string | undefined {
+  if (record["type"] === "system" && record["subtype"] === "post_turn_summary") {
+    const detail = record["status_detail"];
+    return typeof detail === "string" && detail.trim().length > 0
+      ? `Claude progress: ${truncateForLiveStatus(detail)}`
+      : undefined;
+  }
+
+  if (record["type"] !== "assistant") {
+    return undefined;
+  }
+
+  const message = record["message"];
+  const content =
+    typeof message === "object" && message !== null
+      ? (message as Record<string, unknown>)["content"]
+      : undefined;
+
+  if (!Array.isArray(content) || content.length === 0) {
+    return undefined;
+  }
+
+  const block = content[content.length - 1] as Record<string, unknown>;
+
+  if (block["type"] === "thinking" && typeof block["thinking"] === "string") {
+    const thinking = block["thinking"].trim();
+    return thinking.length === 0
+      ? undefined
+      : `Claude is thinking: ${truncateForLiveStatus(thinking)}`;
+  }
+
+  if (block["type"] === "text" && typeof block["text"] === "string") {
+    const text = block["text"].trim();
+    return text.length === 0
+      ? undefined
+      : `Claude is drafting a response: ${truncateForLiveStatus(text)}`;
+  }
+
+  if (block["type"] === "tool_use" && typeof block["name"] === "string") {
+    return `Claude is using a tool: ${describeClaudeToolUse(block["name"], block["input"])}`;
+  }
+
+  return undefined;
+}
+
+function describeClaudeToolUse(toolName: string, input: unknown): string {
+  const fields = typeof input === "object" && input !== null
+    ? (input as Record<string, unknown>)
+    : {};
+
+  switch (toolName) {
+    case "Read":
+      return `Reading ${describeToolInputField(fields["file_path"])}`;
+    case "Edit":
+    case "MultiEdit":
+      return `Editing ${describeToolInputField(fields["file_path"])}`;
+    case "Write":
+      return `Writing ${describeToolInputField(fields["file_path"])}`;
+    case "Glob":
+      return `Searching for ${describeToolInputField(fields["pattern"])}`;
+    case "Grep":
+      return `Searching project for "${describeToolInputField(fields["pattern"])}"`;
+    case "LS":
+      return `Listing ${describeToolInputField(fields["path"])}`;
+    default:
+      return toolName;
+  }
+}
+
+function describeToolInputField(value: unknown): string {
+  return typeof value === "string" && value.trim().length > 0 ? value : "the project";
+}
+
+function truncateForLiveStatus(value: string): string {
+  const singleLine = value.replace(/\s+/gu, " ").trim();
+  return singleLine.length > 140 ? `${singleLine.slice(0, 140)}…` : singleLine;
 }
 
 export function getClaudeToolsForMode(mode: AgentStartRequest["mode"]): string {
@@ -487,8 +658,10 @@ export function parseClaudeAgentResponseFromCli(stdout: string): ClaudeAgentResp
     throw new Error("Claude Code returned no output.");
   }
 
-  const parsed = JSON.parse(stdout) as unknown;
+  return parseClaudeAgentResponseFromParsedResult(JSON.parse(stdout) as unknown);
+}
 
+function parseClaudeAgentResponseFromParsedResult(parsed: unknown): ClaudeAgentResponse {
   if (isClaudeErrorResult(parsed)) {
     throw new Error(
       `Claude Code returned an error result: ${getClaudeResultText(parsed)}`

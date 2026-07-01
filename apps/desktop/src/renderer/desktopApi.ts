@@ -155,6 +155,7 @@ const fallbackApi: DesktopApi = {
     open: () => Promise.resolve(undefined),
     openRecent: () => Promise.reject(new Error("Electron project API unavailable.")),
     clearRecent: () => Promise.resolve({ recentProjects: [] }),
+    removeRecent: () => Promise.resolve({ recentProjects: [] }),
     refresh: () => Promise.reject(new Error("Electron project API unavailable.")),
     createEntry: () => Promise.reject(new Error("Electron project API unavailable.")),
     renameEntry: () => Promise.reject(new Error("Electron project API unavailable.")),

@@ -12,6 +12,7 @@ export const ipcChannels = {
   projectOpen: "project.open",
   projectOpenRecent: "project.openRecent",
   projectClearRecent: "project.clearRecent",
+  projectRemoveRecent: "project.removeRecent",
   projectRefresh: "project.refresh",
   projectCreateEntry: "project.createEntry",
   projectRenameEntry: "project.renameEntry",
@@ -2826,6 +2827,7 @@ export type IpcRequestMap = {
   readonly [ipcChannels.projectOpen]: undefined;
   readonly [ipcChannels.projectOpenRecent]: { readonly rootPath: string };
   readonly [ipcChannels.projectClearRecent]: undefined;
+  readonly [ipcChannels.projectRemoveRecent]: { readonly rootPath: string };
   readonly [ipcChannels.projectRefresh]: { readonly projectRoot: string };
   readonly [ipcChannels.projectCreateEntry]: {
     readonly projectRoot: string;
@@ -3053,6 +3055,7 @@ export type IpcResponseMap = {
   readonly [ipcChannels.projectOpen]: ProjectOpenResult | undefined;
   readonly [ipcChannels.projectOpenRecent]: ProjectOpenResult;
   readonly [ipcChannels.projectClearRecent]: ProjectState;
+  readonly [ipcChannels.projectRemoveRecent]: ProjectState;
   readonly [ipcChannels.projectRefresh]: ProjectOpenResult;
   readonly [ipcChannels.projectCreateEntry]: ProjectOpenResult;
   readonly [ipcChannels.projectRenameEntry]: ProjectOpenResult;
@@ -3202,6 +3205,7 @@ export type DesktopApi = {
     readonly open: () => Promise<ProjectOpenResult | undefined>;
     readonly openRecent: (rootPath: string) => Promise<ProjectOpenResult>;
     readonly clearRecent: () => Promise<ProjectState>;
+    readonly removeRecent: (rootPath: string) => Promise<ProjectState>;
     readonly refresh: (projectRoot: string) => Promise<ProjectOpenResult>;
     readonly createEntry: (
       request: IpcRequestMap[typeof ipcChannels.projectCreateEntry]

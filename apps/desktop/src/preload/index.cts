@@ -37,6 +37,7 @@ const api: DesktopApi = {
     open: () => invoke("project.open", undefined),
     openRecent: (rootPath) => invoke("project.openRecent", { rootPath }),
     clearRecent: () => invoke("project.clearRecent", undefined),
+    removeRecent: (rootPath) => invoke("project.removeRecent", { rootPath }),
     refresh: (projectRoot) => invoke("project.refresh", { projectRoot }),
     createEntry: (request) => invoke("project.createEntry", request),
     renameEntry: (request) => invoke("project.renameEntry", request),
