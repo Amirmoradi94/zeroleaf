@@ -258,7 +258,6 @@ const agentProviderIds = [
   "anthropic-claude",
   "openrouter-design"
 ] as const satisfies readonly AgentProviderId[];
-const agentHistoryStorageKey = "zeroleaf-agent-history";
 const agentProviderStorageKey = "zeroleaf-agent-provider";
 const maxAgentImageAttachments = 4;
 const maxAgentImageAttachmentBytes = 6 * 1024 * 1024;
@@ -532,9 +531,7 @@ export function App() {
       selectedText: "",
       top: 0
     });
-  const [agentEvents, setAgentEvents] = useState<readonly AgentEvent[]>(() =>
-    readStoredAgentHistory()
-  );
+  const [agentEvents, setAgentEvents] = useState<readonly AgentEvent[]>([]);
   const [agentLiveStatus, setAgentLiveStatus] = useState<AgentLiveStatus | null>(null);
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentSessionId, setAgentSessionId] = useState<string | null>(null);
@@ -1809,10 +1806,6 @@ export function App() {
     sharedDocumentUpdateCursors,
     sharedRealtimeDocumentVersions
   ]);
-
-  useEffect(() => {
-    writeStoredAgentHistory(agentEvents);
-  }, [agentEvents]);
 
   useEffect(() => {
     if (!layoutLoaded) {
@@ -10139,18 +10132,6 @@ function AgentPane({
             <option value="openrouter-design">OpenRouter Design</option>
           </select>
         </label>
-        <label>
-          Mode
-          <select
-            value={mode}
-            onChange={(event) => onModeChange(event.target.value as AgentMode)}
-          >
-            <option value="suggest">Ask only</option>
-            <option value="apply-with-review">Review changes first</option>
-            <option value="autonomous-local">Auto-apply local changes</option>
-          </select>
-        </label>
-        <p className="agent-mode-help">{getAgentModeDescription(mode)}</p>
       </div>
 
       {selectedText !== null && (
@@ -13622,60 +13603,6 @@ function writeStoredAgentProvider(providerId: AgentProviderId) {
   } catch {
     // Local storage may be unavailable in restricted browser contexts.
   }
-}
-
-function readStoredAgentHistory(): readonly AgentEvent[] {
-  try {
-    const rawHistory = window.localStorage.getItem(agentHistoryStorageKey);
-    if (rawHistory === null) {
-      return [];
-    }
-
-    const parsed = JSON.parse(rawHistory) as unknown;
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed.filter(isStoredAgentMessageEvent).slice(-24);
-  } catch {
-    return [];
-  }
-}
-
-function writeStoredAgentHistory(events: readonly AgentEvent[]) {
-  try {
-    const messageEvents = events
-      .filter((event) => event.type === "message")
-      .filter((event) => !isOperationalAgentStatusMessage(event.content))
-      .slice(-24);
-
-    if (messageEvents.length === 0) {
-      window.localStorage.removeItem(agentHistoryStorageKey);
-      return;
-    }
-
-    window.localStorage.setItem(agentHistoryStorageKey, JSON.stringify(messageEvents));
-  } catch {
-    // Local storage is an enhancement only; the agent must still work without it.
-  }
-}
-
-function isStoredAgentMessageEvent(value: unknown): value is AgentEvent {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-
-  const candidate = value as Partial<AgentEvent>;
-  return (
-    candidate.type === "message" &&
-    typeof candidate.id === "string" &&
-    typeof candidate.sessionId === "string" &&
-    typeof candidate.createdAt === "string" &&
-    (candidate.role === "user" ||
-      candidate.role === "assistant" ||
-      candidate.role === "system") &&
-    typeof candidate.content === "string"
-  );
 }
 
 function useAgentElapsedSeconds(running: boolean): number {

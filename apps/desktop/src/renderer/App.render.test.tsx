@@ -424,7 +424,6 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("setAgentSessionId(result.sessionId)");
     expect(appSource).toContain('setAgentPrompt("");');
     expect(appSource).toContain("AgentLiveStatus");
-    expect(appSource).toContain("zeroleaf-agent-history");
     expect(appSource).toContain("zeroleaf-agent-provider");
     expect(appSource).toContain("Clear agent history");
     expect(appSource).toContain("Stop agent run");

@@ -1428,7 +1428,7 @@ h2 {
 
 .agent-controls {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 8px;
   padding: 10px 12px;
   border-bottom: 1px solid #e1e6ea;
@@ -1446,14 +1446,6 @@ h2 {
 
 .agent-controls select {
   font-size: 14px;
-}
-
-.agent-mode-help {
-  grid-column: 1 / -1;
-  margin: -2px 0 0;
-  color: #65747b;
-  font-size: 12px;
-  line-height: 1.4;
 }
 
 .agent-pane .text-button,
