@@ -498,21 +498,6 @@ h2 {
   line-height: 1.4;
 }
 
-.recent-toolbar {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 8px;
-}
-
-.recent-toolbar .primary-button {
-  width: 100%;
-  font-size: 12px;
-}
-
-.recent-toolbar .text-button {
-  white-space: nowrap;
-}
-
 .recent-projects .primary-button {
   width: 100%;
 }
@@ -1805,16 +1790,43 @@ input {
 }
 
 .agent-mode-chip {
-  overflow: hidden;
-  max-width: 150px;
-  padding: 3px 10px;
+  width: auto;
+  max-width: 170px;
+  height: 26px;
+  padding: 0 24px 0 11px;
+  border: 1px solid transparent;
   border-radius: 999px;
-  background: #eef4f4;
+  background-color: #eef4f4;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2340565c' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 11px;
   color: #40565c;
   font-size: 12px;
   font-weight: 600;
-  text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease;
+}
+
+.agent-mode-chip:hover:not(:disabled) {
+  border-color: #cfe0e0;
+  background-color: #e4efef;
+}
+
+.agent-mode-chip:focus-visible {
+  border-color: #2f6f73;
+  box-shadow: 0 0 0 3px rgba(47, 111, 115, 0.12);
+  outline: none;
+}
+
+.agent-mode-chip:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 .agent-send-button {

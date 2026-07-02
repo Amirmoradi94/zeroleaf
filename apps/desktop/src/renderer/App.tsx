@@ -7725,7 +7725,6 @@ export function App() {
             onCloseProject={closeProject}
             onOpenProject={openProject}
             onOpenRecentProject={openRecentProject}
-            onOpenShareModal={() => setShareModalOpen(true)}
             onClearRecentProjects={clearRecentProjects}
             onRemoveRecentProject={removeRecentProject}
             onRefreshProject={refreshProjectTree}
@@ -8358,7 +8357,6 @@ function ProjectSidebar({
   onCloseProject,
   onOpenProject,
   onOpenRecentProject,
-  onOpenShareModal,
   onClearRecentProjects,
   onRemoveRecentProject,
   onRefreshProject,
@@ -8406,7 +8404,6 @@ function ProjectSidebar({
   readonly onCloseProject: () => void;
   readonly onOpenProject: () => void;
   readonly onOpenRecentProject: (rootPath: string) => void;
-  readonly onOpenShareModal: () => void;
   readonly onClearRecentProjects: () => void;
   readonly onRemoveRecentProject: (rootPath: string) => void;
   readonly onRefreshProject: () => void;
@@ -8496,9 +8493,7 @@ function ProjectSidebar({
       {project === undefined ? (
         <RecentProjects
           recentProjects={recentProjects}
-          onOpenProject={onOpenProject}
           onOpenRecentProject={onOpenRecentProject}
-          onOpenShareModal={onOpenShareModal}
           onClearRecentProjects={onClearRecentProjects}
           onRemoveRecentProject={onRemoveRecentProject}
         />
@@ -8888,16 +8883,12 @@ function ProjectSidebar({
 
 function RecentProjects({
   onClearRecentProjects,
-  onOpenProject,
   onOpenRecentProject,
-  onOpenShareModal,
   onRemoveRecentProject,
   recentProjects
 }: {
   readonly onClearRecentProjects: () => void;
-  readonly onOpenProject: () => void;
   readonly onOpenRecentProject: (rootPath: string) => void;
-  readonly onOpenShareModal: () => void;
   readonly onRemoveRecentProject: (rootPath: string) => void;
   readonly recentProjects: readonly RecentProject[];
 }) {
@@ -8908,25 +8899,6 @@ function RecentProjects({
         <h3>No project open</h3>
         <p>Open an existing project, import a ZIP archive, or start from a template.</p>
       </section>
-
-      <div className="recent-toolbar">
-        <button
-          className="primary-button recent-open-folder"
-          type="button"
-          onClick={onOpenProject}
-        >
-          <FolderOpen aria-hidden="true" size={15} />
-          Open Folder
-        </button>
-        <button
-          className="text-button recent-open-share-modal"
-          type="button"
-          onClick={onOpenShareModal}
-        >
-          <Share2 aria-hidden="true" size={15} />
-          Shared Projects
-        </button>
-      </div>
 
       <div className="recent-list" aria-label="Recent projects">
         <div className="recent-list__header">
@@ -10353,12 +10325,18 @@ function AgentPane({
               >
                 <ImagePlus size={15} />
               </IconButton>
-              <span
+              <select
                 className="agent-mode-chip"
+                aria-label="Agent mode"
+                value={mode}
+                disabled={running}
                 title={getAgentModeDescription(mode)}
+                onChange={(event) => onModeChange(event.target.value as AgentMode)}
               >
-                {getAgentModeShortLabel(mode)}
-              </span>
+                <option value="suggest">Ask only</option>
+                <option value="apply-with-review">Review first</option>
+                <option value="autonomous-local">Auto-apply</option>
+              </select>
             </div>
             {running ? (
               <button
@@ -13785,18 +13763,6 @@ function formatAgentModeLabel(mode: AgentMode): string {
       return "Ask only";
     case "autonomous-local":
       return "Auto-apply local changes";
-  }
-}
-
-function getAgentModeShortLabel(mode: AgentMode): string {
-  switch (mode) {
-    case "apply-with-review":
-      return "Review first";
-    case "suggest":
-    case "read-only":
-      return "Ask only";
-    case "autonomous-local":
-      return "Auto-apply";
   }
 }
 
