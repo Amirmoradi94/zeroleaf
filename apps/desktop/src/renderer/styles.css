@@ -739,15 +739,29 @@ h2 {
 }
 
 .recent-project-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: stretch;
-  gap: 8px;
+  position: relative;
+}
+
+.recent-project-row .recent-row {
+  padding-right: 42px;
 }
 
 .recent-project-row .icon-button {
-  align-self: start;
-  margin-top: 4px;
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  width: 28px;
+  height: 28px;
+  border-color: transparent;
+  background: transparent;
+  color: #7f9096;
+}
+
+.recent-project-row .icon-button:hover:not(:disabled) {
+  border-color: #d3dee0;
+  background: #ffffff;
+  color: #46555c;
 }
 
 .recent-row {
@@ -1736,82 +1750,133 @@ input {
   font-size: 12px;
 }
 
-.agent-prompt-field {
-  position: relative;
+.agent-input-card {
   display: grid;
-}
-
-.agent-composer textarea {
-  height: auto;
-  min-height: 78px;
-  max-height: 180px;
-  padding: 10px 12px 44px;
-  overflow-y: auto;
-  resize: none;
-  border-color: #b8cdd0;
-  border-radius: 8px;
+  border: 1px solid #b8cdd0;
+  border-radius: 14px;
+  background: #ffffff;
   box-shadow: inset 0 0 0 1px rgba(47, 111, 115, 0.04);
-  font-size: 15px;
-  line-height: 1.45;
   transition:
     border-color 120ms ease,
     box-shadow 120ms ease;
 }
 
-.agent-composer textarea:focus {
+.agent-input-card:focus-within {
   border-color: #2f6f73;
   box-shadow:
     0 0 0 3px rgba(47, 111, 115, 0.11),
     inset 0 0 0 1px rgba(47, 111, 115, 0.08);
+}
+
+.agent-composer .agent-input-card textarea {
+  height: auto;
+  min-height: 72px;
+  max-height: 200px;
+  padding: 11px 12px 4px;
+  overflow-y: auto;
+  resize: none;
+  border: none;
+  border-radius: 14px 14px 0 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+.agent-composer .agent-input-card textarea:focus {
+  border: none;
+  box-shadow: none;
   outline: none;
 }
 
-.agent-prompt-attach {
-  position: absolute;
-  bottom: 8px;
-  left: 8px;
+.agent-input-toolbar {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px 8px;
 }
 
-.agent-prompt-attach .icon-button {
-  width: 28px;
-  height: 28px;
-  border-color: transparent;
-  background: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 1px 4px rgba(27, 43, 44, 0.12);
+.agent-input-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
-.agent-prompt-attach .icon-button:hover:not(:disabled) {
-  border-color: #b8cdd0;
-  background: #f8fbfb;
+.agent-mode-chip {
+  overflow: hidden;
+  max-width: 150px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #eef4f4;
+  color: #40565c;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.agent-composer-actions,
+.agent-send-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 0 8px 0 14px;
+  border: none;
+  border-radius: 999px;
+  background: #2f6f73;
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    opacity 120ms ease;
+}
+
+.agent-send-button:hover:not(:disabled) {
+  background: #295f63;
+}
+
+.agent-send-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.agent-send-button.stop {
+  padding: 0 14px 0 12px;
+  background: #c0392b;
+}
+
+.agent-send-button.stop:hover:not(:disabled) {
+  background: #a53124;
+}
+
 .agent-approval-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
 
-.agent-composer-actions {
-  align-items: center;
-  justify-content: space-between;
+.agent-input-hint {
+  margin: 0;
+  padding: 0 2px;
+  color: #7f9096;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
-.agent-composer-actions > span {
-  overflow: hidden;
-  color: #65747b;
-  font-size: 13px;
-  font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-composer-buttons {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 8px;
+.agent-input-hint kbd {
+  padding: 1px 5px;
+  border: 1px solid #d3dee0;
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: #f6f9f9;
+  color: #4a5f65;
+  font-family: inherit;
+  font-size: 11px;
 }
 
 .agent-message-row {

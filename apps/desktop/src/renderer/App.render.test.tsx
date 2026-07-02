@@ -377,7 +377,9 @@ describe("App renderer shell", () => {
     expect(appSource).toContain("openProviderSetupTerminal");
     expect(appSource).toContain("Log in with your subscription");
     expect(appSource).toMatch(/does\s+not request or store provider API keys/u);
-    expect(appSource).toContain("scoped edit, compile, or project inspection");
+    expect(appSource).toContain(
+      "Ask for an edit, a compile, or a question about your paper"
+    );
     expect(appSource).toContain("Explain selection");
     expect(appSource).toContain("Expand notes");
     expect(appSource).toContain("Improve academic tone");

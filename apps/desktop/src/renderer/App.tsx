@@ -81,6 +81,7 @@ import type {
   WorkbenchLayout
 } from "@latex-agent/ipc-contracts";
 import {
+  ArrowUp,
   BookOpen,
   Bot,
   Check,
@@ -105,6 +106,7 @@ import {
   Settings,
   Share2,
   Sparkles,
+  Square,
   Terminal,
   Trash2,
   TriangleAlert,
@@ -7684,7 +7686,9 @@ export function App() {
       <div className="workspace" style={workspaceStyle}>
         <ActivityRail
           activeTab={activeSidebarTab}
+          canShare={currentProject !== undefined}
           onOpenSettings={() => setSettingsOpen(true)}
+          onOpenShareModal={() => setShareModalOpen(true)}
           onSelectTab={setActiveSidebarTab}
         />
         {activeSidebarTab === "files" && (
@@ -8182,11 +8186,15 @@ export function App() {
 
 function ActivityRail({
   activeTab,
+  canShare,
   onOpenSettings,
+  onOpenShareModal,
   onSelectTab
 }: {
   readonly activeTab: SidebarTab;
+  readonly canShare: boolean;
   readonly onOpenSettings: () => void;
+  readonly onOpenShareModal: () => void;
   readonly onSelectTab: (tab: SidebarTab) => void;
 }) {
   return (
@@ -8213,6 +8221,13 @@ function ActivityRail({
         <Plus size={18} />
       </IconButton>
       <div className="activity-rail-spacer" aria-hidden="true" />
+      <IconButton
+        label="Share project"
+        disabled={!canShare}
+        onClick={onOpenShareModal}
+      >
+        <Share2 size={18} />
+      </IconButton>
       <IconButton label="Open settings" onClick={onOpenSettings}>
         <Settings size={18} />
       </IconButton>
@@ -8471,11 +8486,6 @@ function ProjectSidebar({
         <IconButton label="Open project" onClick={onOpenProject}>
           <FolderOpen size={16} />
         </IconButton>
-        {project !== undefined && (
-          <IconButton label="Share project" onClick={onOpenShareModal}>
-            <Share2 size={16} />
-          </IconButton>
-        )}
         {project !== undefined && (
           <IconButton label="Close project" onClick={onCloseProject}>
             <X size={16} />
@@ -10214,9 +10224,10 @@ function AgentPane({
             <span className="agent-empty-icon" aria-hidden="true">
               <MessageSquareText size={18} />
             </span>
-            <strong>Ask about the current paper or request a reviewed edit.</strong>
+            <strong>Start a conversation about your paper</strong>
             <p>
-              Live progress appears here while the agent reads, edits, and verifies.
+              Ask a question, request an edit, or run a compile. The agent&rsquo;s
+              live progress shows up right here.
             </p>
           </div>
         ) : (
@@ -10305,12 +10316,12 @@ function AgentPane({
             ))}
           </div>
         )}
-        <div className="agent-prompt-field">
+        <div className="agent-input-card">
           <textarea
             ref={composerRef}
             aria-label="Agent prompt"
             value={prompt}
-            placeholder="Ask for a scoped edit, compile, or project inspection..."
+            placeholder="Ask for an edit, a compile, or a question about your paper…"
             onChange={(event) => onPromptChange(event.target.value)}
             onKeyDown={(event) => {
               if (canSend && event.key === "Enter" && !event.shiftKey) {
@@ -10331,39 +10342,49 @@ function AgentPane({
               event.target.value = "";
             }}
           />
-          <div className="agent-prompt-attach">
-            <IconButton
-              disabled={running || imageAttachments.length >= maxAgentImageAttachments}
-              label="Attach image"
-              onClick={() => attachmentInputRef.current?.click()}
-            >
-              <ImagePlus size={15} />
-            </IconButton>
+          <div className="agent-input-toolbar">
+            <div className="agent-input-toolbar-left">
+              <IconButton
+                disabled={
+                  running || imageAttachments.length >= maxAgentImageAttachments
+                }
+                label="Attach image"
+                onClick={() => attachmentInputRef.current?.click()}
+              >
+                <ImagePlus size={15} />
+              </IconButton>
+              <span
+                className="agent-mode-chip"
+                title={getAgentModeDescription(mode)}
+              >
+                {getAgentModeShortLabel(mode)}
+              </span>
+            </div>
+            {running ? (
+              <button
+                className="agent-send-button stop"
+                type="button"
+                onClick={onCancel}
+              >
+                <Square aria-hidden="true" size={14} />
+                Stop
+              </button>
+            ) : (
+              <button
+                className="agent-send-button"
+                type="button"
+                disabled={!canSend}
+                onClick={onStart}
+              >
+                Send
+                <ArrowUp aria-hidden="true" size={15} />
+              </button>
+            )}
           </div>
         </div>
-        <div className="agent-composer-actions">
-          <span>{formatAgentModeLabel(mode)}</span>
-          <div className="agent-composer-buttons">
-            <button
-              className="primary-button"
-              type="button"
-              disabled={!canSend}
-              onClick={onStart}
-            >
-              <Sparkles aria-hidden="true" size={15} />
-              Send
-            </button>
-            <button
-              className="text-button"
-              type="button"
-              disabled={!running}
-              onClick={onCancel}
-            >
-              <X aria-hidden="true" size={15} />
-              Stop
-            </button>
-          </div>
-        </div>
+        <p className="agent-input-hint">
+          <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line
+        </p>
       </div>
     </aside>
   );
@@ -13764,6 +13785,18 @@ function formatAgentModeLabel(mode: AgentMode): string {
       return "Ask only";
     case "autonomous-local":
       return "Auto-apply local changes";
+  }
+}
+
+function getAgentModeShortLabel(mode: AgentMode): string {
+  switch (mode) {
+    case "apply-with-review":
+      return "Review first";
+    case "suggest":
+    case "read-only":
+      return "Ask only";
+    case "autonomous-local":
+      return "Auto-apply";
   }
 }
 
