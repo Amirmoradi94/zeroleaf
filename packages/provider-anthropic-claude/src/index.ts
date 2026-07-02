@@ -20,7 +20,9 @@ import type {
   HistoryChangeSet,
   ProjectFileSnapshot,
   WordBlockOperation,
-  WordChangeSet
+  WordChangeSet,
+  WordStructureNode,
+  WordTableCellRef
 } from "@latex-agent/ipc-contracts";
 
 export const anthropicClaudeProviderId = "anthropic-claude" as const;
@@ -90,6 +92,7 @@ export type ClaudeProviderOptions = {
 };
 
 const defaultClaudeModel = "sonnet";
+const defaultClaudeExecTimeoutMs = 7_200_000;
 
 export class ClaudeProvider {
   readonly id: AgentProviderId = anthropicClaudeProviderId;
@@ -105,7 +108,7 @@ export class ClaudeProvider {
       options.claudeBinary ?? getConfiguredCliBinary(claudePathEnvName, "claude");
     this.model =
       options.model ?? process.env["LATEX_AGENT_CLAUDE_MODEL"] ?? defaultClaudeModel;
-    this.timeoutMs = options.timeoutMs ?? 180_000;
+    this.timeoutMs = options.timeoutMs ?? defaultClaudeExecTimeoutMs;
     this.runClaudeCode =
       options.runClaudeCode ??
       ((request) => runClaudeCode(this.claudeBinary, this.model, request));
@@ -787,6 +790,44 @@ function isValidWordBlockOperation(value: unknown): value is WordBlockOperation 
         typeof operation.endOffset === "number" &&
         typeof operation.replacementText === "string"
       );
+    case "replace-table-cell":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.rowIndex === "number" &&
+        typeof operation.columnIndex === "number" &&
+        typeof operation.afterText === "string"
+      );
+    case "insert-table-row":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.anchorRowIndex === "number" &&
+        (operation.position === "before" || operation.position === "after")
+      );
+    case "delete-table-row":
+      return typeof operation.tableId === "string" && typeof operation.rowIndex === "number";
+    case "insert-table-column":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.anchorColumnIndex === "number" &&
+        (operation.position === "before" || operation.position === "after")
+      );
+    case "delete-table-column":
+      return (
+        typeof operation.tableId === "string" && typeof operation.columnIndex === "number"
+      );
+    case "merge-table-cells":
+      return (
+        typeof operation.tableId === "string" &&
+        Array.isArray(operation.cells) &&
+        operation.cells.length >= 2 &&
+        operation.cells.every(
+          (cell) =>
+            typeof cell === "object" &&
+            cell !== null &&
+            typeof (cell as Partial<WordTableCellRef>).rowIndex === "number" &&
+            typeof (cell as Partial<WordTableCellRef>).columnIndex === "number"
+        )
+      );
     default:
       return false;
   }
@@ -844,7 +885,7 @@ function createClaudePrompt(
     "In message, always explain the result in user-facing terms: list the files or sections changed and the purpose of the change. If no source file changed, say why no change was made and do not imply that an edit happened.",
     "Preserve all unrelated text and formatting when returning a patch.",
     request.activeDocument?.kind === "word"
-      ? 'The active document is a Microsoft Word .docx file represented as extracted paragraphs. Do not return a raw .docx patch. For Word edits, set action "word-edit", afterContents "", and populate wordChangesets with filePath, summary, and operations using operation types "replace-block", "insert-block-after", "delete-block", "move-block", or "replace-selection".'
+      ? 'The active document is a Microsoft Word .docx file represented as extracted paragraphs. Do not return a raw .docx patch. For Word edits, set action "word-edit", afterContents "", and populate wordChangesets with filePath, summary, and operations. Paragraph operation types are "replace-block", "insert-block-after", "delete-block", "move-block", "replace-selection". Table operation types are "replace-table-cell", "insert-table-row", "delete-table-row", "insert-table-column", "delete-table-column", "merge-table-cells", each targeting a table id and 0-based row/column indices from the document structure section below. A single wordChangeset\'s operations must be either all paragraph operations or all table operations, never mixed.'
       : "",
     snapshot.path === newFileSnapshotPath
       ? 'No active TeX file is open. If the user asks to create a .tex file, return action "patch", choose a clear project-relative targetFilePath ending in .tex, set afterContents to the complete new file contents, and use an empty original file.'
@@ -874,6 +915,7 @@ function createClaudePrompt(
     request.diagnostic === undefined
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
+    formatActiveWordStructureContext(request),
     "",
     `Original ${snapshot.path}:`,
     request.activeDocument?.kind === "word" ? "```text" : "```tex",
@@ -892,6 +934,53 @@ function createEmptyProjectSnapshot(): ProjectFileSnapshot {
     contents: "",
     mtimeMs: Date.now()
   };
+}
+
+function formatActiveWordStructureContext(request: AgentStartRequest): string {
+  if (request.activeDocument?.kind !== "word") {
+    return "";
+  }
+
+  const structure = request.activeDocument.structure ?? [];
+  if (structure.length === 0) {
+    return "";
+  }
+
+  const structureLines = structure.map((node) => formatWordStructureNode(node));
+  const structureWarnings = request.activeDocument.structureWarnings ?? [];
+
+  return [
+    "Document structure (headings and tables, for understanding layout and position).",
+    "Headings are read-only context. Tables can be edited with table operations targeting the table's id and 0-based row/column indices shown below.",
+    ...structureLines,
+    structureWarnings.length === 0
+      ? ""
+      : `Structure extraction warnings: ${structureWarnings.join("; ")}`
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
+function formatWordStructureNode(node: WordStructureNode): string {
+  if (node.type === "paragraph") {
+    if (node.headingLevel === undefined) {
+      return "";
+    }
+    return `Heading (level ${node.headingLevel}): ${JSON.stringify(node.text)}`;
+  }
+
+  const grid: string[] = [];
+  for (let row = 0; row < node.rowCount; row++) {
+    const cells = node.cells
+      .filter((cell) => cell.rowIndex === row)
+      .sort((a, b) => a.columnIndex - b.columnIndex)
+      .map((cell) => `R${cell.rowIndex}C${cell.columnIndex}=${JSON.stringify(cell.text)}`);
+    grid.push(`  ${cells.join("  ")}`);
+  }
+
+  return [`Table ${node.id} (${node.rowCount} rows x ${node.columnCount} columns):`, ...grid].join(
+    "\n"
+  );
 }
 
 function createActiveDocumentSnapshot(
@@ -1032,7 +1121,13 @@ const claudeOutputSchema = {
                     "insert-block-after",
                     "delete-block",
                     "move-block",
-                    "replace-selection"
+                    "replace-selection",
+                    "replace-table-cell",
+                    "insert-table-row",
+                    "delete-table-row",
+                    "insert-table-column",
+                    "delete-table-column",
+                    "merge-table-cells"
                   ]
                 },
                 blockId: { type: "string" },
@@ -1050,7 +1145,25 @@ const claudeOutputSchema = {
                 },
                 startOffset: { type: "number" },
                 endOffset: { type: "number" },
-                replacementText: { type: "string" }
+                replacementText: { type: "string" },
+                tableId: { type: "string" },
+                rowIndex: { type: "number" },
+                columnIndex: { type: "number" },
+                anchorRowIndex: { type: "number" },
+                anchorColumnIndex: { type: "number" },
+                position: { enum: ["before", "after"] },
+                cells: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      rowIndex: { type: "number" },
+                      columnIndex: { type: "number" }
+                    },
+                    required: ["rowIndex", "columnIndex"]
+                  }
+                }
               },
               required: ["type"]
             }

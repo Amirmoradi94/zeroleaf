@@ -116,6 +116,10 @@ import {
   type SharedProjectRole,
   type SharedProjectSessionSummary,
   type SharedProjectSummary,
+  isWordTableOperation,
+  type WordBlockOperation,
+  type WordDocumentModel,
+  type WordTableOperation,
   type WorkbenchLayout
 } from "@latex-agent/ipc-contracts";
 import { ProjectChangeDebouncer } from "./projectWatcher.js";
@@ -317,6 +321,42 @@ async function configureOnlyOfficeBridge(): Promise<void> {
       inferOnlyOfficeBridgePort(bridgePublicBaseUrl)
     )
   });
+}
+
+async function withWordStructure(
+  document: WordDocumentModel,
+  projectRoot: string,
+  filePath: string
+): Promise<WordDocumentModel> {
+  const extraction = await onlyOfficeBridge.extractWordStructure({
+    projectRoot,
+    filePath
+  });
+  return {
+    ...document,
+    structure: extraction.structure,
+    structureWarnings: extraction.warnings
+  };
+}
+
+// Table operations are applied through ONLYOFFICE's Document Builder, which
+// can't be interleaved with the paragraph-block docx rebuild without
+// destroying table structure, so a changeset must be entirely one kind or
+// the other. Returns the operations narrowed to WordTableOperation[] when
+// the changeset is table-only, or undefined when it is paragraph-block-only.
+function resolveWordTableOperations(
+  operations: readonly WordBlockOperation[]
+): readonly WordTableOperation[] | undefined {
+  const tableOperationCount = operations.filter(isWordTableOperation).length;
+  if (tableOperationCount === 0) {
+    return undefined;
+  }
+  if (tableOperationCount !== operations.length) {
+    throw new Error(
+      "A Word changeset cannot mix table operations with paragraph block operations."
+    );
+  }
+  return operations.filter(isWordTableOperation);
 }
 
 function firstNonEmptyString(...values: readonly (string | undefined)[]): string {
@@ -3547,8 +3587,12 @@ function registerIpcHandlers() {
     )
   );
 
-  handleIpc(ipcChannels.wordRead, (_event, request) =>
-    readWordDocument(request.projectRoot, request.path)
+  handleIpc(ipcChannels.wordRead, async (_event, request) =>
+    withWordStructure(
+      await readWordDocument(request.projectRoot, request.path),
+      request.projectRoot,
+      request.path
+    )
   );
 
   handleIpc(ipcChannels.wordSave, (_event, request) =>
@@ -3579,6 +3623,34 @@ function registerIpcHandlers() {
         persistedChangeSet.projectRoot,
         persistedChangeSet.filePath
       );
+      const tableOperations = resolveWordTableOperations(persistedChangeSet.operations);
+
+      if (tableOperations !== undefined) {
+        const tableResult = await onlyOfficeBridge.applyWordTableOperations({
+          projectRoot: persistedChangeSet.projectRoot,
+          filePath: persistedChangeSet.filePath,
+          operations: tableOperations
+        });
+        if (!tableResult.ok) {
+          throw new Error(tableResult.error);
+        }
+        const appliedChangeSet = await history.markWordChangeSetApplied(
+          persistedChangeSet,
+          beforeSnapshot.id
+        );
+        return {
+          changeset: appliedChangeSet,
+          document: await withWordStructure(
+            await readWordDocument(
+              persistedChangeSet.projectRoot,
+              persistedChangeSet.filePath
+            ),
+            persistedChangeSet.projectRoot,
+            persistedChangeSet.filePath
+          )
+        };
+      }
+
       const result = await applyWordChangeSet(persistedChangeSet);
       const appliedChangeSet = await history.markWordChangeSetApplied(
         result.changeset,
@@ -3586,7 +3658,12 @@ function registerIpcHandlers() {
       );
       return {
         ...result,
-        changeset: appliedChangeSet
+        changeset: appliedChangeSet,
+        document: await withWordStructure(
+          result.document,
+          persistedChangeSet.projectRoot,
+          persistedChangeSet.filePath
+        )
       };
     } finally {
       history.close();
@@ -3599,7 +3676,11 @@ function registerIpcHandlers() {
       const changeset = await history.rollbackWordChangeSet(request.changesetId);
       return {
         changeset,
-        document: await readWordDocument(changeset.projectRoot, changeset.filePath)
+        document: await withWordStructure(
+          await readWordDocument(changeset.projectRoot, changeset.filePath),
+          changeset.projectRoot,
+          changeset.filePath
+        )
       };
     } finally {
       history.close();

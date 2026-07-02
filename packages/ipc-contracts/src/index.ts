@@ -695,6 +695,32 @@ export type WordDocumentBlock = {
   readonly text: string;
 };
 
+export type WordStructureParagraphNode = {
+  readonly type: "paragraph";
+  readonly id: string;
+  readonly text: string;
+  readonly headingLevel?: number;
+  readonly styleName?: string;
+  readonly hasNonTextContent?: boolean;
+};
+
+export type WordStructureTableCell = {
+  readonly id: string;
+  readonly rowIndex: number;
+  readonly columnIndex: number;
+  readonly text: string;
+};
+
+export type WordStructureTableNode = {
+  readonly type: "table";
+  readonly id: string;
+  readonly rowCount: number;
+  readonly columnCount: number;
+  readonly cells: readonly WordStructureTableCell[];
+};
+
+export type WordStructureNode = WordStructureParagraphNode | WordStructureTableNode;
+
 export type WordDocumentModel = {
   readonly kind: "word";
   readonly path: string;
@@ -703,6 +729,8 @@ export type WordDocumentModel = {
   readonly mtimeMs: number;
   readonly extractedAt: string;
   readonly warnings: readonly string[];
+  readonly structure?: readonly WordStructureNode[];
+  readonly structureWarnings?: readonly string[];
 };
 
 export type WordDocumentSaveResult = {
@@ -711,7 +739,7 @@ export type WordDocumentSaveResult = {
   readonly mtimeMs: number;
 };
 
-export type WordBlockOperation =
+export type WordParagraphBlockOperation =
   | {
       readonly type: "replace-block";
       readonly blockId: string;
@@ -738,6 +766,69 @@ export type WordBlockOperation =
       readonly endOffset: number;
       readonly replacementText: string;
     };
+
+export type WordTableCellRef = {
+  readonly rowIndex: number;
+  readonly columnIndex: number;
+};
+
+// Table operations target a table by its WordStructureTableNode.id (from
+// AgentActiveDocument.structure) plus 0-based row/column indices. They are
+// applied through ONLYOFFICE's Document Builder, not the paragraph-block
+// docx rebuild, so a WordChangeSet's operations must be either all
+// WordParagraphBlockOperation or all WordTableOperation, never mixed.
+export type WordTableOperation =
+  | {
+      readonly type: "replace-table-cell";
+      readonly tableId: string;
+      readonly rowIndex: number;
+      readonly columnIndex: number;
+      readonly afterText: string;
+    }
+  | {
+      readonly type: "insert-table-row";
+      readonly tableId: string;
+      readonly anchorRowIndex: number;
+      readonly position: "before" | "after";
+    }
+  | {
+      readonly type: "delete-table-row";
+      readonly tableId: string;
+      readonly rowIndex: number;
+    }
+  | {
+      readonly type: "insert-table-column";
+      readonly tableId: string;
+      readonly anchorColumnIndex: number;
+      readonly position: "before" | "after";
+    }
+  | {
+      readonly type: "delete-table-column";
+      readonly tableId: string;
+      readonly columnIndex: number;
+    }
+  | {
+      readonly type: "merge-table-cells";
+      readonly tableId: string;
+      readonly cells: readonly WordTableCellRef[];
+    };
+
+export type WordBlockOperation = WordParagraphBlockOperation | WordTableOperation;
+
+const wordTableOperationTypes = new Set<WordBlockOperation["type"]>([
+  "replace-table-cell",
+  "insert-table-row",
+  "delete-table-row",
+  "insert-table-column",
+  "delete-table-column",
+  "merge-table-cells"
+]);
+
+export function isWordTableOperation(
+  operation: WordBlockOperation
+): operation is WordTableOperation {
+  return wordTableOperationTypes.has(operation.type);
+}
 
 export type WordChangeSetStatus =
   | "proposed"
@@ -841,6 +932,8 @@ export type AgentActiveDocument =
       readonly plainText: string;
       readonly blocks: readonly WordDocumentBlock[];
       readonly warnings: readonly string[];
+      readonly structure?: readonly WordStructureNode[];
+      readonly structureWarnings?: readonly string[];
     };
 
 export type ProjectChangeEvent = {

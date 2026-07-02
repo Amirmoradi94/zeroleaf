@@ -368,6 +368,265 @@ describe("OnlyOfficeBridgeService", () => {
     ).rejects.toThrow(/bridge callback URL is not reachable/iu);
   });
 
+  it("extracts paragraph and table structure via a Document Builder round trip", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "zeroleaf-onlyoffice-structure-"));
+    await writeFile(join(projectRoot, "report.docx"), Buffer.from("docx"));
+
+    const rawElements = [
+      {
+        type: "paragraph",
+        index: 0,
+        text: "Executive Summary",
+        styleName: "Heading 1",
+        hasNonTextContent: false
+      },
+      {
+        type: "table",
+        index: 1,
+        rowCount: 2,
+        columnCount: 2,
+        cells: [
+          { rowIndex: 0, columnIndex: 0, text: "Name" },
+          { rowIndex: 0, columnIndex: 1, text: "Score" },
+          { rowIndex: 1, columnIndex: 0, text: "Ada" },
+          { rowIndex: 1, columnIndex: 1, text: "97" }
+        ]
+      }
+    ];
+    const resultDocx = await buildStructureResultDocx(rawElements);
+
+    const docBuilderRequests: Array<{ readonly url: unknown; readonly async: unknown }> =
+      [];
+    let documentServerUrl = "";
+    const documentServer = await listen(async (request, response) => {
+      if (request.url === "/docbuilder") {
+        const body = JSON.parse(await readRequestText(request)) as {
+          readonly url: unknown;
+          readonly async: unknown;
+        };
+        docBuilderRequests.push(body);
+
+        const scriptResponse = await fetch(String(body.url));
+        const scriptText = await scriptResponse.text();
+        expect(scriptResponse.status).toBe(200);
+        expect(scriptText).toContain("builder.OpenFile(");
+        expect(scriptText).toContain("/onlyoffice/sessions/");
+
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            key: "bld_test",
+            end: true,
+            urls: { "structure-result.docx": `${documentServerUrl}/structure-result.docx` }
+          })
+        );
+        return;
+      }
+
+      if (request.url === "/structure-result.docx") {
+        response.writeHead(200, {
+          "content-type":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        });
+        response.end(resultDocx);
+        return;
+      }
+
+      response.writeHead(404);
+      response.end();
+    });
+    documentServerUrl = documentServer.url;
+    const service = new OnlyOfficeBridgeService({
+      documentServerUrl: documentServer.url
+    });
+    services.push(service);
+
+    const result = await service.extractWordStructure({
+      projectRoot,
+      filePath: "report.docx"
+    });
+
+    expect(docBuilderRequests).toHaveLength(1);
+    expect(docBuilderRequests[0]?.async).toBe(false);
+    expect(result.warnings).toEqual([]);
+    expect(result.structure).toHaveLength(2);
+
+    const [heading, table] = result.structure;
+    expect(heading).toMatchObject({
+      type: "paragraph",
+      text: "Executive Summary",
+      headingLevel: 1,
+      styleName: "Heading 1"
+    });
+    expect(heading?.id).toMatch(/^para-0-[0-9a-f]{12}$/u);
+
+    expect(table).toMatchObject({ type: "table", rowCount: 2, columnCount: 2 });
+    if (table?.type !== "table") {
+      throw new Error("expected a table node");
+    }
+    expect(table.cells).toHaveLength(4);
+    expect(table.cells.map((cell) => cell.text)).toEqual(["Name", "Score", "Ada", "97"]);
+    expect(table.cells[0]?.id).toMatch(/^tbl-1-r0c0-[0-9a-f]{12}$/u);
+  });
+
+  it("degrades to an empty structure with a warning when disabled", async () => {
+    const projectRoot = await mkdtemp(
+      join(tmpdir(), "zeroleaf-onlyoffice-structure-disabled-")
+    );
+    await writeFile(join(projectRoot, "report.docx"), Buffer.from("docx"));
+    const service = new OnlyOfficeBridgeService({ enabled: false });
+    services.push(service);
+
+    const result = await service.extractWordStructure({
+      projectRoot,
+      filePath: "report.docx"
+    });
+
+    expect(result.structure).toEqual([]);
+    expect(result.warnings[0]).toMatch(/disabled/iu);
+  });
+
+  it("degrades to an empty structure with a warning when Document Server is unreachable", async () => {
+    const projectRoot = await mkdtemp(
+      join(tmpdir(), "zeroleaf-onlyoffice-structure-unreachable-")
+    );
+    await writeFile(join(projectRoot, "report.docx"), Buffer.from("docx"));
+    const unavailableServer = await listen((_request, response) => {
+      response.writeHead(404);
+      response.end();
+    });
+    const service = new OnlyOfficeBridgeService({
+      documentServerUrl: unavailableServer.url
+    });
+    services.push(service);
+
+    const result = await service.extractWordStructure({
+      projectRoot,
+      filePath: "report.docx"
+    });
+
+    expect(result.structure).toEqual([]);
+    expect(result.warnings[0]).toMatch(/structure extraction (request failed|is unavailable)/iu);
+  });
+
+  it("applies table operations via a Document Builder round trip and writes the result to disk", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "zeroleaf-onlyoffice-table-write-"));
+    const documentPath = join(projectRoot, "report.docx");
+    await writeFile(documentPath, Buffer.from("before-docx"));
+
+    const writtenBytes = Buffer.from("after-table-write");
+    const docBuilderRequests: Array<{ readonly url: unknown; readonly async: unknown }> =
+      [];
+    let documentServerUrl = "";
+    let capturedScript = "";
+    const documentServer = await listen(async (request, response) => {
+      if (request.url === "/docbuilder") {
+        const body = JSON.parse(await readRequestText(request)) as {
+          readonly url: unknown;
+          readonly async: unknown;
+        };
+        docBuilderRequests.push(body);
+
+        const scriptResponse = await fetch(String(body.url));
+        capturedScript = await scriptResponse.text();
+        expect(scriptResponse.status).toBe(200);
+
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            key: "bld_test",
+            end: true,
+            urls: {
+              "table-write-result.docx": `${documentServerUrl}/table-write-result.docx`
+            }
+          })
+        );
+        return;
+      }
+
+      if (request.url === "/table-write-result.docx") {
+        response.writeHead(200, {
+          "content-type":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        });
+        response.end(writtenBytes);
+        return;
+      }
+
+      response.writeHead(404);
+      response.end();
+    });
+    documentServerUrl = documentServer.url;
+
+    const saveEvents: string[] = [];
+    const service = new OnlyOfficeBridgeService({
+      documentServerUrl: documentServer.url,
+      onBeforeDocumentSave: ({ filePath }) => {
+        saveEvents.push(`before:${filePath}`);
+      },
+      onAfterDocumentSave: ({ filePath }) => {
+        saveEvents.push(`after:${filePath}`);
+      }
+    });
+    services.push(service);
+
+    const result = await service.applyWordTableOperations({
+      projectRoot,
+      filePath: "report.docx",
+      operations: [
+        {
+          type: "replace-table-cell",
+          tableId: "tbl-2-abc123def456",
+          rowIndex: 0,
+          columnIndex: 1,
+          afterText: "Updated"
+        }
+      ]
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(docBuilderRequests).toHaveLength(1);
+    expect(docBuilderRequests[0]?.async).toBe(false);
+    expect(capturedScript).toContain("builder.OpenFile(");
+    expect(capturedScript).toContain('"elementIndex":2');
+    expect(capturedScript).toContain('"type":"replace-table-cell"');
+    await expect(readFile(documentPath, "utf8")).resolves.toBe("after-table-write");
+    expect(saveEvents).toEqual(["before:report.docx", "after:report.docx"]);
+  });
+
+  it("rejects a table operation with a malformed table id without contacting the Document Server", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "zeroleaf-onlyoffice-table-badid-"));
+    await writeFile(join(projectRoot, "report.docx"), Buffer.from("docx"));
+    const service = new OnlyOfficeBridgeService({
+      documentServerUrl: "http://127.0.0.1:1"
+    });
+    services.push(service);
+
+    const result = await service.applyWordTableOperations({
+      projectRoot,
+      filePath: "report.docx",
+      operations: [{ type: "delete-table-row", tableId: "not-a-table-id", rowIndex: 0 }]
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/not a recognized structural table id/iu);
+    }
+  });
+
+  it("returns an error for table operations when ONLYOFFICE is disabled", async () => {
+    const service = new OnlyOfficeBridgeService({ enabled: false });
+    services.push(service);
+
+    const result = await service.applyWordTableOperations({
+      projectRoot: "/tmp/does-not-matter",
+      filePath: "report.docx",
+      operations: [{ type: "delete-table-row", tableId: "tbl-0-aaa", rowIndex: 0 }]
+    });
+
+    expect(result).toEqual({ ok: false, error: "ONLYOFFICE integration is disabled." });
+  });
+
   it("probes host.docker.internal bridge URLs through the local listener", async () => {
     const projectRoot = await mkdtemp(
       join(tmpdir(), "zeroleaf-onlyoffice-docker-host-")
@@ -412,6 +671,28 @@ async function listen(
     server,
     url: `http://127.0.0.1:${address.port}`
   };
+}
+
+async function buildStructureResultDocx(elements: readonly unknown[]): Promise<Buffer> {
+  const startMarker = "__ZEROLEAF_STRUCTURE_JSON_START__";
+  const endMarker = "__ZEROLEAF_STRUCTURE_JSON_END__";
+  const payload = `${startMarker}${JSON.stringify(elements)}${endMarker}`;
+  const archive = new JSZip();
+  archive.file(
+    "word/document.xml",
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+      "<w:body><w:p><w:r><w:t xml:space=\"preserve\">" +
+      escapeXmlText(payload) +
+      "</w:t></w:r></w:p></w:body></w:document>"
+  );
+  return archive.generateAsync({ type: "nodebuffer" });
+}
+
+function escapeXmlText(value: string): string {
+  return value
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;");
 }
 
 async function readRequestText(request: IncomingMessage): Promise<string> {

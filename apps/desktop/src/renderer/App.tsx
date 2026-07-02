@@ -78,6 +78,7 @@ import type {
   WordDocumentModel,
   WordChangeSet,
   WordChangeSetApplyResult,
+  WordStructureNode,
   WorkbenchLayout
 } from "@latex-agent/ipc-contracts";
 import {
@@ -278,6 +279,8 @@ type EditorFileState = ProjectFileSnapshot & {
   readonly wordBlocks?: readonly WordDocumentBlock[];
   readonly savedWordBlocks?: readonly WordDocumentBlock[];
   readonly wordWarnings?: readonly string[];
+  readonly wordStructure?: readonly WordStructureNode[];
+  readonly wordStructureWarnings?: readonly string[];
 };
 
 type SavedEditorFile = {
@@ -3279,7 +3282,13 @@ export function App() {
                   path: seededWordDocument.path,
                   plainText: seededWordDocument.plainText,
                   blocks: seededWordDocument.blocks,
-                  warnings: seededWordDocument.warnings
+                  warnings: seededWordDocument.warnings,
+                  ...(seededWordDocument.structure === undefined
+                    ? {}
+                    : { structure: seededWordDocument.structure }),
+                  ...(seededWordDocument.structureWarnings === undefined
+                    ? {}
+                    : { structureWarnings: seededWordDocument.structureWarnings })
                 }
               }),
           compiler: selectedCompiler
@@ -5395,7 +5404,13 @@ export function App() {
                     path: activeFile.path,
                     plainText: activeFile.contents,
                     blocks: activeFile.wordBlocks ?? [],
-                    warnings: activeFile.wordWarnings ?? []
+                    warnings: activeFile.wordWarnings ?? [],
+                    ...(activeFile.wordStructure === undefined
+                      ? {}
+                      : { structure: activeFile.wordStructure }),
+                    ...(activeFile.wordStructureWarnings === undefined
+                      ? {}
+                      : { structureWarnings: activeFile.wordStructureWarnings })
                   }
                 : {
                     kind: "text" as const,
@@ -15522,7 +15537,11 @@ function createEditorFileStateFromWordDocument(
     documentKind: "word",
     wordBlocks: document.blocks,
     savedWordBlocks: document.blocks,
-    wordWarnings: document.warnings
+    wordWarnings: document.warnings,
+    ...(document.structure === undefined ? {} : { wordStructure: document.structure }),
+    ...(document.structureWarnings === undefined
+      ? {}
+      : { wordStructureWarnings: document.structureWarnings })
   };
 }
 
@@ -15542,6 +15561,18 @@ function formatWordOperationTitle(operationType: WordBlockOperation["type"]): st
       return "Move paragraph";
     case "replace-selection":
       return "Replace selection";
+    case "replace-table-cell":
+      return "Replace table cell";
+    case "insert-table-row":
+      return "Insert table row";
+    case "delete-table-row":
+      return "Delete table row";
+    case "insert-table-column":
+      return "Insert table column";
+    case "delete-table-column":
+      return "Delete table column";
+    case "merge-table-cells":
+      return "Merge table cells";
   }
 }
 
@@ -15557,6 +15588,16 @@ function getWordOperationBeforeText(
     case "move-block":
     case "replace-selection":
       return findWordBlockText(blocks, operation.blockId);
+    case "replace-table-cell":
+      return `Table ${operation.tableId}, row ${operation.rowIndex}, column ${operation.columnIndex}`;
+    case "insert-table-row":
+    case "delete-table-row":
+      return `Table ${operation.tableId}`;
+    case "insert-table-column":
+    case "delete-table-column":
+      return `Table ${operation.tableId}`;
+    case "merge-table-cells":
+      return `Table ${operation.tableId}, ${operation.cells.length} cells`;
   }
 }
 
@@ -15577,6 +15618,20 @@ function getWordOperationAfterText(
       const blockText = findWordBlockText(blocks, operation.blockId);
       return `${blockText.slice(0, operation.startOffset)}${operation.replacementText}${blockText.slice(operation.endOffset)}`;
     }
+    case "replace-table-cell":
+      return operation.afterText;
+    case "insert-table-row":
+      return `Row inserted ${operation.position} row ${operation.anchorRowIndex}`;
+    case "delete-table-row":
+      return `Row ${operation.rowIndex} removed`;
+    case "insert-table-column":
+      return `Column inserted ${operation.position} column ${operation.anchorColumnIndex}`;
+    case "delete-table-column":
+      return `Column ${operation.columnIndex} removed`;
+    case "merge-table-cells":
+      return operation.cells
+        .map((cell) => `r${cell.rowIndex}c${cell.columnIndex}`)
+        .join(" + ");
   }
 }
 

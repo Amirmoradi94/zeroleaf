@@ -45,7 +45,7 @@ export type WordDocumentBlock = {
   readonly text: string;
 };
 
-export type WordBlockOperation =
+export type WordParagraphBlockOperation =
   | {
       readonly type: "replace-block";
       readonly blockId: string;
@@ -72,6 +72,49 @@ export type WordBlockOperation =
       readonly endOffset: number;
       readonly replacementText: string;
     };
+
+export type WordTableCellRef = {
+  readonly rowIndex: number;
+  readonly columnIndex: number;
+};
+
+export type WordTableOperation =
+  | {
+      readonly type: "replace-table-cell";
+      readonly tableId: string;
+      readonly rowIndex: number;
+      readonly columnIndex: number;
+      readonly afterText: string;
+    }
+  | {
+      readonly type: "insert-table-row";
+      readonly tableId: string;
+      readonly anchorRowIndex: number;
+      readonly position: "before" | "after";
+    }
+  | {
+      readonly type: "delete-table-row";
+      readonly tableId: string;
+      readonly rowIndex: number;
+    }
+  | {
+      readonly type: "insert-table-column";
+      readonly tableId: string;
+      readonly anchorColumnIndex: number;
+      readonly position: "before" | "after";
+    }
+  | {
+      readonly type: "delete-table-column";
+      readonly tableId: string;
+      readonly columnIndex: number;
+    }
+  | {
+      readonly type: "merge-table-cells";
+      readonly tableId: string;
+      readonly cells: readonly WordTableCellRef[];
+    };
+
+export type WordBlockOperation = WordParagraphBlockOperation | WordTableOperation;
 
 export type WordChangeSetStatus =
   | "proposed"
@@ -1699,6 +1742,49 @@ function normalizeWordOperations(
           endOffset: operation.endOffset,
           replacementText: operation.replacementText
         };
+      case "replace-table-cell":
+        return {
+          type: "replace-table-cell",
+          tableId: operation.tableId,
+          rowIndex: operation.rowIndex,
+          columnIndex: operation.columnIndex,
+          afterText: operation.afterText
+        };
+      case "insert-table-row":
+        return {
+          type: "insert-table-row",
+          tableId: operation.tableId,
+          anchorRowIndex: operation.anchorRowIndex,
+          position: operation.position
+        };
+      case "delete-table-row":
+        return {
+          type: "delete-table-row",
+          tableId: operation.tableId,
+          rowIndex: operation.rowIndex
+        };
+      case "insert-table-column":
+        return {
+          type: "insert-table-column",
+          tableId: operation.tableId,
+          anchorColumnIndex: operation.anchorColumnIndex,
+          position: operation.position
+        };
+      case "delete-table-column":
+        return {
+          type: "delete-table-column",
+          tableId: operation.tableId,
+          columnIndex: operation.columnIndex
+        };
+      case "merge-table-cells":
+        return {
+          type: "merge-table-cells",
+          tableId: operation.tableId,
+          cells: operation.cells.map((cell) => ({
+            rowIndex: cell.rowIndex,
+            columnIndex: cell.columnIndex
+          }))
+        };
     }
   });
 }
@@ -1781,6 +1867,43 @@ function isWordBlockOperation(value: unknown): value is WordBlockOperation {
         typeof operation.startOffset === "number" &&
         typeof operation.endOffset === "number" &&
         typeof operation.replacementText === "string"
+      );
+    case "replace-table-cell":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.rowIndex === "number" &&
+        typeof operation.columnIndex === "number" &&
+        typeof operation.afterText === "string"
+      );
+    case "insert-table-row":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.anchorRowIndex === "number" &&
+        (operation.position === "before" || operation.position === "after")
+      );
+    case "delete-table-row":
+      return typeof operation.tableId === "string" && typeof operation.rowIndex === "number";
+    case "insert-table-column":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.anchorColumnIndex === "number" &&
+        (operation.position === "before" || operation.position === "after")
+      );
+    case "delete-table-column":
+      return (
+        typeof operation.tableId === "string" && typeof operation.columnIndex === "number"
+      );
+    case "merge-table-cells":
+      return (
+        typeof operation.tableId === "string" &&
+        Array.isArray(operation.cells) &&
+        operation.cells.every(
+          (cell) =>
+            typeof cell === "object" &&
+            cell !== null &&
+            typeof (cell as Partial<WordTableCellRef>).rowIndex === "number" &&
+            typeof (cell as Partial<WordTableCellRef>).columnIndex === "number"
+        )
       );
     default:
       return false;

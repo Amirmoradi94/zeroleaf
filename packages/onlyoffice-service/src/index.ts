@@ -15,7 +15,10 @@ import type {
   OnlyOfficeEditorSession,
   OnlyOfficeExportPdfResult,
   OnlyOfficeForceSaveResult,
-  OnlyOfficeStatus
+  OnlyOfficeStatus,
+  WordStructureNode,
+  WordStructureTableCell,
+  WordTableOperation
 } from "@latex-agent/ipc-contracts";
 
 export type OnlyOfficeBridgeOptions = {
@@ -67,8 +70,46 @@ type ConversionResponse = {
   readonly error?: unknown;
 };
 
+type BuilderScriptEntry = {
+  readonly script: string;
+  readonly token: string;
+  readonly expiresAtMs: number;
+};
+
+type WordStructureExtractionResult = {
+  readonly structure: readonly WordStructureNode[];
+  readonly warnings: readonly string[];
+};
+
+export type WordTableOperationsApplyResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: string };
+
+type RawStructureParagraphElement = {
+  readonly type: "paragraph";
+  readonly index: number;
+  readonly text: string;
+  readonly styleName: string | null;
+  readonly hasNonTextContent: boolean;
+};
+
+type RawStructureTableElement = {
+  readonly type: "table";
+  readonly index: number;
+  readonly rowCount: number;
+  readonly columnCount: number;
+  readonly cells: readonly {
+    readonly rowIndex: number;
+    readonly columnIndex: number;
+    readonly text: string;
+  }[];
+};
+
+type RawStructureElement = RawStructureParagraphElement | RawStructureTableElement;
+
 const defaultDocumentServerUrl = "http://127.0.0.1:8082";
 const defaultSessionTtlMs = 12 * 60 * 60 * 1_000;
+const builderScriptTtlMs = 2 * 60 * 1_000;
 const maxCallbackBodyBytes = 2_000_000;
 const docxContentType =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -76,6 +117,10 @@ const saveStatuses = new Set([2, 3, 6, 7]);
 const bridgeHealthTimeoutMs = 2_000;
 const bridgeWarmupDelayMs = 750;
 const forceSaveBeforeExportWaitMs = 1_500;
+const structureResultFilename = "structure-result.docx";
+const structureJsonStartMarker = "__ZEROLEAF_STRUCTURE_JSON_START__";
+const structureJsonEndMarker = "__ZEROLEAF_STRUCTURE_JSON_END__";
+const tableWriteResultFilename = "table-write-result.docx";
 
 export class OnlyOfficeBridgeService {
   private enabled: boolean;
@@ -88,6 +133,7 @@ export class OnlyOfficeBridgeService {
   private readonly sessions = new Map<string, OnlyOfficeSession>();
   private readonly sessionSavedAtMs = new Map<string, number>();
   private readonly sessionSaveWaiters = new Map<string, Set<SessionSaveWaiter>>();
+  private readonly builderScripts = new Map<string, BuilderScriptEntry>();
   private readonly onBeforeDocumentSave:
     | OnlyOfficeBridgeOptions["onBeforeDocumentSave"]
     | undefined;
@@ -280,6 +326,215 @@ export class OnlyOfficeBridgeService {
       config,
       expiresAt: new Date(expiresAtMs).toISOString()
     };
+  }
+
+  async extractWordStructure(request: {
+    readonly projectRoot: string;
+    readonly filePath: string;
+  }): Promise<WordStructureExtractionResult> {
+    if (!this.enabled) {
+      return {
+        structure: [],
+        warnings: ["ONLYOFFICE integration is disabled."]
+      };
+    }
+
+    let session: OnlyOfficeEditorSession;
+    try {
+      const started = await this.ensureStarted();
+      if (started) {
+        await delay(bridgeWarmupDelayMs);
+      }
+      await this.verifyPublicBridgeReachable();
+      session = await this.createEditorSession(request);
+    } catch (error) {
+      return {
+        structure: [],
+        warnings: [
+          `ONLYOFFICE structure extraction is unavailable: ${getErrorMessage(error)}`
+        ]
+      };
+    }
+
+    const scriptId = randomUUID();
+    const scriptToken = randomBytes(24).toString("base64url");
+    this.builderScripts.set(scriptId, {
+      script: buildStructureExtractionScript(session.config.document.url),
+      token: scriptToken,
+      expiresAtMs: Date.now() + builderScriptTtlMs
+    });
+
+    try {
+      const scriptUrl = `${this.getPublicBaseUrl()}/onlyoffice/builder-scripts/${scriptId}/${scriptToken}`;
+      const requestBodyWithoutToken = { async: false, url: scriptUrl };
+      const requestToken =
+        this.jwtSecret === undefined
+          ? undefined
+          : signOnlyOfficeJwt(requestBodyWithoutToken, this.jwtSecret);
+      const requestBody =
+        requestToken === undefined
+          ? requestBodyWithoutToken
+          : { ...requestBodyWithoutToken, token: requestToken };
+
+      const response = await fetch(`${this.documentServerUrl}/docbuilder`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(requestToken === undefined ? {} : { authorization: `Bearer ${requestToken}` })
+        },
+        body: JSON.stringify(requestBody)
+      });
+
+      if (!response.ok) {
+        return {
+          structure: [],
+          warnings: [
+            `ONLYOFFICE structure extraction request failed with HTTP ${response.status}.`
+          ]
+        };
+      }
+
+      const result = (await response.json().catch(() => ({}))) as {
+        readonly error?: unknown;
+        readonly urls?: Readonly<Record<string, unknown>>;
+      };
+      const errorCode =
+        typeof result.error === "number" && result.error !== 0 ? result.error : undefined;
+      if (errorCode !== undefined) {
+        return {
+          structure: [],
+          warnings: [`ONLYOFFICE structure extraction failed with error ${errorCode}.`]
+        };
+      }
+
+      const resultUrl = result.urls?.[structureResultFilename];
+      if (typeof resultUrl !== "string" || resultUrl.length === 0) {
+        return {
+          structure: [],
+          warnings: ["ONLYOFFICE structure extraction did not return a result file."]
+        };
+      }
+
+      const resultBytes = await downloadBinary(
+        normalizeOnlyOfficeDownloadUrl(resultUrl, this.documentServerUrl)
+      );
+      return await parseStructureExtractionResult(resultBytes);
+    } catch (error) {
+      return {
+        structure: [],
+        warnings: [`ONLYOFFICE structure extraction failed: ${getErrorMessage(error)}`]
+      };
+    } finally {
+      this.builderScripts.delete(scriptId);
+      this.sessions.delete(session.sessionId);
+    }
+  }
+
+  async applyWordTableOperations(request: {
+    readonly projectRoot: string;
+    readonly filePath: string;
+    readonly operations: readonly WordTableOperation[];
+  }): Promise<WordTableOperationsApplyResult> {
+    if (!this.enabled) {
+      return { ok: false, error: "ONLYOFFICE integration is disabled." };
+    }
+
+    if (request.operations.length === 0) {
+      return { ok: false, error: "Table changeset requires at least one operation." };
+    }
+
+    let elementIndexByOperation: readonly number[];
+    try {
+      elementIndexByOperation = request.operations.map((operation) =>
+        parseTableElementIndex(operation.tableId)
+      );
+    } catch (error) {
+      return { ok: false, error: getErrorMessage(error) };
+    }
+
+    let session: OnlyOfficeEditorSession;
+    let internalSession: OnlyOfficeSession;
+    try {
+      const started = await this.ensureStarted();
+      if (started) {
+        await delay(bridgeWarmupDelayMs);
+      }
+      await this.verifyPublicBridgeReachable();
+      session = await this.createEditorSession(request);
+      internalSession = this.sessions.get(session.sessionId)!;
+    } catch (error) {
+      return {
+        ok: false,
+        error: `ONLYOFFICE table edit is unavailable: ${getErrorMessage(error)}`
+      };
+    }
+
+    const scriptId = randomUUID();
+    const scriptToken = randomBytes(24).toString("base64url");
+    this.builderScripts.set(scriptId, {
+      script: buildTableWriteScript(
+        session.config.document.url,
+        request.operations,
+        elementIndexByOperation
+      ),
+      token: scriptToken,
+      expiresAtMs: Date.now() + builderScriptTtlMs
+    });
+
+    try {
+      const scriptUrl = `${this.getPublicBaseUrl()}/onlyoffice/builder-scripts/${scriptId}/${scriptToken}`;
+      const requestBodyWithoutToken = { async: false, url: scriptUrl };
+      const requestToken =
+        this.jwtSecret === undefined
+          ? undefined
+          : signOnlyOfficeJwt(requestBodyWithoutToken, this.jwtSecret);
+      const requestBody =
+        requestToken === undefined
+          ? requestBodyWithoutToken
+          : { ...requestBodyWithoutToken, token: requestToken };
+
+      const response = await fetch(`${this.documentServerUrl}/docbuilder`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(requestToken === undefined ? {} : { authorization: `Bearer ${requestToken}` })
+        },
+        body: JSON.stringify(requestBody)
+      });
+
+      if (!response.ok) {
+        return {
+          ok: false,
+          error: `ONLYOFFICE table edit request failed with HTTP ${response.status}.`
+        };
+      }
+
+      const result = (await response.json().catch(() => ({}))) as {
+        readonly error?: unknown;
+        readonly urls?: Readonly<Record<string, unknown>>;
+      };
+      const errorCode =
+        typeof result.error === "number" && result.error !== 0 ? result.error : undefined;
+      if (errorCode !== undefined) {
+        return { ok: false, error: `ONLYOFFICE table edit failed with error ${errorCode}.` };
+      }
+
+      const resultUrl = result.urls?.[tableWriteResultFilename];
+      if (typeof resultUrl !== "string" || resultUrl.length === 0) {
+        return { ok: false, error: "ONLYOFFICE table edit did not return a result file." };
+      }
+
+      await this.writeSavedDocument(
+        internalSession,
+        normalizeOnlyOfficeDownloadUrl(resultUrl, this.documentServerUrl)
+      );
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: `ONLYOFFICE table edit failed: ${getErrorMessage(error)}` };
+    } finally {
+      this.builderScripts.delete(scriptId);
+      this.sessions.delete(session.sessionId);
+    }
   }
 
   async forceSave(sessionId: string): Promise<OnlyOfficeForceSaveResult> {
@@ -475,6 +730,18 @@ export class OnlyOfficeBridgeService {
         return;
       }
 
+      const builderScriptMatch = /^\/onlyoffice\/builder-scripts\/([^/]+)\/([^/]+)$/u.exec(
+        requestUrl.pathname
+      );
+      if (request.method === "GET" && builderScriptMatch !== null) {
+        this.handleBuilderScriptDownload(
+          builderScriptMatch[1]!,
+          builderScriptMatch[2]!,
+          response
+        );
+        return;
+      }
+
       const callbackMatch =
         /^\/onlyoffice\/sessions\/([^/]+)\/([^/]+)\/callback$/u.exec(
           requestUrl.pathname
@@ -497,6 +764,30 @@ export class OnlyOfficeBridgeService {
       );
       writeJson(response, 500, { error: getErrorMessage(error) });
     }
+  }
+
+  private handleBuilderScriptDownload(
+    scriptId: string,
+    token: string,
+    response: ServerResponse
+  ): void {
+    const entry = this.builderScripts.get(scriptId);
+    if (entry === undefined || entry.token !== token) {
+      writeJson(response, 404, { error: "not-found" });
+      return;
+    }
+
+    if (Date.now() > entry.expiresAtMs) {
+      this.builderScripts.delete(scriptId);
+      writeJson(response, 404, { error: "expired" });
+      return;
+    }
+
+    response.writeHead(200, {
+      "content-type": "application/javascript; charset=utf-8",
+      "cache-control": "no-store"
+    });
+    response.end(entry.script);
   }
 
   private async handleDocumentDownload(
@@ -990,6 +1281,256 @@ function decodeXmlText(value: string): string {
     .replace(/&quot;/gu, '"')
     .replace(/&apos;/gu, "'")
     .replace(/&amp;/gu, "&");
+}
+
+function parseTableElementIndex(tableId: string): number {
+  const match = /^tbl-(\d+)-/u.exec(tableId);
+  if (match === null) {
+    throw new Error(`Table id ${tableId} is not a recognized structural table id.`);
+  }
+  return Number(match[1]);
+}
+
+function buildTableWriteScript(
+  documentUrl: string,
+  operations: readonly WordTableOperation[],
+  elementIndexByOperation: readonly number[]
+): string {
+  const operationsWithElementIndex = operations.map((operation, index) => ({
+    ...operation,
+    elementIndex: elementIndexByOperation[index]
+  }));
+
+  return `
+builder.OpenFile(${JSON.stringify(documentUrl)});
+
+var oDocument = Api.GetDocument();
+var operations = ${JSON.stringify(operationsWithElementIndex)};
+
+function zeroleafGetTable(elementIndex) {
+  var oElement = oDocument.GetElement(elementIndex);
+  if (!oElement || oElement.GetClassType() !== "table") {
+    throw new Error("Element " + elementIndex + " is not a table.");
+  }
+  return oElement;
+}
+
+for (var i = 0; i < operations.length; i++) {
+  var op = operations[i];
+  var oTable = zeroleafGetTable(op.elementIndex);
+
+  if (op.type === "replace-table-cell") {
+    oTable.GetRow(op.rowIndex).GetCell(op.columnIndex).SetText(op.afterText);
+  } else if (op.type === "insert-table-row") {
+    oTable.GetRow(op.anchorRowIndex).AddRows(1, op.position === "before");
+  } else if (op.type === "delete-table-row") {
+    oTable.GetRow(op.rowIndex).Remove();
+  } else if (op.type === "insert-table-column") {
+    oTable.GetRow(0).GetCell(op.anchorColumnIndex).AddColumns(1, op.position === "before");
+  } else if (op.type === "delete-table-column") {
+    oTable.GetRow(0).GetCell(op.columnIndex).RemoveColumn();
+  } else if (op.type === "merge-table-cells") {
+    var cellsToMerge = [];
+    for (var c = 0; c < op.cells.length; c++) {
+      cellsToMerge.push(oTable.GetRow(op.cells[c].rowIndex).GetCell(op.cells[c].columnIndex));
+    }
+    oTable.MergeCells(cellsToMerge);
+  } else {
+    throw new Error("Unsupported table operation: " + op.type);
+  }
+}
+
+builder.SaveFile("docx", ${JSON.stringify(tableWriteResultFilename)});
+builder.CloseFile();
+`;
+}
+
+function buildStructureExtractionScript(documentUrl: string): string {
+  return `
+builder.OpenFile(${JSON.stringify(documentUrl)});
+
+var oDocument = Api.GetDocument();
+var elements = [];
+var elementsCount = oDocument.GetElementsCount();
+
+function zeroleafReadParagraphText(oParagraph) {
+  try {
+    return String(oParagraph.GetText()).replace(/\\r\\n/g, "\\n").trim();
+  } catch (e) {
+    return "";
+  }
+}
+
+function zeroleafReadCellText(oCell) {
+  var content = oCell.GetContent();
+  var count = content.GetElementsCount();
+  var parts = [];
+  for (var i = 0; i < count; i++) {
+    var child = content.GetElement(i);
+    if (child.GetClassType() === "paragraph") {
+      parts.push(zeroleafReadParagraphText(child));
+    }
+  }
+  return parts.join("\\n").trim();
+}
+
+for (var i = 0; i < elementsCount; i++) {
+  var oElement = oDocument.GetElement(i);
+  var classType = oElement.GetClassType();
+
+  if (classType === "paragraph") {
+    var text = zeroleafReadParagraphText(oElement);
+    var styleName = null;
+    try {
+      var oStyle = oElement.GetStyle();
+      styleName = oStyle ? oStyle.GetName() : null;
+    } catch (e) {
+      styleName = null;
+    }
+    var elementsInParagraph = 0;
+    try {
+      elementsInParagraph = oElement.GetElementsCount();
+    } catch (e) {
+      elementsInParagraph = 0;
+    }
+    elements.push({
+      type: "paragraph",
+      index: i,
+      text: text,
+      styleName: styleName,
+      hasNonTextContent: text.length === 0 && elementsInParagraph > 0
+    });
+  } else if (classType === "table") {
+    var rowCount = oElement.GetRowsCount();
+    var columnCount = 0;
+    var cells = [];
+    for (var r = 0; r < rowCount; r++) {
+      var oRow = oElement.GetRow(r);
+      var cellCount = oRow.GetCellsCount();
+      if (cellCount > columnCount) {
+        columnCount = cellCount;
+      }
+      for (var c = 0; c < cellCount; c++) {
+        cells.push({
+          rowIndex: r,
+          columnIndex: c,
+          text: zeroleafReadCellText(oRow.GetCell(c))
+        });
+      }
+    }
+    elements.push({
+      type: "table",
+      index: i,
+      rowCount: rowCount,
+      columnCount: columnCount,
+      cells: cells
+    });
+  }
+}
+
+var oJsonParagraph = Api.CreateParagraph();
+oJsonParagraph.AddText(${JSON.stringify(structureJsonStartMarker)} + JSON.stringify(elements) + ${JSON.stringify(structureJsonEndMarker)});
+oDocument.Push(oJsonParagraph);
+
+builder.SaveFile("docx", ${JSON.stringify(structureResultFilename)});
+builder.CloseFile();
+`;
+}
+
+async function parseStructureExtractionResult(
+  resultBytes: Buffer
+): Promise<WordStructureExtractionResult> {
+  const archive = await JSZip.loadAsync(resultBytes);
+  const documentXmlFile = archive.file("word/document.xml");
+  if (documentXmlFile === null) {
+    return {
+      structure: [],
+      warnings: ["ONLYOFFICE structure result was missing word/document.xml."]
+    };
+  }
+
+  const documentXml = await documentXmlFile.async("string");
+  const rawText = Array.from(documentXml.matchAll(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/gu))
+    .map((match) => decodeXmlText(match[1] ?? ""))
+    .join("");
+
+  const startIndex = rawText.indexOf(structureJsonStartMarker);
+  const endIndex = rawText.indexOf(structureJsonEndMarker);
+  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+    return {
+      structure: [],
+      warnings: ["ONLYOFFICE structure result did not include a structure payload."]
+    };
+  }
+
+  const jsonText = rawText.slice(startIndex + structureJsonStartMarker.length, endIndex);
+
+  let rawElements: readonly RawStructureElement[];
+  try {
+    rawElements = JSON.parse(jsonText) as readonly RawStructureElement[];
+  } catch {
+    return {
+      structure: [],
+      warnings: ["ONLYOFFICE structure result payload could not be parsed."]
+    };
+  }
+
+  return { structure: rawElements.map(toStructureNode), warnings: [] };
+}
+
+function toStructureNode(element: RawStructureElement): WordStructureNode {
+  if (element.type === "paragraph") {
+    const headingLevel = parseHeadingLevel(element.styleName);
+    return {
+      type: "paragraph",
+      id: createStructureId(`para-${element.index}`, element.text),
+      text: element.text,
+      ...(headingLevel === undefined ? {} : { headingLevel }),
+      ...(element.styleName === null ? {} : { styleName: element.styleName }),
+      ...(element.hasNonTextContent ? { hasNonTextContent: true } : {})
+    };
+  }
+
+  const tableId = createStructureId(
+    `tbl-${element.index}`,
+    `${element.rowCount}x${element.columnCount}`
+  );
+  const cells: WordStructureTableCell[] = element.cells.map((cell) => ({
+    id: createStructureId(
+      `tbl-${element.index}-r${cell.rowIndex}c${cell.columnIndex}`,
+      cell.text
+    ),
+    rowIndex: cell.rowIndex,
+    columnIndex: cell.columnIndex,
+    text: cell.text
+  }));
+
+  return {
+    type: "table",
+    id: tableId,
+    rowCount: element.rowCount,
+    columnCount: element.columnCount,
+    cells
+  };
+}
+
+function parseHeadingLevel(styleName: string | null): number | undefined {
+  if (styleName === null) {
+    return undefined;
+  }
+
+  const match = /^heading\s*(\d+)$/iu.exec(styleName.trim());
+  if (match === null) {
+    return undefined;
+  }
+
+  const level = Number(match[1]);
+  return Number.isFinite(level) && level > 0 ? level : undefined;
+}
+
+function createStructureId(prefix: string, seed: string): string {
+  const hash = createHash("sha256").update(seed).digest("hex").slice(0, 12);
+  return `${prefix}-${hash}`;
 }
 
 async function delay(delayMs: number): Promise<void> {

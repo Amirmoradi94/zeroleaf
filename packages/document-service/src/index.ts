@@ -6,11 +6,13 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { Document, Packer, Paragraph, TextRun } from "docx";
 import JSZip from "jszip";
 
+import { isWordTableOperation } from "@latex-agent/ipc-contracts";
 import type {
   WordDocumentBlock,
   WordDocumentModel,
   WordDocumentSaveResult,
   WordBlockOperation,
+  WordParagraphBlockOperation,
   WordChangeSet,
   WordChangeSetApplyResult
 } from "@latex-agent/ipc-contracts";
@@ -117,7 +119,9 @@ export async function createWordChangeSet({
 }): Promise<WordChangeSet> {
   const root = await validateProjectRoot(projectRoot);
   const absolutePath = await resolveExistingDocumentPath(root, filePath);
-  const normalizedOperations = normalizeWordOperations(operations);
+  const normalizedOperations = normalizeWordOperations(
+    assertParagraphBlockOperations(operations)
+  );
 
   if (normalizedOperations.length === 0) {
     throw new DocumentServiceError(
@@ -152,15 +156,13 @@ export async function applyWordChangeSet(
     );
   }
 
-  const nextBlocks = applyWordBlockOperations(
-    changeset.baseBlocks,
-    changeset.operations
-  );
+  const paragraphOperations = assertParagraphBlockOperations(changeset.operations);
+  const nextBlocks = applyWordBlockOperations(changeset.baseBlocks, paragraphOperations);
   const appliedAt = new Date().toISOString();
   const appliedChangeSet: WordChangeSet = {
     ...changeset,
     baseBlocks: normalizeBlocks(changeset.baseBlocks),
-    operations: normalizeWordOperations(changeset.operations),
+    operations: normalizeWordOperations(paragraphOperations),
     status: "applied",
     updatedAt: appliedAt,
     appliedAt
@@ -176,12 +178,24 @@ export async function applyWordChangeSet(
 
 export function applyWordBlockOperations(
   blocks: readonly WordDocumentBlock[],
-  operations: readonly WordBlockOperation[]
+  operations: readonly WordParagraphBlockOperation[]
 ): readonly WordDocumentBlock[] {
   return operations.reduce(
     (currentBlocks, operation) => applyWordBlockOperation(currentBlocks, operation),
     normalizeBlocks(blocks)
   );
+}
+
+function assertParagraphBlockOperations(
+  operations: readonly WordBlockOperation[]
+): readonly WordParagraphBlockOperation[] {
+  if (operations.some(isWordTableOperation)) {
+    throw new DocumentServiceError(
+      "Word table operations must be applied through the ONLYOFFICE Document Builder path, not the paragraph block rebuild.",
+      "unsupported-document"
+    );
+  }
+  return operations as readonly WordParagraphBlockOperation[];
 }
 
 function splitExtractedParagraphs(value: string): readonly string[] {
@@ -265,8 +279,8 @@ function normalizeBlocks(
 }
 
 function normalizeWordOperations(
-  operations: readonly WordBlockOperation[]
-): readonly WordBlockOperation[] {
+  operations: readonly WordParagraphBlockOperation[]
+): readonly WordParagraphBlockOperation[] {
   return operations.map((operation) => {
     switch (operation.type) {
       case "replace-block":
@@ -310,7 +324,7 @@ function normalizeWordOperations(
 
 function applyWordBlockOperation(
   blocks: readonly WordDocumentBlock[],
-  operation: WordBlockOperation
+  operation: WordParagraphBlockOperation
 ): readonly WordDocumentBlock[] {
   switch (operation.type) {
     case "replace-block":

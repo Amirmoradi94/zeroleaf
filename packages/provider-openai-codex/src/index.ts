@@ -25,7 +25,9 @@ import type {
   PdfPreviewCaptureResult,
   ProjectFileSnapshot,
   WordBlockOperation,
-  WordChangeSet
+  WordChangeSet,
+  WordStructureNode,
+  WordTableCellRef
 } from "@latex-agent/ipc-contracts";
 
 import {
@@ -1903,6 +1905,7 @@ function createCodexPrompt(
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
     formatActiveWordBlockContext(request),
+    formatActiveWordStructureContext(request),
     "",
     `Active file preview (${snapshot.path}):`,
     request.activeDocument?.kind === "word" ? "```text" : "```tex",
@@ -1952,12 +1955,20 @@ function formatWordEditInstructions(request: AgentStartRequest): string {
       ? "In autonomous-local mode, ZeroLeaf applies returned wordChangesets directly to the .docx and refreshes ONLYOFFICE. In your message, say you prepared the Word edit for ZeroLeaf to apply; do not claim the .docx changed inside Codex CLI."
       : "",
     "Do not return a raw .docx patch and do not create or edit .tex files for Word-document requests.",
-    "Each Word operation must target one of the block IDs listed below.",
-    'For operation "replace-block", include type, blockId, afterText, and set afterBlockId, block, startOffset, endOffset, replacementText to null.',
-    'For operation "insert-block-after", include type, afterBlockId, block { id, kind: "paragraph", text }, and set blockId, afterText, startOffset, endOffset, replacementText to null. Use afterBlockId null to insert at the beginning.',
-    'For operation "delete-block", include type, blockId, and set afterText, afterBlockId, block, startOffset, endOffset, replacementText to null.',
-    'For operation "replace-selection", include type, blockId, startOffset, endOffset, replacementText, and set afterText, afterBlockId, block to null.',
-    "Prefer replacing the existing blank or placeholder paragraph for the first substantial Word edit."
+    "Each paragraph operation must target one of the block IDs listed below. Each table operation must target one of the table IDs from the document structure section, using its 0-based row/column indices.",
+    "A single wordChangeset's operations must be either ALL paragraph operations (replace-block, insert-block-after, delete-block, move-block, replace-selection) or ALL table operations (replace-table-cell, insert-table-row, delete-table-row, insert-table-column, delete-table-column, merge-table-cells) — never mixed in one changeset. Use separate changesets if you need both.",
+    'For operation "replace-block", include type, blockId, afterText, and set afterBlockId, block, startOffset, endOffset, replacementText, tableId, rowIndex, columnIndex, anchorRowIndex, anchorColumnIndex, position, cells to null.',
+    'For operation "insert-block-after", include type, afterBlockId, block { id, kind: "paragraph", text }, and set all other fields to null. Use afterBlockId null to insert at the beginning.',
+    'For operation "delete-block", include type, blockId, and set all other fields to null.',
+    'For operation "replace-selection", include type, blockId, startOffset, endOffset, replacementText, and set all other fields to null.',
+    "Prefer replacing the existing blank or placeholder paragraph for the first substantial Word edit.",
+    'For operation "replace-table-cell", include type, tableId, rowIndex, columnIndex, afterText, and set all other fields to null.',
+    'For operation "insert-table-row", include type, tableId, anchorRowIndex, position ("before" or "after"), and set all other fields to null.',
+    'For operation "delete-table-row", include type, tableId, rowIndex, and set all other fields to null.',
+    'For operation "insert-table-column", include type, tableId, anchorColumnIndex, position ("before" or "after"), and set all other fields to null.',
+    'For operation "delete-table-column", include type, tableId, columnIndex, and set all other fields to null.',
+    'For operation "merge-table-cells", include type, tableId, cells (array of { rowIndex, columnIndex }, at least 2), and set all other fields to null.',
+    "When a table changeset has multiple operations on the same table, later operations see the row/column indices AFTER earlier operations in the same changeset have already shifted them (e.g. deleting row 1 then row 1 again deletes what was originally row 2)."
   ].join("\n");
 }
 
@@ -1980,6 +1991,53 @@ function formatActiveWordBlockContext(request: AgentStartRequest): string {
   ]
     .filter((line) => line.length > 0)
     .join("\n");
+}
+
+function formatActiveWordStructureContext(request: AgentStartRequest): string {
+  if (request.activeDocument?.kind !== "word") {
+    return "";
+  }
+
+  const structure = request.activeDocument.structure ?? [];
+  if (structure.length === 0) {
+    return "";
+  }
+
+  const structureLines = structure.map((node) => formatWordStructureNode(node));
+  const structureWarnings = request.activeDocument.structureWarnings ?? [];
+
+  return [
+    "Document structure (headings and tables, for understanding layout and position).",
+    "Headings are read-only context. Tables can be edited with table operations (see instructions above) targeting the table's id and 0-based row/column indices shown below.",
+    ...structureLines,
+    structureWarnings.length === 0
+      ? ""
+      : `Structure extraction warnings: ${structureWarnings.join("; ")}`
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
+function formatWordStructureNode(node: WordStructureNode): string {
+  if (node.type === "paragraph") {
+    if (node.headingLevel === undefined) {
+      return "";
+    }
+    return `Heading (level ${node.headingLevel}): ${JSON.stringify(node.text)}`;
+  }
+
+  const grid: string[] = [];
+  for (let row = 0; row < node.rowCount; row++) {
+    const cells = node.cells
+      .filter((cell) => cell.rowIndex === row)
+      .sort((a, b) => a.columnIndex - b.columnIndex)
+      .map((cell) => `R${cell.rowIndex}C${cell.columnIndex}=${JSON.stringify(cell.text)}`);
+    grid.push(`  ${cells.join("  ")}`);
+  }
+
+  return [`Table ${node.id} (${node.rowCount} rows x ${node.columnCount} columns):`, ...grid].join(
+    "\n"
+  );
 }
 
 async function readInitialSnapshot({
@@ -2278,6 +2336,7 @@ function createCodexInterruptedRetryPrompt(
       ? ""
       : `Diagnostic: ${request.diagnostic.severity} ${request.diagnostic.filePath ?? ""}:${request.diagnostic.line ?? ""} ${request.diagnostic.message}`,
     formatActiveWordBlockContext(request),
+    formatActiveWordStructureContext(request),
     "",
     `Focused active file preview (${snapshot.path}):`,
     request.activeDocument?.kind === "word" ? "```text" : "```tex",
@@ -2662,6 +2721,44 @@ function isValidWordBlockOperation(value: unknown): value is WordBlockOperation 
         typeof operation.endOffset === "number" &&
         typeof operation.replacementText === "string"
       );
+    case "replace-table-cell":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.rowIndex === "number" &&
+        typeof operation.columnIndex === "number" &&
+        typeof operation.afterText === "string"
+      );
+    case "insert-table-row":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.anchorRowIndex === "number" &&
+        (operation.position === "before" || operation.position === "after")
+      );
+    case "delete-table-row":
+      return typeof operation.tableId === "string" && typeof operation.rowIndex === "number";
+    case "insert-table-column":
+      return (
+        typeof operation.tableId === "string" &&
+        typeof operation.anchorColumnIndex === "number" &&
+        (operation.position === "before" || operation.position === "after")
+      );
+    case "delete-table-column":
+      return (
+        typeof operation.tableId === "string" && typeof operation.columnIndex === "number"
+      );
+    case "merge-table-cells":
+      return (
+        typeof operation.tableId === "string" &&
+        Array.isArray(operation.cells) &&
+        operation.cells.length >= 2 &&
+        operation.cells.every(
+          (cell) =>
+            typeof cell === "object" &&
+            cell !== null &&
+            typeof (cell as Partial<WordTableCellRef>).rowIndex === "number" &&
+            typeof (cell as Partial<WordTableCellRef>).columnIndex === "number"
+        )
+      );
     default:
       return false;
   }
@@ -2714,6 +2811,49 @@ function normalizeCodexWordBlockOperation(
         startOffset: operation.startOffset,
         endOffset: operation.endOffset,
         replacementText: operation.replacementText
+      };
+    case "replace-table-cell":
+      return {
+        type: "replace-table-cell",
+        tableId: operation.tableId,
+        rowIndex: operation.rowIndex,
+        columnIndex: operation.columnIndex,
+        afterText: operation.afterText
+      };
+    case "insert-table-row":
+      return {
+        type: "insert-table-row",
+        tableId: operation.tableId,
+        anchorRowIndex: operation.anchorRowIndex,
+        position: operation.position
+      };
+    case "delete-table-row":
+      return {
+        type: "delete-table-row",
+        tableId: operation.tableId,
+        rowIndex: operation.rowIndex
+      };
+    case "insert-table-column":
+      return {
+        type: "insert-table-column",
+        tableId: operation.tableId,
+        anchorColumnIndex: operation.anchorColumnIndex,
+        position: operation.position
+      };
+    case "delete-table-column":
+      return {
+        type: "delete-table-column",
+        tableId: operation.tableId,
+        columnIndex: operation.columnIndex
+      };
+    case "merge-table-cells":
+      return {
+        type: "merge-table-cells",
+        tableId: operation.tableId,
+        cells: operation.cells.map((cell) => ({
+          rowIndex: cell.rowIndex,
+          columnIndex: cell.columnIndex
+        }))
       };
   }
 }
@@ -2770,7 +2910,13 @@ export const codexOutputSchema = {
                     "insert-block-after",
                     "delete-block",
                     "move-block",
-                    "replace-selection"
+                    "replace-selection",
+                    "replace-table-cell",
+                    "insert-table-row",
+                    "delete-table-row",
+                    "insert-table-column",
+                    "delete-table-column",
+                    "merge-table-cells"
                   ]
                 },
                 blockId: { type: ["string", "null"] },
@@ -2788,7 +2934,25 @@ export const codexOutputSchema = {
                 },
                 startOffset: { type: ["number", "null"] },
                 endOffset: { type: ["number", "null"] },
-                replacementText: { type: ["string", "null"] }
+                replacementText: { type: ["string", "null"] },
+                tableId: { type: ["string", "null"] },
+                rowIndex: { type: ["number", "null"] },
+                columnIndex: { type: ["number", "null"] },
+                anchorRowIndex: { type: ["number", "null"] },
+                anchorColumnIndex: { type: ["number", "null"] },
+                position: { type: ["string", "null"], enum: ["before", "after", null] },
+                cells: {
+                  type: ["array", "null"],
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      rowIndex: { type: "number" },
+                      columnIndex: { type: "number" }
+                    },
+                    required: ["rowIndex", "columnIndex"]
+                  }
+                }
               },
               required: [
                 "type",
@@ -2798,7 +2962,14 @@ export const codexOutputSchema = {
                 "block",
                 "startOffset",
                 "endOffset",
-                "replacementText"
+                "replacementText",
+                "tableId",
+                "rowIndex",
+                "columnIndex",
+                "anchorRowIndex",
+                "anchorColumnIndex",
+                "position",
+                "cells"
               ]
             }
           }
